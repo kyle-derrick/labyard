@@ -9,6 +9,15 @@ description = "Declarative network lab orchestration for Proxmox VE"
 [dependencies]
 # ── HTTP ──
 axum = { version = "0.8", features = ["ws", "macros"] }
+# ttyd 反代：WS 用 tokio-tungstenite，HTTP 转发用 hyper 的 client
+# （hyper 是 axum 的底层，已在依赖树里；不引 reqwest 是因为它的 idna→icu
+#  链要求 rustc 1.88，而 Debian 13 自带的是 1.85。反代只需要明文 HTTP/1.1，
+#  hyper 客户端栈就够，MSRV 也低）
+tokio-tungstenite = "0.24"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 # ── 异步 ──

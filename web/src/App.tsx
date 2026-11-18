@@ -3,17 +3,21 @@ import { Layout, Menu, Button, Space, Typography, App as AntApp } from "antd";
 import {
   DashboardOutlined,
   ExperimentOutlined,
+  HistoryOutlined,
   LogoutOutlined,
+  CloudServerOutlined,
 } from "@ant-design/icons";
 import Login from "./Login";
 import Dashboard from "./Dashboard";
 import Editor from "./Editor";
+import Hosts from "./Hosts";
+import Runs from "./Runs";
 import { api } from "./api";
 
 const { Header, Content } = Layout;
 const { Text } = Typography;
 
-type Page = "dashboard" | "editor";
+type Page = "dashboard" | "editor" | "hosts" | "runs";
 
 export default function App() {
   const { message } = AntApp.useApp();
@@ -74,6 +78,16 @@ export default function App() {
                 label: "编排",
               },
               {
+                key: "hosts",
+                icon: <CloudServerOutlined />,
+                label: "主机",
+              },
+              {
+                key: "runs",
+                icon: <HistoryOutlined />,
+                label: "运行历史",
+              },
+              {
                 key: "dashboard",
                 icon: <DashboardOutlined />,
                 label: "概览",
@@ -87,7 +101,10 @@ export default function App() {
       </Header>
 
       <Content style={{ padding: 20, maxWidth: 1600, width: "100%", margin: "0 auto" }}>
-        {page === "editor" ? <Editor /> : <Dashboard />}
+        {page === "editor" && <Editor />}
+        {page === "hosts" && <Hosts />}
+        {page === "runs" && <Runs />}
+        {page === "dashboard" && <Dashboard />}
       </Content>
     </Layout>
   );

@@ -82,6 +82,10 @@ pub struct ZoneSpec {
     pub lang: Option<String>,
     pub apt_mirror: Option<String>,
     pub packages: Option<Vec<String>>,
+    /// 宿主机在 zone 网桥上的管理地址（Web 终端/调试直达用）。
+    /// 不写则自动取网段 .254/前缀。宿主从这里 L2 直达容器，
+    /// 不经过网关转发——所以网关的入向丢弃规则不受影响。
+    pub bridge_mgmt_ip: Option<String>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -142,6 +146,10 @@ pub struct HostSpec {
     pub lang: Option<String>,
     pub apt_mirror: Option<String>,
     pub packages: Option<Vec<String>>,
+    /// 宿主机在 zone 网桥上的管理地址（Web 终端/调试直达用）。
+    /// 不写则自动取网段 .254/前缀。宿主从这里 L2 直达容器，
+    /// 不经过网关转发——所以网关的入向丢弃规则不受影响。
+    pub bridge_mgmt_ip: Option<String>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -235,6 +243,8 @@ pub struct ResolvedZone {
     /// 上联网桥名（wan 时是用户配置的外部桥，否则是上游 zone 的桥）
     pub uplink_bridge: Option<String>,
     pub v4_cidr: String,
+    /// 宿主在桥上的管理地址；Web 终端从宿主直连容器用
+    pub bridge_mgmt_ip: String,
     pub v6_prefix: Option<String>,
     pub nat: bool,
     pub hosts: Vec<ResolvedHost>,
@@ -489,12 +499,26 @@ impl Spec {
                 });
             }
 
+            // 宿主管理地址：显式配置优先，否则取网段 .254（网关占 .1、
+            // 主机从 .2 起分配，.254 实际不会冲突）
+            let mgmt = z.bridge_mgmt_ip.clone().unwrap_or_else(|| {
+                let (net, prefix) = z.v4.split_once('/').unwrap_or((&z.v4, "24"));
+                let mut parts: Vec<&str> = net.split('.').collect();
+                if parts.len() == 4 {
+                    parts[3] = "254";
+                    format!("{}/{}", parts.join("."), prefix)
+                } else {
+                    format!("{net}/254")
+                }
+            });
+
             out.push(ResolvedZone {
                 name: zone_name.clone(),
                 bridge,
                 uplink,
                 uplink_bridge,
                 v4_cidr: z.v4.clone(),
+                bridge_mgmt_ip: mgmt,
                 v6_prefix,
                 nat: z.nat,
                 hosts,

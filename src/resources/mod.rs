@@ -410,8 +410,8 @@ async fn apply_step(
     cancel: &CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match &step.kind {
-        StepKind::Bridge { name, .. } => {
-            pve.ensure_bridge(name, cancel).await?;
+        StepKind::Bridge { name, mgmt_ip, .. } => {
+            pve.ensure_bridge(name, mgmt_ip, cancel).await?;
         }
 
         StepKind::Template {
@@ -432,6 +432,7 @@ async fn apply_step(
             template_storage,
             bridge,
             uplink_bridge,
+            mirr_bridge,
             ssh_keys,
             password,
             ..
@@ -453,6 +454,7 @@ async fn apply_step(
                 vol,
                 bridge,
                 uplink_bridge.as_deref(),
+                mirr_bridge.as_deref(),
                 password.as_deref(),
                 ssh_keys,
                 cancel,
@@ -497,10 +499,11 @@ async fn apply_step(
         }
 
         StepKind::Bootstrap {
+            zone: bootstrap_zone,
+            host: bootstrap_host,
             vmid,
             provisioner,
             args,
-            ..
         } => {
             let base = assets::Assets::text("base/bootstrap.sh")
                 .ok_or("内置 bootstrap.sh 缺失（编译产物不完整）")?;
@@ -534,34 +537,103 @@ async fn apply_step(
             } else if provisioner != "none" {
                 return Err(format!("找不到 provisioner `{provisioner}`").into());
             }
+
+            // ── Web 终端：ttyd 静态二进制注入 + systemd 单元 ──
+            // 绑定容器自己的内网地址而不是 0.0.0.0：网关的 eth1 接 WAN，
+            // 监听全网卡等于把终端暴露给外部。
+            {
+                let (zone, host) = (bootstrap_zone, bootstrap_host);
+                let bind_ip = args
+                    .get("ipv4")
+                    .map(|v| v.split('/').next().unwrap_or(v).to_string());
+                if let Some(ip) = bind_ip {
+                    match pve.ensure_terminal(*vmid, zone.as_str(), host.as_str(), &ip, cancel).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = tx
+                                .send(Event::Line {
+                                    key: step.key.clone(),
+                                    stream: crate::core::runner::Stream::Stdout,
+                                    line: "[终端] 宿主没有 /usr/local/bin/ttyd，跳过 Web 终端安装"
+                                        .into(),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            // 终端是增强功能，不该拖垮基础配置
+                            let _ = tx
+                                .send(Event::Line {
+                                    key: step.key.clone(),
+                                    stream: crate::core::runner::Stream::Stdout,
+                                    line: format!("[终端] ttyd 安装失败（不影响主机可用）: {e}"),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
         }
 
         StepKind::Mirror {
             zone,
+            bridge,
             source_vmid,
             target_vmid,
-            target_iface,
             ..
         } => {
-            // 宿主侧：写配置 + 起 systemd 模板实例
-            let unit = format!("labmirror@{zone}-{source_vmid}-{target_vmid}");
+            // labmirror 的脚本与单元模板是二进制内嵌资产——版本永远与
+            // labyart 二进制同步，不会出现"装了旧脚本配新配置"。
+            let script_body = assets::Assets::text("base/labmirror.sh")
+                .ok_or("内置 labmirror.sh 缺失（编译产物不完整）")?;
+            let unit_body = assets::Assets::text("base/labmirror@.service")
+                .ok_or("内置 labmirror@.service 缺失（编译产物不完整）")?;
+            // 实例名与单元名必须分开：单元是 labmirror@<instance>，
+            // conf 文件名是 <instance>.conf（脚本按 %i 找 conf，不带前缀）。
+            // 早期两处都用带前缀的名字，单元永远找不到 conf。
+            let instance = format!("{zone}-{source_vmid}-{target_vmid}");
+            let unit = format!("labmirror@{instance}");
             let conf_dir = "/etc/labyard/mirror";
+            // 落点不写死 veth 名：analysis 重建后 veth1002i1→veth1005i1，
+            // 旧名字挂不上规则且不报错。让 labmirror 按 mirr 桥现探。
+            // SRC_BRIDGE 必须是桥名（lablab）而不是 zone 名（lab）——两者
+            // 只在没配 bridge 前缀时碰巧相同，用错了单元会静默 inactive
             let conf = format!(
-                "SOURCE_VMID={source_vmid}\nTARGET_VMID={target_vmid}\nTARGET_IFACE={target_iface}\n"
+                "SRC_BRIDGE={bridge}\nMIRR_BRIDGE=mirr\nSOURCE_VMID={source_vmid}\nTARGET_VMID={target_vmid}\n"
             );
-            let script = format!(
-                "set -e; mkdir -p {conf_dir}; printf '%s' '{conf}' > {conf_dir}/{unit}.conf; \
-                 systemctl enable --now {unit}.service 2>/dev/null || systemctl restart {unit}.service"
+            let b64_script = crate::pve::base64_encode(script_body.as_bytes());
+            let b64_unit = crate::pve::base64_encode(unit_body.as_bytes());
+            let cmd = format!(
+                "set -e\n\
+                 mkdir -p {conf_dir}\n\
+                 echo {b64_script} | base64 -d > /usr/local/bin/labmirror\n\
+                 chmod +x /usr/local/bin/labmirror\n\
+                 echo {b64_unit} | base64 -d > /etc/systemd/system/labmirror@.service\n\
+                 rm -f {conf_dir}/labmirror@*.conf\n\
+                 printf '%s' '{conf}' > {conf_dir}/{instance}.conf\n\
+                 systemctl daemon-reload\n\
+                 systemctl enable {unit}.service 2>/dev/null || true\n\
+                 systemctl restart {unit}.service 2>&1 || {{ journalctl -u {unit}.service -n 20 --no-pager; exit 1; }}"
             );
-            runner
+            let out = runner
                 .run(
                     &format!("mirror:{unit}"),
-                    &CommandSpec::new("sh", ["-c", &script]).with_timeout(Duration::from_secs(60)),
+                    &CommandSpec::new("sh", ["-c", cmd.as_str()])
+                        .with_timeout(Duration::from_secs(60)),
                     Some(tx.clone()),
                     cancel,
                     false,
                 )
                 .await?;
+            // 判定靠退出码而不是 stdout：这条调用把行转发到事件流（Web/CLI
+            // 都能看到），返回体里的 stdout 是空的——早期用 stdout 判 active，
+            // 结果永远拿到空字符串，参数对也被判失败。
+            if out.code != Some(0) {
+                return Err(format!(
+                    "labmirror 实例启动失败（退出码 {:?}，journal 已随事件流输出）",
+                    out.code
+                )
+                .into());
+            }
         }
 
         StepKind::Snapshot { vmid, name, .. } => {
@@ -675,6 +747,13 @@ impl Executor {
             for prefix in ["ct", "net", "bootstrap", "snapshot"] {
                 self.db
                     .forget_step(&format!("{prefix}:{}:{}", zone.name, h.name));
+            }
+        }
+
+        // ── mirr 桥：analysis 的 eth2 随容器消失，桥空了就一并删 ──
+        if let Ok(m) = self.pve.bridge_members("mirr", cancel).await {
+            if m.is_empty() {
+                let _ = self.pve.destroy_bridge("mirr", cancel).await;
             }
         }
 

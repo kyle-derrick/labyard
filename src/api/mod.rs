@@ -3,13 +3,13 @@
 pub mod auth;
 
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{FromRequestParts, Path, Query, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use rust_embed::RustEmbed;
@@ -74,6 +74,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/runs/{id}/events", get(run_events))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/doctor", get(doctor))
+        .route("/api/runs", get(list_runs))
+        .route("/api/runs/{id}/steps", get(run_steps))
+        .route("/api/runs/{id}/retry", post(retry_run))
+        .route("/api/hosts", get(hosts))
+        .route("/api/hosts/{z}/{h}/power", post(power))
+        .route("/api/snapshots/{z}/{h}", get(list_snapshots).post(snapshot_op))
+        .route("/api/destroy", post(destroy))
+        .route("/terminal/{z}/{h}", any(terminal_bare))
+        .route("/terminal/{z}/{h}/", any(terminal_trailing))
+        .route("/terminal/{z}/{h}/{*path}", any(terminal_proxy))
         .route("/api/openapi.json", get(openapi))
         .fallback(get(static_handler))
         .with_state(state)
@@ -384,12 +394,67 @@ struct ApplyResp {
     run_id: String,
 }
 
-async fn apply(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<SpecReq>) -> Response {
+async fn apply(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SpecReq>,
+) -> Response {
     require_auth!(state, headers);
+    apply_core(state, req.yaml, req.snapshot).await
+}
 
-    // 先卡版本再规划：设计里写的是"不做 8.x 兼容层"，那就必须在动手之前拒绝，
-    // 而不是让用户在 PVE 8 上跑到一半才撞见字段不认识。
-    // `doctor` 也会报这一条，但 doctor 是给人看的，这里才是真正的闸。
+fn run_id_seed() -> String {
+    format!(
+        "{}:{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        std::process::id()
+    )
+}
+
+// ───────────────────────── 运维：历史 / 电源 / 快照 / 销毁 ─────────────────────────
+
+async fn list_runs(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    Json(serde_json::json!({ "runs": state.db.list_runs(100) })).into_response()
+}
+
+async fn run_steps(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    require_auth!(state, headers);
+    Json(serde_json::json!({ "steps": state.db.run_steps(&id) })).into_response()
+}
+
+/// 重跑 = 用当前持久化的规格再 apply 一次。幂等引擎保证"没变的跳过、
+/// 变了的重跑"，retry 不是回滚也不是重建，是重新对账。
+async fn retry_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    require_auth!(state, headers);
+    let yaml = match tokio::fs::read_to_string(spec_file(&state.cfg)).await {
+        Ok(y) => y,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "没有已保存的规格，先在编辑器里保存"})),
+            )
+                .into_response()
+        }
+    };
+    let _ = id; // run id 只做审计上下文，真正对账的是当前规格
+    apply_core(state, yaml, false).await
+}
+
+/// 把 apply handler 的主体抽出来，apply 与 retry 共用。
+async fn apply_core(
+    state: Arc<AppState>,
+    yaml: String,
+    snapshot: bool,
+) -> Response {
     {
         let cancel = CancellationToken::new();
         if let Err(e) = state.pve.require_pve9(&cancel).await {
@@ -400,11 +465,14 @@ async fn apply(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req)
                 .into_response();
         }
     }
-
-    let (zones, plan) = match build_plan(&state, &req.yaml, req.snapshot) {
+    let (zones, plan) = match build_plan(&state, &yaml, snapshot) {
         Ok(v) => v,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response()
         }
     };
 
@@ -435,16 +503,13 @@ async fn apply(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req)
     tokio::spawn(async move {
         let (mtx, mut mrx) = mpsc::channel::<Event>(500);
         let btx2 = btx.clone();
-        // mpsc（有背压）→ broadcast（多订阅者）
         let fwd = tokio::spawn(async move {
             while let Some(ev) = mrx.recv().await {
                 let _ = btx2.send(ev);
             }
         });
-
         let ex = Executor::new(pve, db.clone(), runner);
         let summary = ex.execute(&plan, &rid, mtx, cancel.clone(), conc).await;
-
         let _ = fwd.await;
         let final_status = if cancel.is_cancelled() {
             "cancelled"
@@ -461,15 +526,475 @@ async fn apply(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req)
         });
     });
 
-    Json(ApplyResp { run_id }).into_response()
+    Json(serde_json::json!({ "run_id": run_id })).into_response()
 }
 
-fn run_id_seed() -> String {
-    format!(
-        "{}:{}",
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-        std::process::id()
-    )
+/// 主机清单：DB 分配记录 × PVE 实际状态。
+async fn hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    let cancel = CancellationToken::new();
+    let vms = state.pve.cluster_vms(&cancel).await.unwrap_or_default();
+    let rows: Vec<serde_json::Value> = state
+        .db
+        .all_vmids()
+        .into_iter()
+        .map(|(zone, host, vmid)| {
+            let row = vms.iter().find(|r| r.vmid_parsed() == Some(vmid));
+            serde_json::json!({
+                "zone": zone,
+                "host": host,
+                "vmid": vmid,
+                "exists": row.is_some(),
+                "status": row.and_then(|r| r.status.clone()).unwrap_or_else(|| "absent".to_string()),
+                "name": row.map(|r| r.name.clone()),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "hosts": rows })).into_response()
+}
+
+#[derive(Deserialize)]
+struct PowerReq {
+    action: String,
+}
+
+async fn power(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((z, h)): Path<(String, String)>,
+    Json(req): Json<PowerReq>,
+) -> Response {
+    require_auth!(state, headers);
+    if !matches!(req.action.as_str(), "start" | "stop" | "reboot") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "action 只支持 start/stop/reboot"})),
+        )
+            .into_response();
+    }
+    let Some(vmid) = state.db.vmid_of(&z, &h) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{z}/{h} 没有分配记录")})),
+        )
+            .into_response();
+    };
+    let cancel = CancellationToken::new();
+    match state.pve.ct_action(vmid, &req.action, &cancel).await {
+        Ok(()) => Json(serde_json::json!({"ok": true, "vmid": vmid})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_snapshots(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((z, h)): Path<(String, String)>,
+) -> Response {
+    require_auth!(state, headers);
+    let Some(vmid) = state.db.vmid_of(&z, &h) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{z}/{h} 没有分配记录")})),
+        )
+            .into_response();
+    };
+    let cancel = CancellationToken::new();
+    match state.pve.snapshots_of(vmid, &cancel).await {
+        Ok(names) => Json(serde_json::json!({ "snapshots": names, "vmid": vmid })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SnapshotReq {
+    action: String,
+    name: String,
+}
+
+async fn snapshot_op(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((z, h)): Path<(String, String)>,
+    Json(req): Json<SnapshotReq>,
+) -> Response {
+    require_auth!(state, headers);
+    let Some(vmid) = state.db.vmid_of(&z, &h) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{z}/{h} 没有分配记录")})),
+        )
+            .into_response();
+    };
+    // 快照名白名单：PVE 允许很宽的字符集，但这是 web 入口，收紧到
+    // 字母数字-_，防注入也防手滑
+    if req.name.is_empty()
+        || req.name.len() > 64
+        || !req
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "快照名只允许字母数字与 -_，最长 64"})),
+        )
+            .into_response();
+    }
+    let cancel = CancellationToken::new();
+    let r = match req.action.as_str() {
+        "create" => state.pve.ensure_snapshot(vmid, &req.name, &cancel).await,
+        "rollback" => state.pve.rollback_snapshot(vmid, &req.name, &cancel).await,
+        "delete" => state.pve.del_snapshot(vmid, &req.name, &cancel).await,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "action 只支持 create/rollback/delete"})),
+            )
+                .into_response()
+        }
+    };
+    match r {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DestroyReq {
+    zone: String,
+    /// 必须与 zone 同名——Web 版的"第二次确认"
+    confirm: String,
+}
+
+async fn destroy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<DestroyReq>,
+) -> Response {
+    require_auth!(state, headers);
+    if req.confirm != req.zone {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "confirm 必须与 zone 名一致（二次确认）"})),
+        )
+            .into_response();
+    }
+    let yaml = match tokio::fs::read_to_string(spec_file(&state.cfg)).await {
+        Ok(y) => y,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "没有已保存的规格"})),
+            )
+                .into_response()
+        }
+    };
+    let text_specs = match Spec::parse(&yaml) {
+        Ok(sp) => sp,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("规格解析失败: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let zones = match text_specs.resolve(&state.cfg.pve.wan_bridge) {
+        Ok(zs) => zs,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("规格解析失败: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let Some(z) = zones.iter().find(|z| z.name == req.zone) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("规格里没有 zone `{}`", req.zone)})),
+        )
+            .into_response();
+    };
+    let ex = Executor::new(state.pve.clone(), state.db.clone(), state.runner.clone());
+    let cancel = CancellationToken::new();
+    match ex.destroy_zone(z, &zones, &cancel).await {
+        Ok(report) => Json(serde_json::json!({
+            "ok": true,
+            "destroyed_cts": report.destroyed_cts,
+            "absent_cts": report.absent_cts,
+            "bridge_deleted": report.bridge_deleted,
+            "kept_bridge": report.kept_bridge,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+// ───────────────────────── Web 终端反代（ttyd）─────────────────────────
+
+/// 从已保存的规格里取主机内网地址。Web 终端从宿主经桥管理地址 L2 直达
+/// 容器，不经过网关转发。
+async fn host_ip(state: &AppState, z: &str, h: &str) -> Result<String, String> {
+    let vmid = state
+        .db
+        .vmid_of(z, h)
+        .ok_or_else(|| format!("{z}/{h} 没有分配记录（还没 apply？）"))?;
+    state
+        .pve
+        .ct_ip(vmid, "eth0", &CancellationToken::new())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 裸路径（无尾斜杠）→ 补斜杠。ttyd 的 base path 必须以 / 结尾，
+/// 否则页面里的相对资源会解析到 /terminal/z 下面。
+async fn terminal_bare(
+    State(state): State<Arc<AppState>>,
+    Path((z, h)): Path<(String, String)>,
+    req: axum::extract::Request,
+) -> Response {
+    // ttyd 的 base path 必须以 / 结尾，裸路径补上斜杠后由浏览器重新请求，
+    // 页面里的相对资源才对得上
+    let q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    axum::response::Redirect::permanent(&format!(
+        "/terminal/{}/{}/{q}",
+        urlencode(&z),
+        urlencode(&h)
+    ))
+    .into_response()
+}
+
+fn urlencode(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect()
+}
+
+/// 尾斜杠版：ttyd 的入口页（path 为空）。不能重定向到这里——
+/// 那样会和上面的 bare 版组成无限循环。
+async fn terminal_trailing(
+    State(state): State<Arc<AppState>>,
+    Path((z, h)): Path<(String, String)>,
+    req: axum::extract::Request,
+) -> Response {
+    terminal_impl(state, z, h, String::new(), req).await
+}
+
+async fn terminal_proxy(
+    State(state): State<Arc<AppState>>,
+    Path((z, h, path)): Path<(String, String, String)>,
+    req: axum::extract::Request,
+) -> Response {
+    terminal_impl(state, z, h, path, req).await
+}
+
+async fn terminal_impl(
+    state: Arc<AppState>,
+    z: String,
+    h: String,
+    path: String,
+    req: axum::extract::Request,
+) -> Response {
+    // 认证走 cookie（前端 iframe 与 WebSocket 都自动带，无需额外令牌）
+    {
+        let headers = req.headers().clone();
+        if current_user(&state, &headers).is_none() {
+            return unauthorized();
+        }
+    }
+
+    let ip = match host_ip(&state, &z, &h).await {
+        Ok(ip) => ip,
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response()
+        }
+    };
+
+    let (mut parts, body) = req.into_parts();
+    let qs = parts
+        .uri
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let target = format!("/terminal/{z}/{h}/{path}");
+
+    let is_ws = parts
+        .headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if is_ws {
+        return match axum::extract::WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(ws) => {
+                let url = format!("ws://{ip}:7681{target}{qs}");
+                ws.on_upgrade(move |socket| async move {
+                    if let Err(e) = pipe_ws(socket, &url).await {
+                        tracing::debug!("terminal ws closed: {e}");
+                    }
+                })
+            }
+            Err(rej) => rej.into_response(),
+        };
+    }
+
+    // HTTP：ttyd 的静态资源与 /token 之类的小请求，body 直接缓冲转发
+    let method = parts.method.clone();
+    let body_bytes = axum::body::to_bytes(body, 8 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let path_q = format!("{target}{qs}");
+
+    let stream = match tokio::net::TcpStream::connect((ip.as_str(), 7681u16)).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("连不上容器里的 ttyd（{ip}:7681）: {e}")
+                })),
+            )
+                .into_response()
+        }
+    };
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("ttyd 握手失败: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let hyper_req = match hyper::Request::builder()
+        .method(method)
+        .uri(path_q)
+        // ttyd 是按 Host 头做校验的（防 DNS rebinding），必须转发容器视角的 Host
+        .header(header::HOST, format!("{ip}:7681"))
+        .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes.to_vec())))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    match sender.send_request(hyper_req).await {
+        Ok(resp) => {
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut headers_out = Vec::new();
+            for name in [header::CONTENT_TYPE, header::CACHE_CONTROL, header::ETAG] {
+                if let Some(v) = resp.headers().get(&name) {
+                    headers_out.push((name, v.clone()));
+                }
+            }
+            let mut out = Response::new(axum::body::Body::new(resp.into_body()));
+            *out.status_mut() = status;
+            for (k, v) in headers_out {
+                out.headers_mut().insert(k, v);
+            }
+            out
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("ttyd 请求失败（{ip}:7681）: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// axum WebSocket ↔ tokio-tungstenite 的双向搬运。
+async fn pipe_ws(socket: axum::extract::ws::WebSocket, url: &str) -> Result<(), String> {
+    use axum::extract::ws::Message as AxMsg;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as TgMsg;
+
+    let (up, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut up_tx, mut up_rx) = up.split();
+    let (mut dn_tx, mut dn_rx) = socket.split();
+
+    let to_up = async {
+        while let Some(Ok(msg)) = futures_util::StreamExt::next(&mut dn_rx).await {
+            let m = match msg {
+                AxMsg::Text(t) => TgMsg::Text(t.as_str().into()),
+                AxMsg::Binary(b) => TgMsg::Binary(b.to_vec().into()),
+                AxMsg::Ping(p) => TgMsg::Ping(p.to_vec().into()),
+                AxMsg::Pong(p) => TgMsg::Pong(p.to_vec().into()),
+                AxMsg::Close(_) => {
+                    let _ = up_tx.send(TgMsg::Close(None)).await;
+                    break;
+                }
+            };
+            if up_tx.send(m).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), String>(())
+    };
+    let to_dn = async {
+        while let Some(Ok(msg)) = futures_util::StreamExt::next(&mut up_rx).await {
+            let m = match msg {
+                TgMsg::Text(t) => AxMsg::Text(t.to_string().into()),
+                TgMsg::Binary(b) => AxMsg::Binary(b.to_vec().into()),
+                TgMsg::Ping(p) => AxMsg::Ping(p.to_vec().into()),
+                TgMsg::Pong(p) => AxMsg::Pong(p.to_vec().into()),
+                TgMsg::Close(_) => {
+                    let _ = dn_tx.send(AxMsg::Close(None)).await;
+                    break;
+                }
+                TgMsg::Frame(_) => continue,
+            };
+            if dn_tx.send(m).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), String>(())
+    };
+    let _ = tokio::join!(to_up, to_dn);
+    Ok(())
 }
 
 // ───────────────────────── SSE ─────────────────────────

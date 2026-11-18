@@ -165,6 +165,28 @@ else
   PW_LOC=""
 fi
 
+# ── Web 终端的数据面：ttyd 静态二进制 ──
+# Debian 13 仓库里没有 ttyd（从 forky 才开始打包），用官方 Release 的静态
+# 单文件（1.3 MB，无 .so 依赖）。它只用于往容器里推，宿主自己不跑。
+if [ ! -x /usr/local/bin/ttyd ]; then
+  case "$(uname -m)" in
+    x86_64) TTYD_ARCH=x86_64 ;;
+    aarch64|arm64) TTYD_ARCH=aarch64 ;;
+    *) TTYD_ARCH="" ;;
+  esac
+  if [ -n "$TTYD_ARCH" ]; then
+    say "下载 ttyd（Web 终端）"
+    if curl -fsSL --connect-timeout 10 -o /usr/local/bin/ttyd \
+        "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.$TTYD_ARCH"; then
+      chmod +x /usr/local/bin/ttyd
+      echo "  ttyd: $(/usr/local/bin/ttyd --version 2>/dev/null || echo 未知版本)"
+    else
+      rm -f /usr/local/bin/ttyd
+      echo "  ⚠ ttyd 下载失败——Web 终端不可用（其余功能不受影响）"
+    fi
+  fi
+fi
+
 echo
 say "安装完成"
 echo "  地址:   $ADDR"

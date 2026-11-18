@@ -45,6 +45,8 @@ pub enum StepKind {
     Bridge {
         zone: String,
         name: String,
+        /// 宿主在桥上的管理地址（Web 终端从宿主直连容器）
+        mgmt_ip: String,
         /// 上联的网桥；`wan` 时为外部桥
         uplink_bridge: String,
     },
@@ -65,6 +67,8 @@ pub enum StepKind {
         storage: String,
         /// 模板所在存储（查 volid 用）
         template_storage: String,
+        /// analysis 主机挂 mirr 桥的口（抓包落点）；其余主机为 None
+        mirr_bridge: Option<String>,
         node: Option<String>,
         /// 接入桥（建机时就绑，避免先建后改）
         bridge: String,
@@ -105,6 +109,8 @@ pub enum StepKind {
     },
     Mirror {
         zone: String,
+        /// 源桥的实际名字（zone 名与桥名不一定相同：lab → lablab）
+        bridge: String,
         source_host: String,
         source_vmid: u32,
         target_host: String,
@@ -147,10 +153,32 @@ impl Plan {
     ) -> Self {
         let mut steps = Vec::new();
 
+        // ── 0. mirr 桥：有 analysis 主机才建（纯二层、无 IP、不挂网关）──
+        let has_analysis = zones
+            .iter()
+            .any(|z| z.hosts.iter().any(|h| h.role == crate::core::spec::Role::Analysis));
+        if has_analysis {
+            let kind = StepKind::Bridge {
+                zone: "mirr".into(),
+                name: "mirr".into(),
+                mgmt_ip: String::new(),
+                uplink_bridge: String::new(),
+            };
+            steps.push(Step {
+                key: "bridge:mirr".into(),
+                phase: Phase::Bridge,
+                zone: "mirr".into(),
+                input_hash: hash_of(&kind),
+                deps: vec![],
+                kind,
+            });
+        }
+
         // ── 1. 桥：每个 zone 一个，先建上游 ──
         for z in zones {
             let kind = StepKind::Bridge {
                 zone: z.name.clone(),
+                mgmt_ip: z.bridge_mgmt_ip.clone(),
                 name: z.bridge.clone(),
                 uplink_bridge: z.uplink_bridge.clone().unwrap_or_default(),
             };
@@ -214,9 +242,19 @@ impl Plan {
                     template: h.template.clone(),
                     storage: h.storage.clone(),
                     template_storage: h.template_storage.clone(),
+                    mirr_bridge: if h.role == crate::core::spec::Role::Analysis {
+                        Some("mirr".to_string())
+                    } else {
+                        None
+                    },
                     node: h.node.clone(),
                     bridge: z.bridge.clone(),
-                    uplink_bridge: if h.role == crate::core::spec::Role::Gateway {
+                    // analysis 也要上联：它得自己 apt-get 装 apt-cacher-ng
+                    //（设计里是"可选"，但不给就没法装缓存服务）
+                    uplink_bridge: if matches!(
+                        h.role,
+                        crate::core::spec::Role::Gateway | crate::core::spec::Role::Analysis
+                    ) {
                         z.uplink_bridge.clone()
                     } else {
                         None
@@ -235,6 +273,8 @@ impl Plan {
                     deps: vec![
                         format!("bridge:{}", z.name),
                         format!("template:{}:{}", h.template_storage, h.template),
+                        // analysis 的 mirr 口要在建容器前就绪
+                        "bridge:mirr".to_string(),
                     ],
                     kind,
                 });
@@ -351,11 +391,13 @@ impl Plan {
                 for t in &targets {
                     let kind = StepKind::Mirror {
                         zone: z.name.clone(),
+                        bridge: z.bridge.clone(),
                         source_host: s.name.clone(),
                         source_vmid: s.vmid.unwrap_or_else(|| vmid_for(&z.name, &s.name)),
                         target_host: t.name.clone(),
                         target_vmid: t.vmid.unwrap_or_else(|| vmid_for(&z.name, &t.name)),
-                        target_iface: "eth0".into(),
+                        // 落点是 analysis 在 mirr 桥上的宿主侧 veth，执行时探测
+                        target_iface: String::new(),
                     };
                     steps.push(Step {
                         key: format!("mirror:{}:{}->{}", z.name, s.name, t.name),

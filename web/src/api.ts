@@ -106,7 +106,82 @@ export const api = {
     req<{ ok: boolean }>(`/api/runs/${runId}/cancel`, { method: "POST" }),
 
   doctor: () => req<{ items: DoctorItem[] }>("/api/doctor"),
+
+  // ── 运维 ──
+  runs: () => req<{ runs: RunRow[] }>("/api/runs"),
+
+  runSteps: (id: string) =>
+    req<{ steps: RunStepRow[] }>(`/api/runs/${id}/steps`),
+
+  retry: (id: string) =>
+    req<{ run_id: string }>(`/api/runs/${id}/retry`, { method: "POST" }),
+
+  hosts: () => req<{ hosts: HostRow[] }>("/api/hosts"),
+
+  power: (zone: string, host: string, action: "start" | "stop" | "reboot") =>
+    req<{ ok: boolean; vmid: number }>(
+      `/api/hosts/${zone}/${host}/power`,
+      { method: "POST", body: JSON.stringify({ action }) },
+    ),
+
+  snapshots: (zone: string, host: string) =>
+    req<{ snapshots: string[]; vmid: number }>(
+      `/api/snapshots/${zone}/${host}`,
+    ),
+
+  snapshotOp: (
+    zone: string,
+    host: string,
+    action: "create" | "rollback" | "delete",
+    name: string,
+  ) =>
+    req<{ ok: boolean }>(`/api/snapshots/${zone}/${host}`, {
+      method: "POST",
+      body: JSON.stringify({ action, name }),
+    }),
+
+  destroy: (zone: string) =>
+    req<{
+      ok: boolean;
+      destroyed_cts: [string, number][];
+      absent_cts: string[];
+      bridge_deleted: boolean;
+      kept_bridge: string | null;
+    }>("/api/destroy", {
+      method: "POST",
+      body: JSON.stringify({ zone, confirm: zone }),
+    }),
 };
+
+export type RunRow = {
+  id: string;
+  status: string;
+  spec_name: string | null;
+  started_at: string;
+  finished_at: string | null;
+};
+
+export type RunStepRow = {
+  step_key: string;
+  state: string;
+  message: string;
+  started_at: string;
+  finished_at: string;
+};
+
+export type HostRow = {
+  zone: string;
+  host: string;
+  vmid: number;
+  exists: boolean;
+  status: string;
+  name: string | null;
+};
+
+/** Web 终端的 iframe 地址（ttyd 的 base path 与后端反代一致）。 */
+export function terminalUrl(zone: string, host: string): string {
+  return `/terminal/${encodeURIComponent(zone)}/${encodeURIComponent(host)}/`;
+}
 
 /**
  * 订阅一次 run 的事件流。

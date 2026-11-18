@@ -59,6 +59,26 @@ CREATE TABLE IF NOT EXISTS run_steps (
 "#,
 )];
 
+/// run 历史行（只读视图，运维页直接序列化）。
+#[derive(Debug, serde::Serialize)]
+pub struct RunRow {
+    pub id: String,
+    pub status: String,
+    pub spec_name: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// 一次 run 内的步骤记录。
+#[derive(Debug, serde::Serialize)]
+pub struct RunStepRow {
+    pub step_key: String,
+    pub state: String,
+    pub message: String,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
@@ -278,6 +298,63 @@ impl Db {
     }
 
     /// 列出所有已记录状态的步骤（给 UI 显示"哪些已就绪"）。
+    /// run 历史（新→旧）。前端运维页用。
+    pub fn list_runs(&self, limit: u32) -> Vec<RunRow> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, status, spec_name, started_at, finished_at FROM runs ORDER BY started_at DESC LIMIT ?1",
+        ) {
+            Ok(st) => st,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![limit], |r| {
+            Ok(RunRow {
+                id: r.get(0)?,
+                status: r.get(1)?,
+                spec_name: r.get(2)?,
+                started_at: r.get(3)?,
+                finished_at: r.get(4)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// 一次 run 的步骤明细（含失败原因）。
+    pub fn run_steps(&self, run_id: &str) -> Vec<RunStepRow> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT step_key, state, COALESCE(message,''), COALESCE(started_at,''), COALESCE(finished_at,'') \
+             FROM run_steps WHERE run_id = ?1 ORDER BY started_at",
+        ) {
+            Ok(st) => st,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![run_id], |r| {
+            Ok(RunStepRow {
+                step_key: r.get(0)?,
+                state: r.get(1)?,
+                message: r.get(2)?,
+                started_at: r.get(3)?,
+                finished_at: r.get(4)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// 全部分配记录。前端主机列表用（主机身份的唯一权威是这张表）。
+    pub fn all_vmids(&self) -> Vec<(String, String, u32)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT zone, host, vmid FROM vmids ORDER BY vmid") {
+            Ok(st) => st,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn all_step_states(&self) -> Vec<(String, String, String)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn

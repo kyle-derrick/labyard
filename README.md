@@ -163,7 +163,10 @@ docs/design.md   唯一权威设计文档
 | ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` 8/8 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、靶机**无默认路由**、宿主入向被网关丢弃；幂等重跑 8/8 跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、靶机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）。真机暴露并修复了 6 处缺陷（见 git log `9eb34c1`）|
 | ✅ IPv6（区域内） | ULA 正确下发（gw `::1`、靶机 `::14`）、区域内互通、NAT66 masquerade 规则在位；出公网未测（宿主无 IPv6 上游，环境限制）|
 | ⚠️ 仅设计推演 | IPv6 双栈全链路（ULA 已在真机下发、NAT66 规则在位，但端到端连通未测）、厚 LVM 快照、`pct snapshot` |
-| ❌ 未实现 | ttyd 反代与文件面板、retire/revive、升级迁移（此前 README 误写为"未验证"——它们尚未实现） |
+| ✅ **Web 终端** | ttyd 1.7.7 静态二进制注入容器（systemd 单元、绑容器内网地址）→ axum HTTP+WS 反代（hyper client + tokio-tungstenite）→ iframe 嵌入（ttyd 自带 xterm.js、CJK 输入、ZMODEM 传文件）。真机验证：页面 200、WS 握手 101 |
+| ✅ **Web 运维** | 主机表格（电源 start/stop/reboot）、快照（列/建/回滚/删）、run 历史与明细、retry、destroy（zone 名二次确认）。真机逐项验证通过 |
+| ✅ **mirror/analysis** | analysis 主机自动挂 `mirr` 桥（纯二层无 IP）+ 宿主侧 `labmirror@` 单元（tc mirred），落点按桥探测自愈；apt-cacher-ng 缓存链路端到端验证（无外网靶机经缓存装包成功） |
+| ❌ 未实现 | retire/revive、gateway egress/pub/vpn、zone 多规格管理、升级迁移 |
 
 **mock 全绿不等于真机通过**，这一条不含糊——但现在已经有了真机证据。
 

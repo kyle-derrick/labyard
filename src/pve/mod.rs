@@ -325,6 +325,7 @@ impl Pve {
     pub async fn ensure_bridge(
         &self,
         name: &str,
+        mgmt_ip: &str,
         cancel: &CancellationToken,
     ) -> Result<(), PveError> {
         let script = format!(
@@ -335,6 +336,12 @@ else
   ip link add name {name} type bridge
   ip link set {name} up
   echo "created {name}"
+fi
+# 宿主管理地址：Web 终端与调试从宿主 L2 直达容器，不经网关转发，
+# 所以网关的入向丢弃规则对这些流量不生效（isolation 语义不变。
+# mirr 是纯二层桥，mgmt 为空时跳过）
+if [ -n "{mgmt_ip}" ]; then
+  ip addr replace {mgmt_ip} dev {name}
 fi
 # 持久化（PVE 9 用 /etc/network/interfaces，追加式，重复执行不重复写）
 if ! grep -q "^iface {name} " /etc/network/interfaces 2>/dev/null; then
@@ -409,6 +416,7 @@ fi
         template_vol: &str,
         bridge: &str,
         uplink_bridge: Option<&str>,
+        mirr_bridge: Option<&str>,
         password: Option<&str>,
         ssh_keys: &[String],
         cancel: &CancellationToken,
@@ -449,6 +457,11 @@ fi
                     // 上联网卡走 DHCP：wan 桥通常有 DHCP，或用户自己配好再改
                     args.push(format!("name=eth1,bridge={up},ip=dhcp,type=veth"));
                 }
+                if let Some(mirr) = mirr_bridge {
+                    // analysis 的抓包口：纯二层、无 IP（ip=manual 不配地址）
+                    args.push("--net2".into());
+                    args.push(format!("name=eth2,bridge={mirr},ip=manual,type=veth"));
+                }
                 if let Some(p) = password {
                     args.push("--password".into());
                     args.push(p.into());
@@ -474,6 +487,10 @@ fi
                     // 老容器可能是上一版建的，只有一块网卡——补上而不是重建
                     args.push("--net1".into());
                     args.push(format!("name=eth1,bridge={up},ip=dhcp,type=veth"));
+                }
+                if let Some(mirr) = mirr_bridge {
+                    args.push("--net2".into());
+                    args.push(format!("name=eth2,bridge={mirr},ip=manual,type=veth"));
                 }
                 self.cmd(
                     "ct-update",
@@ -543,6 +560,214 @@ fi
         self.cmd(
             &format!("ct-{action}"),
             CommandSpec::new("pct", args).with_timeout(Duration::from_secs(300)),
+            cancel,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 往容器里装 ttyd 并起 systemd 单元（Web 终端的数据面）。
+    ///
+    /// 二进制从宿主 `/usr/local/bin/ttyd` 推入——它是静态链接的单文件，
+    /// 不依赖容器内任何库。宿主没有这个文件时返回 Ok(false)，由调用方
+    /// 决定怎么说（终端是增强功能，不该炸掉基础配置）。
+    ///
+    /// base path 用 `/terminal/<zone>/<host>`：ttyd 生成页面里的绝对 URL
+    /// 会带上这个前缀，正好与外层反代的路径一致，反代不需要改写任何内容。
+    pub async fn ensure_terminal(
+        &self,
+        vmid: u32,
+        zone: &str,
+        host: &str,
+        bind_ip: &str,
+        cancel: &CancellationToken,
+    ) -> Result<bool, PveError> {
+        const HOST_TTYD: &str = "/usr/local/bin/ttyd";
+        if !std::path::Path::new(HOST_TTYD).exists() {
+            return Ok(false);
+        }
+
+        // 容器里没有才推（1.3 MB，每次 bootstrap 都推一遍是浪费）
+        let has = self
+            .runner
+            .run(
+                &format!("ttyd-check:{vmid}"),
+                &CommandSpec::new("pct", vec!["exec".into(), vmid.to_string(), "--".into(), "test".into(), "-x".into(), "/usr/local/bin/ttyd".into()]),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        if has.code != Some(0) {
+            self.cmd(
+                "ttyd-push",
+                CommandSpec::new(
+                    "pct",
+                    vec![
+                        "push".into(),
+                        vmid.to_string(),
+                        HOST_TTYD.into(),
+                        "/usr/local/bin/ttyd".into(),
+                        "--perms".into(),
+                        "0755".into(),
+                    ],
+                )
+                .with_timeout(Duration::from_secs(120)),
+                cancel,
+            )
+            .await?;
+        }
+
+        let base = format!("/terminal/{zone}/{host}");
+        let unit = format!(
+            r#"[Unit]
+Description=labyard Web terminal (ttyd)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/ttyd -p 7681 -i {bind_ip} -b {base} -W -t fontSize=14 /bin/bash -l
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"#
+        );
+        let b64 = base64_encode(unit.as_bytes());
+        let script = format!(
+            "set -e; echo {b64} | base64 -d > /etc/systemd/system/labyard-ttyd.service.new;              if cmp -s /etc/systemd/system/labyard-ttyd.service.new /etc/systemd/system/labyard-ttyd.service; then                rm -f /etc/systemd/system/labyard-ttyd.service.new; echo unchanged;              else                mv /etc/systemd/system/labyard-ttyd.service.new /etc/systemd/system/labyard-ttyd.service;                systemctl daemon-reload; systemctl enable --now labyard-ttyd;                systemctl restart labyard-ttyd; echo updated;              fi; systemctl is-active labyard-ttyd || true"
+        );
+        self.ct_exec(
+            "ttyd-unit",
+            vmid,
+            &["sh", "-c", &script],
+            Duration::from_secs(60),
+            cancel,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// 容器某块网卡的实际 IPv4（从容器内部读，而不是查 spec）。
+    ///
+    /// 为什么不从规格算：终端这类"操作现成环境"的功能不该依赖 Web 保存的
+    /// 规格存在（CLI 建的环境同样要能开终端），也不该假设地址没被手工改过。
+    pub async fn ct_ip(
+        &self,
+        vmid: u32,
+        iface: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, PveError> {
+        let out = self
+            .runner
+            .run(
+                &format!("ct-ip:{vmid}"),
+                &CommandSpec::new(
+                    "pct",
+                    vec![
+                        "exec".into(),
+                        vmid.to_string(),
+                        "--".into(),
+                        "ip".into(),
+                        "-4".into(),
+                        "-o".into(),
+                        "addr".into(),
+                        "show".into(),
+                        iface.into(),
+                    ],
+                )
+                .with_timeout(Duration::from_secs(20)),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        // 输出形如 `2: eth0    inet 10.77.0.20/24 brd ...`：
+        // 找 "inet" 的下一个 token，切掉前缀
+        out.stdout
+            .split_whitespace()
+            .skip_while(|t| *t != "inet")
+            .nth(1)
+            .map(|cidr| cidr.split('/').next().unwrap_or(cidr).to_string())
+            .ok_or_else(|| {
+                PveError::Run(crate::core::runner::RunError::NonZero {
+                    cmd: format!("ip -4 addr show {iface}"),
+                    code: None,
+                })
+            })
+    }
+
+    /// 容器快照列表（PVE 的 `current` 是活动节点不是快照，滤掉）。
+    pub async fn snapshots_of(
+        &self,
+        vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, PveError> {
+        #[derive(Deserialize)]
+        struct Snap {
+            #[serde(default)]
+            name: String,
+        }
+        let snaps: Vec<Snap> = self
+            .get_json(
+                &format!("/nodes/{}/lxc/{vmid}/snapshot", self.node),
+                &[],
+                cancel,
+            )
+            .await
+            .unwrap_or_default();
+        Ok(snaps
+            .into_iter()
+            .map(|s| s.name)
+            .filter(|n| n != "current" && !n.is_empty())
+            .collect())
+    }
+
+    /// 回滚到快照并重新启动（pct rollback 会把容器停下——恢复到快照点
+    /// 而不重启的话，用户看到的还是"容器停了"，像坏了）。
+    pub async fn rollback_snapshot(
+        &self,
+        vmid: u32,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), PveError> {
+        self.cmd(
+            "snapshot-rollback",
+            CommandSpec::new(
+                "pct",
+                [
+                    "rollback".to_string(),
+                    vmid.to_string(),
+                    name.to_string(),
+                ],
+            )
+            .with_timeout(Duration::from_secs(600)),
+            cancel,
+        )
+        .await?;
+        // 快照点如果是 running 打的，回滚后 PVE 保持 stopped——起来它
+        let _ = self.ct_action(vmid, "start", cancel).await;
+        Ok(())
+    }
+
+    /// 删除快照。
+    pub async fn del_snapshot(
+        &self,
+        vmid: u32,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), PveError> {
+        self.cmd(
+            "snapshot-delete",
+            CommandSpec::new(
+                "pct",
+                [
+                    "delsnapshot".to_string(),
+                    vmid.to_string(),
+                    name.to_string(),
+                ],
+            )
+            .with_timeout(Duration::from_secs(300)),
             cancel,
         )
         .await?;

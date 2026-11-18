@@ -1,0 +1,11 @@
+[Unit]
+Description=labyard traffic mirror instance %i
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/labmirror %i
+
+[Install]
+WantedBy=multi-user.target

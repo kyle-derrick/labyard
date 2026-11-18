@@ -47,7 +47,12 @@ if [ -n "$APT_MIRROR" ]; then
   # （tuna 与 apt-cacher-ng 的路径映射都吃这个规则）。
   . /etc/os-release 2>/dev/null
   codename="${VERSION_CODENAME:-bookworm}"
-  sec="${APT_MIRROR%/debian}-security"
+  # security 源：镜像若以 /debian 结尾，换成 /debian-security（tuna 与
+  # apt-cacher-ng 都是这个路径布局）；否则原样用（用户给了完整地址）
+  case "$APT_MIRROR" in
+    */debian) sec="${APT_MIRROR%/debian}/debian-security" ;;
+    *) sec="$APT_MIRROR" ;;
+  esac
   [ -f /etc/apt/sources.list ] && mv /etc/apt/sources.list /etc/apt/sources.list.bak
   [ -f /etc/apt/sources.list.d/debian.sources ] && mv /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak
   cat > /etc/apt/sources.list <<EOF

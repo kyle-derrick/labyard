@@ -1176,9 +1176,10 @@ POST   /api/zones/{z}/snapshot            {name}
 >
 > | 已实现 | `GET /api/health`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me`、`GET /api/state`、`GET/PUT /api/spec`（规格持久化）、`POST /api/preview`、`POST /api/apply`、`GET /api/runs/{id}/events`（SSE）、`POST /api/runs/{id}/cancel`、`GET /api/doctor`、`GET /api/openapi.json` |
 > |---|---|
-> | **未实现** | zone 的多份管理与 CRUD（当前只有一份 `lab.yaml`）、`/api/topology`、`/api/runs` 列表与 `retry`、`/hosts` 与 `power`、`gateway/egress`、`gateway/pub`、`gateway/vpn`、`/mirrors` 的 CRUD、`/snapshot`、destroy |
+> | **2026-11 补齐** | `/api/runs` 列表 + `/steps` + `/retry`、`/api/hosts` + `power`、`/api/snapshots`（列/建/回滚/删）、`/api/destroy`、Web 终端反代 `/terminal/{z}/{h}/*`（ttyd + WS，含 ZMODEM 文件传输）。以上均已在真机 PVE 9.2.2 上逐项验证 |
+> | **仍未实现** | zone 多份管理与 CRUD（当前一份 `lab.yaml`）、`/api/topology`、`gateway/egress`、`gateway/pub`、`gateway/vpn`、`/mirrors` 的 CRUD、retire/revive、升级迁移 |
 >
-> 未实现的这些**不是遗漏，是刻意的边界**：它们全部依赖真机行为（`pct exec` 进容器调 `labgw` 的输出格式、ttyd 的 header 信任、VPN 的密钥分发），在没有 PVE 9 可测的条件下写出来只能是猜。核心闭环（写 YAML → 看计划 → 幂等执行 → 实时日志）是唯一能自证的部分，所以先把它做扎实。
+> 早期把"没实现"写成"只能在真机验证后再写"——真机到手后发现这个理由不成立的地方已经补齐（终端反代的两处坑：axum 的 `{*path}` 不匹配空段、`capture=false` 时 stdout 为空，都只有真机能撞出来）。
 >
 > **规格持久化**落在 `paths.specs/lab.yaml`，不是 SQLite：运维要能 `cat`、能进 git、能手工改回去。写入走"先 parse + resolve 校验，再 tmp + rename 原子替换"——非法 YAML 一律 400 且不碰旧文件。刷新页面从服务端读回，改过未保存时标题旁有 `未保存` 标签。
 
