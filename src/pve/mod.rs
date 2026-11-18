@@ -248,11 +248,38 @@ impl Pve {
         Ok(v.into_iter().map(|n| n.node).collect())
     }
 
+    /// PVE 配置视图里的桥。**只用于 doctor 展示**——存在性判定别用它：
+    /// `ip link add type bridge` 建出来的桥在这里 `type` 是 `unknown`
+    /// （PVE 只认 /etc/network/interfaces 里写全参数的段），真机实测
+    /// 用它判存在，桥每轮都被误判"已消失"而重跑。
     pub async fn bridges(&self, cancel: &CancellationToken) -> Result<Vec<Iface>, PveError> {
         let v: Vec<Iface> = self
             .get_json(&format!("/nodes/{}/network", self.node), &[], cancel)
             .await?;
         Ok(v.into_iter().filter(|i| i.kind == "bridge").collect())
+    }
+
+    /// 内核实际生效面：`ip -o link show type bridge`。桥的本质是内核接口，
+    /// /etc/network/interfaces 只是持久化——"存在不存在"看这里才不会说谎。
+    pub async fn kernel_bridges(&self, cancel: &CancellationToken) -> Result<Vec<String>, PveError> {
+        let out = self
+            .runner
+            .run(
+                "probe:bridges",
+                &CommandSpec::new("ip", vec!["-o", "link", "show", "type", "bridge"]),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                // `4: lablab: <BROADCAST,...>` → 取第 2 段去冒号
+                l.split(':').nth(1).map(|s| s.trim().to_string())
+            })
+            .collect())
     }
 
     pub async fn storages(&self, cancel: &CancellationToken) -> Result<Vec<Storage>, PveError> {

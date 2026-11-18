@@ -156,19 +156,21 @@ fi
 IP=$(hostname -I | awk '{print $1}')
 ADDR="https://$IP:8443"
 
-# 首次安装才会打印密码
+# 密码只在服务首次启动时打进 journal。安装器**不**把它捞出来打印——
+# 安装输出会进 shell 历史、终端记录和自动化管道，journal 才是它唯一的落点。
+# 这不是绕弯：bootstrap_password 的设计就是"启动时打一次"，这里复述等于第二次泄露点。
 if journalctl -u labyard --since "2 minutes ago" 2>/dev/null | grep -q "初始管理员密码"; then
-  PW=$(journalctl -u labyard --since "2 minutes ago" 2>/dev/null | sed -n 's/.*初始管理员密码: //p' | head -1)
+  PW_LOC="journalctl -u labyard | grep 初始管理员密码"
 else
-  PW=""
+  PW_LOC=""
 fi
 
 echo
 say "安装完成"
 echo "  地址:   $ADDR"
-if [ -n "$PW" ]; then
-  echo "  密码:   $PW"
-  echo "          （只显示这一次，已写入 $STATEDIR/password.hash 的哈希）"
+if [ -n "$PW_LOC" ]; then
+  echo "  密码:   首次安装，执行 $PW_LOC 查看"
+  echo "          （只在 journal 里出现这一次；忘了就删 $STATEDIR/password.hash 再重启）"
 else
   echo "  密码:   沿用上次的（忘了就删 $STATEDIR/password.hash 再重启）"
 fi

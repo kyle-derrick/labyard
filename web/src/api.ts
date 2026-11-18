@@ -29,6 +29,7 @@ export type RunEvent =
   | { kind: "started"; key: string; command: string; pid: number }
   | { kind: "line"; key: string; stream: "stdout" | "stderr"; line: string }
   | { kind: "skipped"; key: string; lines: number }
+  | { kind: "upstream_skipped"; key: string; reason: string }
   | { kind: "finished"; key: string; code: number | null; duration_ms: number }
   | { kind: "failed"; key: string; error: string };
 

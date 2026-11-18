@@ -542,7 +542,7 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             items.push(DoctorItem {
                 name: "PVE 版本".into(),
                 ok: major >= 9,
-                detail: format!("{}.{} (需要 ≥ 9.0)", v.version, v.release),
+                detail: format!("{} (需要 ≥ 9.0)", v.version),
             });
         }
         Err(e) => items.push(DoctorItem {
@@ -601,6 +601,34 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         }
         Err(e) => items.push(DoctorItem {
             name: "存储".into(),
+            ok: false,
+            detail: e.to_string(),
+        }),
+    }
+
+    // 模板（vztmpl）必须有可落地的存储。真机教训：rootfs 用 lvmthin 时
+    // `pveam download local-lvm` 直接 255——模板和 rootfs 是两种内容类型，
+    // 真实环境可能一体（dir/NFS）也可能分开（约定放 local），doctor 把
+    // 现状列出来，哪个存储能放模板一目了然。
+    match state.pve.storages(&cancel).await {
+        Ok(ss) => {
+            let tpl: Vec<String> = ss
+                .iter()
+                .filter(|s| s.supports("vztmpl"))
+                .map(|s| format!("{}({})", s.storage, s.kind))
+                .collect();
+            items.push(DoctorItem {
+                name: "模板存储".into(),
+                ok: !tpl.is_empty(),
+                detail: if tpl.is_empty() {
+                    "没有支持 vztmpl 的存储——模板将无处下载，spec 里可用 template_storage 指定".into()
+                } else {
+                    format!("可放模板: {}；spec 默认跟随 rootfs 存储或用 template_storage 指定", tpl.join(", "))
+                },
+            });
+        }
+        Err(e) => items.push(DoctorItem {
+            name: "模板存储".into(),
             ok: false,
             detail: e.to_string(),
         }),

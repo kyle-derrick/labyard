@@ -168,6 +168,8 @@ export default function Editor() {
             });
           } else if (ev.kind === "skipped") {
             pushLog({ cls: "ln-skip", text: `[已省略 ${ev.lines} 行]` });
+          } else if (ev.kind === "upstream_skipped") {
+            pushLog({ cls: "ln-skip", text: `⊘ ${ev.key}: ${ev.reason}` });
           } else if (ev.kind === "failed") {
             pushLog({ cls: "ln-fail", text: `✗ ${ev.key}: ${ev.error}` });
           } else if (ev.kind === "started") {

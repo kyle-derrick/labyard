@@ -27,6 +27,11 @@ pub struct Defaults {
     pub disk: Option<u32>,
     pub template: Option<String>,
     pub storage: Option<String>,
+    /// 模板（vztmpl）放哪个存储。**默认跟随 `storage`**——模板和 rootfs 在同一个
+    /// 存储里的环境（dir 型、NFS 一体）零配置。rootfs 用 lvmthin/zfspool 之类
+    /// 不支持 vztmpl 内容的存储时必须显式分开写（PVE 约定放在 `local`）。
+    /// 真机验证教训：把模板下载打到 lvmthin 上，`pveam download` 直接 255。
+    pub template_storage: Option<String>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -62,6 +67,7 @@ pub struct ZoneSpec {
     pub disk: Option<u32>,
     pub template: Option<String>,
     pub storage: Option<String>,
+    pub template_storage: Option<String>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -117,6 +123,7 @@ pub struct HostSpec {
     pub disk: Option<u32>,
     pub template: Option<String>,
     pub storage: Option<String>,
+    pub template_storage: Option<String>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -180,7 +187,10 @@ pub struct ResolvedHost {
     pub memory: u32,
     pub disk: u32,
     pub template: String,
+    /// rootfs 落点
     pub storage: String,
+    /// 模板所在存储；默认跟随 storage
+    pub template_storage: String,
     pub node: Option<String>,
     pub dns: Vec<String>,
     pub ssh_keys: Vec<String>,
@@ -322,6 +332,15 @@ impl Spec {
                     .or_else(|| z.storage.clone())
                     .or_else(|| self.defaults.storage.clone())
                     .ok_or_else(|| SpecError::MissingField(zone_name.clone(), "storage".into()))?;
+                // 模板存储：显式指定 > 跟随 rootfs 存储。这里**不做**"存储是否
+                // 支持 vztmpl"的判断——那要查 PVE，是 doctor 的职责（见 doctor
+                // 的"模板存储"检查项），解析层只做三层合并。
+                let template_storage = h
+                    .template_storage
+                    .clone()
+                    .or_else(|| z.template_storage.clone())
+                    .or_else(|| self.defaults.template_storage.clone())
+                    .unwrap_or_else(|| storage.clone());
 
                 // 主机号：写了就校验，没写就按角色默认位往后找第一个空的。
                 // 早先的实现直接用角色默认位，**同一个 zone 里两台 server 会拿到
@@ -389,6 +408,7 @@ impl Spec {
                     disk,
                     template,
                     storage,
+                    template_storage,
                     node: h
                         .node
                         .clone()

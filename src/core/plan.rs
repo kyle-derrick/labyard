@@ -49,7 +49,8 @@ pub enum StepKind {
         uplink_bridge: String,
     },
     Template {
-        storage: String,
+        /// 模板所在存储（vztmpl 内容），与 rootfs 的 `storage` 是两回事
+        template_storage: String,
         template: String,
     },
     Container {
@@ -60,7 +61,10 @@ pub enum StepKind {
         memory: u32,
         disk: u32,
         template: String,
+        /// rootfs 落点
         storage: String,
+        /// 模板所在存储（查 volid 用）
+        template_storage: String,
         node: Option<String>,
         /// 接入桥（建机时就绑，避免先建后改）
         bridge: String,
@@ -164,14 +168,14 @@ impl Plan {
             });
         }
 
-        // ── 2. 模板：同 (storage, template) 只下一次 ──
+        // ── 2. 模板：同 (template_storage, template) 只下一次 ──
         let mut seen_tpl: BTreeMap<(String, String), ()> = BTreeMap::new();
         for z in zones {
             for h in &z.hosts {
-                let k = (h.storage.clone(), h.template.clone());
+                let k = (h.template_storage.clone(), h.template.clone());
                 if seen_tpl.insert(k.clone(), ()).is_none() {
                     let kind = StepKind::Template {
-                        storage: k.0.clone(),
+                        template_storage: k.0.clone(),
                         template: k.1.clone(),
                     };
                     steps.push(Step {
@@ -209,6 +213,7 @@ impl Plan {
                     disk: h.disk,
                     template: h.template.clone(),
                     storage: h.storage.clone(),
+                    template_storage: h.template_storage.clone(),
                     node: h.node.clone(),
                     bridge: z.bridge.clone(),
                     uplink_bridge: if h.role == crate::core::spec::Role::Gateway {
@@ -229,7 +234,7 @@ impl Plan {
                     input_hash: hash_of(&kind),
                     deps: vec![
                         format!("bridge:{}", z.name),
-                        format!("template:{}:{}", h.storage, h.template),
+                        format!("template:{}:{}", h.template_storage, h.template),
                     ],
                     kind,
                 });
@@ -424,7 +429,7 @@ mod tests {
     use crate::core::spec::Spec;
 
     const Y: &str = r#"
-defaults: { cores: 2, memory: 1024, disk: 8, template: debian-13, storage: local-lvm }
+defaults: { cores: 2, memory: 1024, disk: 8, template: debian-13, storage: local-lvm, template_storage: local }
 zones:
   main:
     uplink: wan
@@ -467,11 +472,11 @@ zones:
         let p = build(Y);
         let ct = p.steps.iter().find(|s| s.key == "ct:main:gateway").unwrap();
         assert!(ct.deps.contains(&"bridge:main".to_string()));
-        assert!(ct.deps.contains(&"template:local-lvm:debian-13".to_string()));
+        assert!(ct.deps.contains(&"template:local:debian-13".to_string()));
     }
 
     #[test]
-    fn template_is_deduped() {
+    fn template_is_deduped() { // 同 (template_storage, template) 只下一次
         let p = build(Y);
         let n = p.steps.iter().filter(|s| s.phase == Phase::Template).count();
         assert_eq!(n, 1, "同一 storage+template 只应下载一次");

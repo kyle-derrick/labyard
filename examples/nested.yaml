@@ -10,6 +10,7 @@ defaults:
   disk: 8
   template: debian-13-standard
   storage: local-lvm
+  template_storage: local
 
 zones:
   main:

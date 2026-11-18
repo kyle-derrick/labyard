@@ -73,6 +73,10 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // WAL 是单写者：Container 阶段并发 2 时两个写会撞锁。真机实测撞过——
+        // 早期写失败被 `let _ =` 吞掉，容器建成但状态没记录，下一轮误判
+        // "从未执行"。等待重试是正解，静默丢写是谎言。
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -129,9 +133,17 @@ impl Db {
         .flatten()
     }
 
-    pub fn record_step(&self, key: &str, hash: &str, state: &str, message: Option<&str>) {
+    /// 返回写入错误而不是吞掉：状态记录失败 = 这一步不算完成，
+    /// 调用方要把它当失败处理（资源可能已经建成，重跑由幂等保证安全）。
+    pub fn record_step(
+        &self,
+        key: &str,
+        hash: &str,
+        state: &str,
+        message: Option<&str>,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO step_state (key, input_hash, state, message, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(key) DO UPDATE SET
@@ -140,7 +152,8 @@ impl Db {
                 message = excluded.message,
                 updated_at = excluded.updated_at",
             params![key, hash, state, message, now()],
-        );
+        )
+        .map(|_| ())
     }
 
     /// 清掉某个 key 的记录（销毁资源后调用，否则下次 apply 会以为已完成）。
@@ -236,15 +249,22 @@ impl Db {
             .flatten()
     }
 
-    pub fn record_run_step(&self, run_id: &str, step_key: &str, state: &str, message: Option<&str>) {
+    pub fn record_run_step(
+        &self,
+        run_id: &str,
+        step_key: &str,
+        state: &str,
+        message: Option<&str>,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO run_steps (run_id, step_key, state, message, started_at, finished_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(run_id, step_key) DO UPDATE SET
                 state = excluded.state, message = excluded.message, finished_at = excluded.finished_at",
             params![run_id, step_key, state, message, now()],
-        );
+        )
+        .map(|_| ())
     }
 
     /// 列出所有已记录状态的步骤（给 UI 显示"哪些已就绪"）。

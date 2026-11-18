@@ -94,6 +94,11 @@ pub enum Event {
         code: Option<i32>,
         duration_ms: u64,
     },
+    /// 因上游失败而跳过的步骤（区别于 Skipped——那是日志背压丢行）
+    UpstreamSkipped {
+        key: String,
+        reason: String,
+    },
     Failed {
         key: String,
         error: String,

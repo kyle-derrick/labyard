@@ -201,7 +201,7 @@ async fn doctor(config_path: PathBuf, json: bool) -> Result<(), Box<dyn std::err
             rows.push((
                 "PVE 版本".into(),
                 major >= 9,
-                format!("{}.{}（需要 ≥ 9.0）", v.version, v.release),
+                format!("{}（需要 ≥ 9.0）", v.version),
             ));
         }
         Err(e) => rows.push(("PVE 版本".into(), false, e.to_string())),
@@ -225,6 +225,22 @@ async fn doctor(config_path: PathBuf, json: bool) -> Result<(), Box<dyn std::err
                 .map(|s| format!("{} ({})", s.storage, s.kind))
                 .collect();
             rows.push(("存储(rootdir)".into(), !list.is_empty(), list.join(", ")));
+            // 模板（vztmpl）必须有可落地的存储。真机教训：rootfs 用 lvmthin 时
+            // `pveam download local-lvm` 直接 255——模板和 rootfs 是两种内容类型。
+            let tpl: Vec<String> = ss
+                .iter()
+                .filter(|s| s.supports("vztmpl"))
+                .map(|s| format!("{} ({})", s.storage, s.kind))
+                .collect();
+            rows.push((
+                "模板存储(vztmpl)".into(),
+                !tpl.is_empty(),
+                if tpl.is_empty() {
+                    "没有支持 vztmpl 的存储；spec 可用 template_storage 指定".into()
+                } else {
+                    tpl.join(", ")
+                },
+            ));
         }
         Err(e) => rows.push(("存储".into(), false, e.to_string())),
     }

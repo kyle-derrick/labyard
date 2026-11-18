@@ -85,8 +85,8 @@ impl Executor {
                 }
             }
         }
-        for b in self.pve.bridges(cancel).await? {
-            snap.bridges.insert(b.iface);
+        for b in self.pve.kernel_bridges(cancel).await? {
+            snap.bridges.insert(b);
         }
 
         let mut storages: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
@@ -120,9 +120,12 @@ impl Executor {
         let exists = match &step.kind {
             StepKind::Bridge { name, .. } => snap.bridges.contains(name),
             StepKind::Container { vmid, .. } => snap.vmids.contains(vmid),
-            StepKind::Template { storage, template } => snap
+            StepKind::Template {
+                template_storage,
+                template,
+            } => snap
                 .templates
-                .get(&(storage.clone(), template.clone()))
+                .get(&(template_storage.clone(), template.clone()))
                 .map(|v| v.is_some())
                 .unwrap_or(true),
             // Net / Bootstrap / Mirror / Snapshot 的"存在"检查需要进容器或查快照，
@@ -149,7 +152,9 @@ impl Executor {
             .steps
             .iter()
             .filter_map(|s| match &s.kind {
-                StepKind::Template { storage, template } => Some((storage.clone(), template.clone())),
+                StepKind::Template { template_storage, template } => {
+                    Some((template_storage.clone(), template.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -177,6 +182,10 @@ impl Executor {
         };
         let snap = Arc::new(tokio::sync::Mutex::new(snap));
 
+        // 失败**或被跳过**的 key 集合，必须传递闭包：模板失败 → ct 跳过 →
+        // ct 不算 failed，如果跳过不进集合，net 还会去 exec 一个不存在的容器。
+        let mut failed_keys: std::collections::HashSet<String> = Default::default();
+
         for phase in [
             Phase::Bridge,
             Phase::Template,
@@ -190,6 +199,25 @@ impl Executor {
             if steps.is_empty() {
                 continue;
             }
+            // 依赖里有失败步骤的，直接跳过（记 skipped，不写 DB——下次 run 上游
+            // 成功了照常执行）
+            let (blocked, runnable): (Vec<Step>, Vec<Step>) = steps.into_iter().partition(|s| {
+                s.deps.iter().any(|d| failed_keys.contains(d))
+            });
+            for s in blocked {
+                summary.skipped += 1;
+                failed_keys.insert(s.key.clone());
+                let _ = tx
+                    .send(Event::UpstreamSkipped {
+                        key: s.key.clone(),
+                        reason: "上游步骤失败，本步骤跳过".into(),
+                    })
+                    .await;
+            }
+            if runnable.is_empty() {
+                continue;
+            }
+            let steps = runnable;
             // 建容器最重：并发压低；建桥/网络很轻：可以放宽。
             let limit = match phase {
                 Phase::Bridge | Phase::Template | Phase::Mirror => 1,
@@ -207,6 +235,7 @@ impl Executor {
                     StepState::Applied => summary.applied += 1,
                     StepState::Failed => {
                         summary.failed += 1;
+                        failed_keys.insert(key.clone());
                         if let Some(e) = err {
                             summary.errors.push((key, e));
                         }
@@ -317,8 +346,22 @@ async fn execute_one(
 
     match result {
         Ok(()) => {
-            db.record_step(&step.key, &step.input_hash, "done", None);
-            db.record_run_step(run_id, &step.key, "done", None);
+            // 状态写不进去就不算完成——谎报"完成"比失败更糟：下次 apply
+            // 会因为记录存在而跳过，而那个"完成"从来没被持久化过。
+            if let Err(e) = db.record_step(&step.key, &step.input_hash, "done", None) {
+                return (
+                    step.key,
+                    StepState::Failed,
+                    Some(format!("步骤已执行但状态记录失败: {e}")),
+                );
+            }
+            if let Err(e) = db.record_run_step(run_id, &step.key, "done", None) {
+                return (
+                    step.key,
+                    StepState::Failed,
+                    Some(format!("步骤已执行但 run 记录失败: {e}")),
+                );
+            }
             // 更新快照：后续步骤能看到刚建出来的东西
             {
                 let mut g = snap.lock().await;
@@ -329,9 +372,14 @@ async fn execute_one(
                     StepKind::Container { vmid, .. } => {
                         g.vmids.insert(*vmid);
                     }
-                    StepKind::Template { storage, template } => {
-                        g.templates
-                            .insert((storage.clone(), template.clone()), Some(template.clone()));
+                    StepKind::Template {
+                        template_storage,
+                        template,
+                    } => {
+                        g.templates.insert(
+                            (template_storage.clone(), template.clone()),
+                            Some(template.clone()),
+                        );
                     }
                     _ => {}
                 }
@@ -363,8 +411,11 @@ async fn apply_step(
             pve.ensure_bridge(name, cancel).await?;
         }
 
-        StepKind::Template { storage, template } => {
-            pve.ensure_template(storage, template, cancel).await?;
+        StepKind::Template {
+            template_storage,
+            template,
+        } => {
+            pve.ensure_template(template_storage, template, cancel).await?;
         }
 
         StepKind::Container {
@@ -375,18 +426,20 @@ async fn apply_step(
             disk,
             template,
             storage,
+            template_storage,
             bridge,
             uplink_bridge,
             ssh_keys,
             password,
             ..
         } => {
-            // 模板的完整 volid 从快照里取（probe 阶段已经查过）
-            let vols = pve.templates_on(storage, cancel).await?;
+            // 模板的完整 volid 从模板存储里取（probe 阶段已经查过）。
+            // 真机教训：这里早期用的是 rootfs 存储，模板不在上面就报"找不到"。
+            let vols = pve.templates_on(template_storage, cancel).await?;
             let vol = vols
                 .iter()
                 .find(|v| v.contains(template.as_str()))
-                .ok_or_else(|| format!("存储 {storage} 上找不到模板 {template}"))?;
+                .ok_or_else(|| format!("存储 {template_storage} 上找不到模板 {template}"))?;
             pve.ensure_ct(
                 *vmid,
                 hostname,
@@ -417,7 +470,16 @@ async fn apply_step(
             ..
         } => {
             let script = if *is_gateway {
-                net::gateway_script(&zone_cidr_from(ipv4), ipv6_prefix.as_deref(), "eth1", *nat, dns)
+                // 网关接口地址是它自己的 IP（10.77.0.1/24），不是网段号——
+                // 真机实测发现早期把网段地址写上了接口。
+                net::gateway_script(
+                    ipv4,
+                    &zone_cidr_from(ipv4),
+                    ipv6_prefix.as_deref(),
+                    "eth1",
+                    *nat,
+                    dns,
+                )
             } else {
                 net::host_script(ipv4, gateway.as_deref(), ipv6_prefix.as_deref(), *default_route, dns)
             };
