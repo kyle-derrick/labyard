@@ -1,0 +1,28 @@
+# 两层嵌套：sub 的上联是 main 的网关
+#
+# 结构：wan → [main.gateway] → main 内网 → [sub.gateway] → sub 内网
+# 每个 zone 独立 /24 与独立 ULA /64，NAT66 逐层转译。
+#
+# 注意：zone 名 ≤ 10 字符（网桥名 lab<zone> 要落在 IFNAMSIZ=15 以内）
+defaults:
+  cores: 2
+  memory: 1024
+  disk: 8
+  template: debian-13-standard
+  storage: local-lvm
+
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway:  { role: gateway }
+      analysis: { role: analysis, mirror: target, provisioner: apt-mirror }
+      server1:  { role: server, mirror: source }
+
+  sub:
+    uplink: main          # 关键：指向另一个 zone
+    v4: 10.20.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      client1: { role: client }

@@ -1,0 +1,31 @@
+# 多 zone 并行：三个互不嵌套的 zone，各自独立上联 wan
+#
+# 验证的是：不同 zone 的步骤在阶段内可以并发，且互不干扰。
+defaults:
+  cores: 2
+  memory: 1024
+  disk: 8
+  template: debian-13-standard
+  storage: local-lvm
+
+zones:
+  red:
+    uplink: wan
+    v4: 10.31.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      server1: { role: server }
+
+  blue:
+    uplink: wan
+    v4: 10.32.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      server1: { role: server }
+
+  green:
+    uplink: wan
+    v4: 10.33.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      server1: { role: server }
