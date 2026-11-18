@@ -748,6 +748,17 @@ pub struct SpecQuery {
     pub spec: Option<String>,
 }
 
+/// 解析后一共有几条镜像连线。
+///
+/// 用来回答"这条连线到底删掉没有"：连线可能同时由顶层 `mirrors:` 与主机上的
+/// `mirror: source/target` 生成，`remove_mirror` 只动前者。比较删前删后的条数，
+/// 就能判断是否需要告诉用户"你去改主机那一行"。
+fn count_links(state: &AppState, yaml: &str) -> Option<usize> {
+    let sp = Spec::parse(yaml).ok()?;
+    let resolved = sp.resolve_all(&state.cfg.pve.wan_bridge).ok()?;
+    Some(resolved.mirrors.len())
+}
+
 fn collect_mirrors(state: &AppState, only: Option<&str>) -> ApiResult<Vec<serde_json::Value>> {
     let dir = spec_dir(state);
     let mut out = Vec::new();
@@ -840,6 +851,19 @@ pub async fn delete_mirror(
             .ok_or_else(|| bad("from 请写成 zone:host"))?;
         let (name, cur) = locate_zone(&state, zone)?;
         let next = specs::remove_mirror(&cur, from, to).map_err(|e| bad(e))?;
+        // 一条连线有两个来源：顶层 `mirrors:`，以及主机上的 `mirror: source/target`。
+        // `remove_mirror` 只删前者；如果删完连线还在（后者仍在生成它），必须报错——
+        // 否则接口回 200、刷新后连线又出现，用户会以为平台在骗人。
+        let before = count_links(&state, &cur);
+        let after = count_links(&state, &next);
+        if let (Some(b), Some(a)) = (before, after) {
+            if a >= b {
+                return Err(bad(format!(
+                    "连线 {from} → {to} 是主机上的 `mirror:` 字段生成的，\
+                     删顶层 mirrors 里的条目没用——请到规格里把对应主机的 mirror 去掉"
+                )));
+            }
+        }
         save_spec(&state, &name, &next)?;
         // 规格里删了，宿主上的实例也要停——否则镜像还在跑，只是平台不知道了
         let sp = Spec::parse(&next).map_err(|e| bad(e))?;
@@ -927,12 +951,17 @@ async fn do_retire(
     let cancel = CancellationToken::new();
     let mut stopped = Vec::new();
     let mut absent = Vec::new();
+    // 单台主机废弃时记下它的 vmid：镜像单元名里要按它匹配（见 mirror_unit_globs）
+    let mut retire_vmid: Option<u32> = None;
     for h in &targets {
         let vmid = h.vmid.or_else(|| state.db.vmid_of(&zone, &h.name));
         let Some(vmid) = vmid else {
             absent.push(h.name.clone());
             continue;
         };
+        if host != "*" {
+            retire_vmid = Some(vmid);
+        }
         match state.pve.ct_status(vmid, &cancel).await {
             Ok(Some(st)) if st == "running" => {
                 state
@@ -966,16 +995,8 @@ async fn do_retire(
 
     // 摘掉镜像实例：废弃的机器不该继续往分析机里灌流量
     let ex = Executor::new(state.pve.clone(), state.db.clone(), state.runner.clone());
-    let prefix = if host == "*" {
-        format!("{zone}-")
-    } else {
-        match state.db.vmid_of(&zone, &host) {
-            Some(v) => format!("{zone}-{v}-"),
-            None => format!("{zone}-"),
-        }
-    };
     let stopped_units = ex
-        .stop_mirror_instances(&prefix, &cancel)
+        .stop_mirror_instances(&mirror_unit_globs(&zone, &host, retire_vmid), &cancel)
         .await
         .unwrap_or_default();
 
@@ -1024,7 +1045,20 @@ async fn do_revive(
 
     let cancel = CancellationToken::new();
     let mut started = Vec::new();
-    for h in z.hosts.iter().filter(|h| host == "*" || h.name == host) {
+    // 和 do_retire 一样先确认主机真的在规格里：主机名写错时若直接返回
+    // `{ok:true, started:[]}`，界面会显示"已恢复"而实际什么也没做。
+    let targets: Vec<&crate::core::spec::ResolvedHost> = z
+        .hosts
+        .iter()
+        .filter(|h| host == "*" || h.name == host)
+        .collect();
+    if targets.is_empty() {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("zone `{zone}` 里没有主机 `{host}`"),
+        ));
+    }
+    for h in targets {
         let vmid = h.vmid.or_else(|| state.db.vmid_of(&zone, &h.name));
         let Some(vmid) = vmid else { continue };
         // 已经 running 的不要重复 start（会报错，让整套 revive 失败）
@@ -1053,4 +1087,53 @@ async fn do_revive(
         "started": started,
         "run_id": run_id,
     })))
+}
+
+/// 废弃主机时要停掉哪些镜像单元（宿主侧 `/etc/labyard/mirror/*.conf` 的 glob）。
+///
+/// 单元名是 `{zone}-{源vmid}-{目标vmid}`，于是两支都要照顾：
+/// - 废弃**源机** → 前缀匹配 `lab-102-*`；
+/// - 废弃**分析机（目标端）** → 后缀匹配 `lab-*-100`。只按前缀做的话，
+///   retire 一台 analysis 会"成功"但单元还在跑，流量照旧灌进已停掉的容器。
+/// - 整个 zone、或查不到 vmid → `lab-*`，宁可多停几个（下一次 apply 会按
+///   当前规格重新装回来），也不能留下"平台说废弃了、实际还在跑"。
+fn mirror_unit_globs(zone: &str, host: &str, vmid: Option<u32>) -> Vec<String> {
+    match (host == "*", vmid) {
+        (false, Some(v)) => vec![format!("{zone}-{v}-*"), format!("{zone}-*-{v}")],
+        _ => vec![format!("{zone}-*")],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retiring_a_host_matches_it_as_source_and_as_target() {
+        let g = mirror_unit_globs("lab", "t1", Some(102));
+        assert_eq!(g, vec!["lab-102-*".to_string(), "lab-*-102".to_string()]);
+    }
+
+    #[test]
+    fn retiring_the_analysis_host_matches_by_suffix() {
+        // 真机上撞出来的：analysis 只出现在单元名的**后缀**位置，
+        // 只按前缀匹配会漏掉它，镜像单元继续跑
+        let g = mirror_unit_globs("lab", "cache", Some(100));
+        assert!(
+            g.iter().any(|p| p == "lab-*-100"),
+            "废弃分析机必须能匹配目标端: {g:?}"
+        );
+    }
+
+    #[test]
+    fn retiring_a_whole_zone_uses_one_prefix() {
+        assert_eq!(mirror_unit_globs("lab", "*", Some(101)), vec!["lab-*"]);
+        assert_eq!(mirror_unit_globs("lab", "*", None), vec!["lab-*"]);
+    }
+
+    #[test]
+    fn unknown_vmid_falls_back_to_the_whole_zone() {
+        // 查不到 vmid 就保守处理：多停几个总比留下孤儿单元好
+        assert_eq!(mirror_unit_globs("lab", "t1", None), vec!["lab-*"]);
+    }
 }

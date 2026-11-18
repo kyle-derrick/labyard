@@ -422,6 +422,8 @@ pub enum SpecError {
     MirrorAmbiguous(String),
     #[error("镜像连线 `{0}` → `{1}`：目标必须是 role: analysis（只有它挂了 mirr 口）")]
     MirrorTargetNotAnalysis(String, String),
+    #[error("镜像连线 `{0}` → `{1}`：把自己镜像到自己没有意义（会生成 100-100 这种空转单元）")]
+    MirrorSelfLoop(String, String),
 }
 
 impl Spec {
@@ -740,6 +742,15 @@ impl Spec {
         let push = |zones: &[ResolvedZone], from: (String, String), to: (String, String), out: &mut Vec<ResolvedMirror>, seen: &mut BTreeSet<_>| -> Result<(), SpecError> {
             let (fz, fh) = from;
             let (tz, th) = to;
+            // 自环：把某台主机镜像到它自己。单元名会变成 `lab-100-100`，
+            // 拿到的是一个"抓自己 eth 再灌回自己"的空转单元——静默装上也
+            // 只会浪费 CPU，不如在解析阶段就拦掉。
+            if fz == tz && fh == th {
+                return Err(SpecError::MirrorSelfLoop(
+                    format!("{fz}:{fh}"),
+                    format!("{tz}:{th}"),
+                ));
+            }
             let target = zones
                 .iter()
                 .find(|z| z.name == tz)
@@ -1382,6 +1393,24 @@ mirrors:
         assert!(matches!(
             Spec::parse(y).unwrap().resolve_all("vmbr0"),
             Err(SpecError::MirrorTargetNotAnalysis(_, _))
+        ));
+    }
+
+    #[test]
+    fn a_host_cannot_be_mirrored_into_itself() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts: { gateway: { role: gateway }, analysis: { role: analysis } }
+mirrors:
+  - { from: analysis, to: analysis }
+"#;
+        assert!(matches!(
+            Spec::parse(y).unwrap().resolve_all("vmbr0"),
+            Err(SpecError::MirrorSelfLoop(_, _))
         ));
     }
 

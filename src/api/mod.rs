@@ -201,8 +201,11 @@ async fn login(
     }
     let exp = chrono::Utc::now().timestamp() + state.cfg.server.session_hours * 3600;
     let token = auth::sign(&state.secret, &format!("admin|{exp}"));
+    // 走 TLS 时才加 `Secure`：有些内网部署就是明文 HTTP（面板只在跳板机后），
+    // 无条件加上会让 cookie 根本存不下来，登录变成"输密码→还是未登录"。
+    let secure = if state.cfg.tls_enabled() { "; Secure" } else { "" };
     let cookie = format!(
-        "labyard_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        "labyard_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age={}",
         state.cfg.server.session_hours * 3600
     );
     let mut resp = Json(LoginResp { user: "admin".into() }).into_response();
@@ -213,11 +216,12 @@ async fn login(
     resp
 }
 
-async fn logout() -> Response {
+async fn logout(State(state): State<Arc<AppState>>) -> Response {
+    let secure = if state.cfg.tls_enabled() { "; Secure" } else { "" };
     let mut resp = Json(serde_json::json!({"ok": true})).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        "labyard_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        format!("labyard_session=; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=0")
             .parse()
             .unwrap(),
     );
@@ -1126,18 +1130,35 @@ async fn run_events(
     Path(id): Path<String>,
 ) -> Response {
     require_auth!(state, headers);
+    let status = state.db.run_status(&id);
     let rx = {
         let runs = state.runs.lock().await;
-        match runs.get(&id) {
-            Some(h) => h.tx.subscribe(),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "run 不存在"})),
-                )
-                    .into_response()
-            }
+        runs.get(&id).map(|h| h.tx.subscribe())
+    };
+
+    let Some(rx) = rx.filter(|_| status.as_deref().map_or(true, |s| s == "running")) else {
+        // 没有实时句柄：要么这个 run 根本不存在，要么它已经结束、句柄被回收了。
+        if status.is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "run 不存在"})),
+            )
+                .into_response();
         }
+        // 已经结束的 run 不会再有任何事件。必须补一条 `finished` 并立刻关流：
+        // 前端是 fetch + ReadableStream 且没有超时，靠这条事件收尾——不补的话
+        // 打开一个历史 run 的日志页会一直卡在"连接中"。历史输出不在这里补，
+        // 它在 `/api/runs/{id}/steps` 的 message 字段里。
+        let ev = serde_json::json!({
+            "kind": "finished",
+            "key": format!("run:{id}"),
+            "code": null,
+            "duration_ms": 0,
+        });
+        let one = tokio_stream::iter(vec![Ok::<_, std::convert::Infallible>(
+            SseEvent::default().data(ev.to_string()),
+        )]);
+        return Sse::new(one).into_response();
     };
 
     let stream = BroadcastStream::new(rx).filter_map(|item| match item {
@@ -1336,25 +1357,95 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     Json(serde_json::json!({ "items": items })).into_response()
 }
 
-// ───────────────────────── OpenAPI（手写，够前端生成类型）─────────────────────────
+// ───────────────────────── OpenAPI（手写接口清单）─────────────────────────
+
+/// 接口清单：路径 → [(方法, 摘要)]。
+///
+/// 写成数据而不是一段巨型 `json!`，是为了让契约测试能逐条比对
+/// （见 `every_api_route_is_documented`）。摘要级、不含 schema——前端类型是
+/// `web/src/api.ts` 里手写的，这份清单的用途是"外部集成方一眼看到有哪些接口"，
+/// 而不是生成代码；写明这一点比假装能生成类型诚实。
+const API_DOCS: &[(&str, &[(&str, &str)])] = &[
+    ("/api/health", &[("get", "健康检查（不需要登录）")]),
+    ("/api/auth/login", &[("post", "登录，成功返回 Set-Cookie")]),
+    ("/api/auth/logout", &[("post", "登出，清 cookie")]),
+    ("/api/auth/me", &[("get", "当前用户")]),
+    ("/api/state", &[("get", "已登记步骤的状态（幂等判定的输入）")]),
+    ("/api/spec", &[
+        ("get", "读取默认规格"),
+        ("put", "保存默认规格（先校验，再原子写）"),
+    ]),
+    ("/api/specs", &[
+        ("get", "列出全部规格文件"),
+        ("post", "新建规格（可复制自另一份）"),
+    ]),
+    ("/api/specs/{name}", &[
+        ("get", "读取指定规格"),
+        ("put", "保存指定规格"),
+        ("delete", "删除规格文件（不动 PVE 资源）"),
+    ]),
+    ("/api/specs/{name}/zones", &[("post", "新增一个 zone")]),
+    ("/api/specs/{name}/zones/{z}", &[
+        ("get", "取 zone 片段（编辑框的种子）"),
+        ("put", "用片段替换整个 zone"),
+        ("delete", "从规格里删掉 zone（不动 PVE 资源）"),
+    ]),
+    ("/api/preview", &[("post", "解析规格并返回计划（不执行）")]),
+    ("/api/apply", &[("post", "执行规格，返回 run_id")]),
+    ("/api/runs", &[("get", "run 历史")]),
+    ("/api/runs/{id}/events", &[("get", "SSE 日志流")]),
+    ("/api/runs/{id}/steps", &[("get", "run 的步骤明细")]),
+    ("/api/runs/{id}/retry", &[("post", "从失败的步骤续跑")]),
+    ("/api/runs/{id}/cancel", &[("post", "取消运行")]),
+    ("/api/doctor", &[("get", "环境自检")]),
+    ("/api/hosts", &[("get", "主机清单（含电源状态与 retired 标记）")]),
+    ("/api/hosts/{z}/{h}/power", &[("post", "开/关/重启单台主机")]),
+    ("/api/hosts/{z}/{h}/retire", &[("post", "废弃：停机并摘镜像，保留磁盘")]),
+    ("/api/hosts/{z}/{h}/revive", &[("post", "从废弃状态恢复")]),
+    ("/api/snapshots/{z}/{h}", &[
+        ("get", "列出快照"),
+        ("post", "建/回滚/删快照（action 区分）"),
+    ]),
+    ("/api/destroy", &[("post", "销毁 zone（要求 zone 名二次确认）")]),
+    ("/api/topology", &[("get", "解析后的拓扑：节点与边")]),
+    ("/api/zones/{z}/gateway/status", &[("get", "网关实况：策略 + VPN 进程状态")]),
+    ("/api/zones/{z}/gateway/egress", &[("post", "开/关内网出网")]),
+    ("/api/zones/{z}/gateway/pub", &[("post", "新增端口映射")]),
+    ("/api/zones/{z}/gateway/pub/{idx}", &[("delete", "删除第 idx 条端口映射")]),
+    ("/api/zones/{z}/gateway/vpn", &[("post", "开/关 VPN（wireguard / openvpn）")]),
+    ("/api/zones/{z}/gateway/vpn/{proto}/client", &[("get", "下载客户端配置（现读现拼）")]),
+    ("/api/zones/{z}/retire", &[("post", "废弃整个 zone")]),
+    ("/api/zones/{z}/revive", &[("post", "恢复整个 zone")]),
+    ("/api/mirrors", &[
+        ("get", "镜像连线列表"),
+        ("post", "新增镜像连线并立即装载"),
+    ]),
+    ("/api/mirrors/{id}", &[("delete", "删除镜像连线并卸载单元")]),
+    ("/api/openapi.json", &[("get", "本清单")]),
+];
+
+fn openapi_doc() -> serde_json::Value {
+    let mut paths = serde_json::Map::new();
+    for (path, ops) in API_DOCS {
+        let mut item = serde_json::Map::new();
+        for (method, summary) in *ops {
+            item.insert((*method).to_string(), serde_json::json!({"summary": summary}));
+        }
+        paths.insert((*path).to_string(), serde_json::Value::Object(item));
+    }
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "labyard",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "声明式攻防实验网络编排。摘要级清单，不含 schema；前端类型见 web/src/api.ts。",
+        },
+        "paths": paths,
+    })
+}
 
 async fn openapi() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "openapi": "3.1.0",
-        "info": {"title": "labyard", "version": env!("CARGO_PKG_VERSION")},
-        "paths": {
-            "/api/health": {"get": {"summary": "健康检查"}},
-            "/api/auth/login": {"post": {"summary": "登录"}},
-            "/api/state": {"get": {"summary": "已登记步骤的状态"}},
-            "/api/spec": {
-                "get": {"summary": "读取已保存的规格"},
-                "put": {"summary": "保存规格（先校验，原子写）"}
-            },
-            "/api/preview": {"post": {"summary": "解析 spec 并返回计划"}},
-            "/api/apply": {"post": {"summary": "执行（返回 run_id）"}},
-            "/api/runs/{id}/events": {"get": {"summary": "SSE 日志流"}},
-        }
-    }))
+    Json(openapi_doc())
 }
 
 // ───────────────────────── 静态资源 ─────────────────────────
@@ -1402,5 +1493,83 @@ mod tests {
         assert_eq!(phase_of_key("ct:main:gw"), "ct");
         assert_eq!(phase_of_key("bridge:main"), "bridge");
         assert_eq!(phase_of_key("garbage"), "garbage");
+    }
+
+    /// 契约测试：OpenAPI 是给外部集成方看的，漏一条就等于"这个接口不存在"。
+    ///
+    /// 直接读本文件的路由段抓字面量，比人工维护第二份清单可靠——加了接口忘了写
+    /// 文档，会在这里失败，而不是等某个集成方来问。反方向也查：文档里写了但实际
+    /// 没注册的路径（改路由时最容易留下的残留）。
+    #[test]
+    fn every_api_route_is_documented() {
+        let src = include_str!("mod.rs");
+        let start = src.find("pub fn router(").expect("路由函数");
+        let end = src.find("async fn current_user").expect("认证段起点");
+        let routes = &src[start..end];
+
+        // 按 `.route(` 切块：每块开头是路径字面量，后面到下一块之前是方法链。
+        // 比手工维护第二份清单可靠——加了接口忘了写文档，会在这里失败。
+        let quote = '\u{22}';
+        let mut declared: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            Default::default();
+        for chunk in routes.split(".route(").skip(1) {
+            let Some(open) = chunk.find(quote) else { continue };
+            let Some(close) = chunk[open + 1..].find(quote) else {
+                continue;
+            };
+            let path = &chunk[open + 1..open + 1 + close];
+            if !path.starts_with("/api/") {
+                continue; // /terminal/* 不在 OpenAPI 里
+            }
+            // `{*id}` 是 axum 的捕获语法，文档里统一写成 `{id}`
+            let key = path.replace("{*", "{");
+            let body = &chunk[open + 1 + close + 1..];
+            let body = body.split(".fallback(").next().unwrap_or(body);
+            let mut verbs = std::collections::BTreeSet::new();
+            for (name, probe) in [
+                ("get", "get("),
+                ("post", "post("),
+                ("put", "put("),
+                ("delete", "delete("),
+                ("patch", "patch("),
+            ] {
+                if body.contains(probe) {
+                    verbs.insert(name.to_string());
+                }
+            }
+            declared.insert(key, verbs);
+        }
+        assert!(!declared.is_empty(), "扫描器没抓到任何路由，说明它坏了");
+
+        let doc = openapi_doc();
+        let paths = doc["paths"].as_object().expect("paths");
+
+        let mut missing = vec![];
+        let mut extra = vec![];
+        let mut mismatch = vec![];
+        for (path, verbs) in &declared {
+            match paths.get(path) {
+                None => missing.push(path.clone()),
+                Some(item) => {
+                    let documented: std::collections::BTreeSet<String> = item
+                        .as_object()
+                        .expect("path item 必须是对象")
+                        .keys()
+                        .cloned()
+                        .collect();
+                    if &documented != verbs {
+                        mismatch.push(format!("{path} 实现 {verbs:?} / 文档 {documented:?}"));
+                    }
+                }
+            }
+        }
+        for k in paths.keys() {
+            if !declared.contains_key(k) {
+                extra.push(k.clone());
+            }
+        }
+        assert!(missing.is_empty(), "OpenAPI 缺这些路由: {missing:?}");
+        assert!(extra.is_empty(), "OpenAPI 里有未注册的路径: {extra:?}");
+        assert!(mismatch.is_empty(), "方法不一致: {mismatch:?}");
     }
 }

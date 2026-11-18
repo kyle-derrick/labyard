@@ -5,16 +5,17 @@
 # 不动 PVE 自身的配置，不装 PVE 组件。
 #
 #   ./install.sh                  安装或升级
+#   ./install.sh --ttyd PATH      同上，但用本地的 ttyd 二进制（离线环境）
 #   ./install.sh --uninstall      卸载（保留数据目录，除非 --purge）
 #   ./install.sh --purge          连数据一起删
 set -eu
 
-PREFIX=${PREFIX:-/opt/labyard}
 BINDIR=/usr/local/bin
 UNIT=/etc/systemd/system/labyard.service
 CONFDIR=/etc/labyard
 STATEDIR=/var/lib/labyard
 BIN=./labyard
+TTYD_SRC=""
 
 say() { printf '\033[1;34m[labyard]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[警告]\033[0m %s\n' "$*"; }
@@ -23,22 +24,58 @@ die() { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
 uninstall() {
   say "停止并移除服务"
   systemctl disable --now labyard.service 2>/dev/null || true
-  rm -f "$UNIT" "$BINDIR/labyard"
+  rm -f "$UNIT" "$BINDIR/labyard" "$BINDIR/labyard.prev"
   systemctl daemon-reload 2>/dev/null || true
+
+  # 镜像单元（labmirror@*）只依赖 /etc/labyard/mirror/*.conf，删数据前必须
+  # 先停掉，否则它们会一直重启失败、把 journal 刷满，而且没有任何提示。
   if [ "${1:-}" = "--purge" ]; then
+    n=0
+    for u in $(systemctl list-units --all --plain --no-legend 'labmirror@*' 2>/dev/null | awk '{print $1}'); do
+      systemctl disable --now "$u" >/dev/null 2>&1 || true
+      n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && say "已停掉 $n 个镜像单元"
     warn "删除 $CONFDIR 与 $STATEDIR（不可恢复）"
     rm -rf "$CONFDIR" "$STATEDIR"
+    # ttyd 是安装器放进去的（Web 终端的数据面），purge 一并清掉
+    rm -f /usr/local/bin/ttyd
   else
     say "保留 $CONFDIR 与 $STATEDIR（要一起删加 --purge）"
+    if systemctl list-units --plain --no-legend 'labmirror@*' 2>/dev/null | grep -q .; then
+      warn "实验的 labmirror@ 单元仍在运行（它们只读 /etc/labyard/mirror）。"
+      warn "要一起停： systemctl list-units 'labmirror@*' 然后逐个 disable --now"
+    fi
   fi
-  say "已卸载"
+  say "已卸载（容器与网桥属于实验资产，需在 Web 里 destroy，或手工 pct destroy）"
   exit 0
 }
 
-case "${1:-}" in
-  --uninstall) uninstall ;;
-  --purge) uninstall --purge ;;
-esac
+usage() {
+  cat <<'EOF'
+labyard 宿主安装脚本（PVE 9.x / Debian 13）
+
+  ./install.sh                 安装或升级（缺 ttyd 时自动下载）
+  ./install.sh --ttyd PATH     用本地的 ttyd 二进制（离线环境）
+  ./install.sh --uninstall     卸载，保留 /etc/labyard 与 /var/lib/labyard
+  ./install.sh --purge         卸载并删除数据（含镜像单元、ttyd、证书）
+EOF
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage ;;
+    --uninstall) uninstall ;;
+    --purge) uninstall --purge ;;
+    --ttyd)
+      [ $# -ge 2 ] || die "--ttyd 后面要跟一个文件路径"
+      TTYD_SRC="$2"
+      shift 2
+      ;;
+    *) die "未知参数：$1（可用：--ttyd PATH / --uninstall / --purge）" ;;
+  esac
+done
 
 # ── 前置检查 ──
 [ "$(id -u)" -eq 0 ] || die "需要 root 运行"
@@ -168,7 +205,14 @@ fi
 # ── Web 终端的数据面：ttyd 静态二进制 ──
 # Debian 13 仓库里没有 ttyd（从 forky 才开始打包），用官方 Release 的静态
 # 单文件（1.3 MB，无 .so 依赖）。它只用于往容器里推，宿主自己不跑。
-if [ ! -x /usr/local/bin/ttyd ]; then
+# 离线环境用 `--ttyd /path/to/ttyd` 跳过下载。
+if [ -n "$TTYD_SRC" ]; then
+  [ -f "$TTYD_SRC" ] || die "找不到 ttyd 文件：$TTYD_SRC"
+  say "安装本地 ttyd：$TTYD_SRC"
+  install -m 0755 "$TTYD_SRC" /usr/local/bin/ttyd
+elif [ -x /usr/local/bin/ttyd ]; then
+  say "已有 /usr/local/bin/ttyd，跳过下载"
+else
   case "$(uname -m)" in
     x86_64) TTYD_ARCH=x86_64 ;;
     aarch64|arm64) TTYD_ARCH=aarch64 ;;
@@ -183,7 +227,10 @@ if [ ! -x /usr/local/bin/ttyd ]; then
     else
       rm -f /usr/local/bin/ttyd
       echo "  ⚠ ttyd 下载失败——Web 终端不可用（其余功能不受影响）"
+      echo "    离线环境可重跑： ./install.sh --ttyd /path/to/ttyd"
     fi
+  else
+    warn "未知架构 $(uname -m)，跳过 ttyd——Web 终端不可用（其余功能不受影响）"
   fi
 fi
 

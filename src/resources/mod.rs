@@ -792,13 +792,23 @@ impl Executor {
 
     /// 停掉指定前缀的全部镜像实例，返回停掉的实例名。
     /// `prefix` 形如 `main-`（整个 zone）或 `main-1001-`（某台主机当源）。
+    /// 停掉匹配给定 glob 的镜像实例（宿主侧 `labmirror@` 单元）。
+    ///
+    /// 为什么要接受多个 pattern：单元名是 `{zone}-{源vmid}-{目标vmid}`。
+    /// 废弃**源机**要按前缀匹配（`lab-102-*`），废弃**分析机**要按后缀匹配
+    /// （`lab-*-100`）。只做前缀时，retire 一台 analysis 会"成功"但单元还在跑，
+    /// 症状是平台说废弃了、流量照旧灌进去。
     pub async fn stop_mirror_instances(
         &self,
-        prefix: &str,
+        globs: &[String],
         cancel: &CancellationToken,
     ) -> Result<Vec<String>, String> {
+        let files: String = globs
+            .iter()
+            .map(|g| format!("/etc/labyard/mirror/{g} "))
+            .collect();
         let cmd = format!(
-            "for f in /etc/labyard/mirror/{prefix}*.conf; do \
+            "for f in {files}; do \
                [ -e \"$f\" ] || continue; \
                i=$(basename \"$f\" .conf); \
                systemctl disable --now \"labmirror@$i.service\" >/dev/null 2>&1 || true; \
@@ -808,7 +818,7 @@ impl Executor {
         let out = self
             .runner
             .run(
-                &format!("mirror-stop:{prefix}"),
+                &format!("mirror-stop:{}", globs.join(",")),
                 &CommandSpec::new("sh", ["-c", cmd.as_str()])
                     .with_timeout(Duration::from_secs(60)),
                 None,
@@ -817,11 +827,13 @@ impl Executor {
             )
             .await
             .map_err(|e| e.to_string())?;
+        // 两个 pattern 可能命中同一个文件，去重后再报给用户
+        let mut seen = std::collections::BTreeSet::new();
         Ok(out
             .stdout
             .lines()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && seen.insert(s.clone()))
             .collect())
     }
 

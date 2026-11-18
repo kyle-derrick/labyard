@@ -348,6 +348,24 @@ pub fn set_vpn(doc: &str, zone: &str, which: &str, on: bool) -> Result<String, S
     Ok(d.to_string())
 }
 
+/// 一条 mirrors 记录里的某个字段是否等于 `want`。
+///
+/// 允许 YAML 写裸 host（`to: analysis`）而调用方给的是解析后的 `zone:host`
+/// （列表接口就是把解析结果原样回传的）。不认这种写法的话，手写的连线在
+/// UI 里"加得上、删不掉"，重复添加也拦不住。
+fn link_field_matches(m: &Mapping, k: &str, want: &str) -> bool {
+    let Some(v) = m.get(k).and_then(|n| n.as_scalar().map(|s| s.to_string())) else {
+        return false;
+    };
+    if v == want {
+        return true;
+    }
+    if v.contains(':') {
+        return false;
+    }
+    want.rsplit_once(':').map(|(_, h)| h == v).unwrap_or(false)
+}
+
 /// 加一条镜像连线（幂等：重复加返回错误，让 UI 能提示而不是静默成功）。
 pub fn add_mirror(doc: &str, from: &str, to: &str) -> Result<String, String> {
     let d = parse(doc)?;
@@ -360,13 +378,7 @@ pub fn add_mirror(doc: &str, from: &str, to: &str) -> Result<String, String> {
         .ok_or_else(|| "无法创建 mirrors".to_string())?;
     for i in 0..seq.len() {
         if let Some(m) = seq.get(i).and_then(|n| n.as_mapping().cloned()) {
-            let same = |k: &str, want: &str| {
-                m.get(k)
-                    .and_then(|n| n.as_scalar().map(|s| s.to_string()))
-                    .map(|s| s == want)
-                    .unwrap_or(false)
-            };
-            if same("from", from) && same("to", to) {
+            if link_field_matches(&m, "from", from) && link_field_matches(&m, "to", to) {
                 return Err(format!("连线 {from} → {to} 已存在"));
             }
         }
@@ -385,13 +397,7 @@ pub fn remove_mirror(doc: &str, from: &str, to: &str) -> Result<String, String> 
     };
     for i in 0..seq.len() {
         if let Some(m) = seq.get(i).and_then(|n| n.as_mapping().cloned()) {
-            let same = |k: &str, want: &str| {
-                m.get(k)
-                    .and_then(|n| n.as_scalar().map(|s| s.to_string()))
-                    .map(|s| s == want)
-                    .unwrap_or(false)
-            };
-            if same("from", from) && same("to", to) {
+            if link_field_matches(&m, "from", from) && link_field_matches(&m, "to", to) {
                 seq.remove(i);
                 return Ok(d.to_string());
             }
@@ -515,6 +521,40 @@ zones:
         assert!(add_mirror(&out, "main:web", "main:analysis").is_err(), "重复连线要拒绝");
         let out = remove_mirror(&out, "main:web", "main:analysis").unwrap();
         assert!(!out.contains("main:web"));
+    }
+
+    /// 手写 YAML 常写裸 host（`to: cap`），而列表接口回传的是解析后的
+    /// `zone:host`。两种写法必须互相认，否则连线"加得上、删不掉"。
+    #[test]
+    fn mirror_links_with_bare_hosts_are_matched() {
+        let doc = r#"defaults:
+  cores: 1
+  memory: 512
+  disk: 2
+  template: debian-13-standard
+  storage: local-lvm
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      web: { role: server }
+      cap: { role: analysis }
+mirrors:
+  - { from: web, to: cap }
+"#;
+        assert!(valid(doc), "样例本身要能解析");
+        let out = remove_mirror(doc, "main:web", "main:cap").expect("裸 host 写法也必须能删");
+        assert!(valid(&out));
+        assert!(
+            remove_mirror(&out, "main:web", "main:cap").is_err(),
+            "删过一次之后就找不到了（说明第一次真的删掉了）:\n{out}"
+        );
+        assert!(
+            add_mirror(doc, "main:web", "main:cap").is_err(),
+            "等价写法应视为同一条连线，重复添加要拒绝"
+        );
     }
 
     #[test]

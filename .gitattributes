@@ -1,0 +1,3 @@
+# 前端构建产物要提交（宿主上不需要 Node，见 docs/design.md §12），
+# 但它们不该出现在 diff 与语言统计里。
+web/dist/** linguist-generated=true -diff

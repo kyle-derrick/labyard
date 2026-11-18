@@ -17,3 +17,6 @@
 
 # TypeScript 构建缓存
 *.tsbuildinfo
+
+# Python 缓存（scripts/api-regress.py）
+__pycache__/

@@ -286,8 +286,8 @@ impl Db {
         );
     }
 
-    /// 仅测试使用（用于断言 `mark_interrupted` 的效果）。
-    #[cfg(test)]
+    /// 一次 run 的当前状态。SSE 用它判断"这个 run 是不是已经结束"，好决定
+    /// 是挂上去等事件，还是补一条 `finished` 就关流。
     pub fn run_status(&self, id: &str) -> Option<String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT status FROM runs WHERE id = ?1", [id], |r| r.get(0))
@@ -482,9 +482,10 @@ mod tests {
     #[test]
     fn step_hash_only_counts_done() {
         let db = Db::open_memory().unwrap();
-        db.record_step("bridge:main", "h1", "failed", Some("boom"));
+        db.record_step("bridge:main", "h1", "failed", Some("boom"))
+            .unwrap();
         assert_eq!(db.step_hash("bridge:main"), None, "失败的步骤不能算已完成");
-        db.record_step("bridge:main", "h1", "done", None);
+        db.record_step("bridge:main", "h1", "done", None).unwrap();
         assert_eq!(db.step_hash("bridge:main"), Some("h1".into()));
     }
 
@@ -500,7 +501,7 @@ mod tests {
     #[test]
     fn forget_step_removes_record() {
         let db = Db::open_memory().unwrap();
-        db.record_step("ct:main:gw", "h", "done", None);
+        db.record_step("ct:main:gw", "h", "done", None).unwrap();
         db.forget_step("ct:main:gw");
         assert_eq!(db.step_hash("ct:main:gw"), None);
     }
