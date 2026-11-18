@@ -80,6 +80,20 @@ r=$(curl -s --noproxy '*' -X POST "http://127.0.0.1:$PORT/api/preview" \
 check "嵌套 zone 被接受" 'bridge:sub' "$r"
 check "上游 main 先于 sub" '"zone":"main"' "$r"
 
+# 回归：预览曾把所有 vmid 显示成 null（DB 里其实已分配）
+nv=$(echo "$r" | python3 -c 'import json,sys;print(sum(1 for z in json.load(sys.stdin)["zones"] for h in z["hosts"] if h.get("vmid")))' 2>/dev/null || echo 0)
+check "所有主机都回填了 vmid（$nv 个）" '' "$( [ "$nv" -eq 5 ] && echo ok )"
+
+# 回归：ULA 曾产出 `fd0d6e40:e367::/64` 这种非法 IPv6
+n6=$(echo "$r" | python3 -c '
+import json,sys,ipaddress
+d=json.load(sys.stdin)
+for z in d["zones"]:
+    n=ipaddress.ip_network(z["v6_prefix"])
+    assert n.prefixlen==64 and n.is_private, z["v6_prefix"]
+print("ok")' 2>&1)
+check "ULA 前缀是合法 IPv6 /64" 'ok' "$n6"
+
 echo "== 预览：错误输入 =="
 r=$(curl -s --noproxy '*' -X POST "http://127.0.0.1:$PORT/api/preview" \
   -H 'Content-Type: application/json' -d '{"yaml":"zones: {a: {uplink: nope, v4: 10.1.0.0/24, hosts: {g: {role: gateway}}}}"}')

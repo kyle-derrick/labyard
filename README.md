@@ -150,8 +150,9 @@ docs/design.md   唯一权威设计文档
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | 44 项：YAML 三层合并、zone 拓扑与环检测、步骤哈希确定性、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、分配器对照 |
-| ✅ 本机验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积与内存 |
+| ✅ 单元测试通过 | 45 项：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、分配器对照 |
+| ✅ HTTP 冒烟通过 | 19 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、错误输入、无 PVE 时优雅降级、OpenAPI |
+| ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（7.9 MB）与内存（常驻 6.9 MB / 峰值 38.1 MB，含 scrypt 32 MB 工作区） |
 | ⚠️ 仅设计推演 | PVE 9 的字段级行为（`network`、`lxc`、`snapshot`）、`pveam` 模板列表结构、厚 LVM 快照 |
 | ❌ 完全未验证 | 真实 PVE 上的完整 apply、IPv6 双栈全链路、ttyd 反代与文件传输、升级迁移 |
 

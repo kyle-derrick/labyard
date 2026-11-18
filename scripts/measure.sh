@@ -46,6 +46,9 @@ fds() { ls /proc/$PID/fd 2>/dev/null | wc -l; }
 IDLE=$(rss)
 IDLE_THR=$(thr)
 IDLE_FD=$(fds)
+# 启动即执行的 scrypt 会把 HWM 一次性顶上去，这是"峰值"的真实来源，
+# 必须在任何压测之前就记下来，否则会误以为是请求造成的。
+BOOT_HWM=$(hwm)
 
 # 200 个并发 20 的请求，混合 preview（重）和 state（轻）
 YAML=$(python3 -c 'import json;print(json.dumps(open("examples/nested.yaml").read()))')
@@ -64,16 +67,33 @@ PEAK=$(hwm)
 LOAD_THR=$(thr)
 LOAD_FD=$(fds)
 
+# 并发登录：验证 hash_gate 把 scrypt 串起来后，峰值不会翻倍
+PW=$(grep -o '初始管理员密码: .*' "$DIR/log" | head -1 | cut -d' ' -f2)
+if [ -n "$PW" ]; then
+  seq 1 8 | xargs -P 8 -I{} sh -c "
+    curl -s --noproxy '*' -o /dev/null -X POST http://127.0.0.1:$PORT/api/auth/login \
+      -H 'Content-Type: application/json' -d '{\"password\":\"$PW\"}'
+  " 2>/dev/null
+  sleep 1
+  LOGIN_HWM=$(hwm)
+  LOGIN_RSS=$(rss)
+else
+  LOGIN_HWM="n/a"; LOGIN_RSS="n/a"
+fi
+
 echo "=== $(uname -m) / $(nproc) cores / $(rustc --version 2>/dev/null || echo rustc-n/a) ==="
 echo
 printf "%-22s %s\n" "二进制大小" "$(du -h "$BIN" | cut -f1)"
 printf "%-22s %s KB\n" "空闲 RSS" "$IDLE"
+printf "%-22s %s KB\n" "启动后 VmHWM（含 scrypt）" "$BOOT_HWM"
 printf "%-22s %s KB\n" "压测峰值 VmHWM" "$PEAK"
 printf "%-22s %s KB\n" "压测后 RSS" "$LOAD"
 printf "%-22s %s 线程\n" "空闲线程数" "$IDLE_THR"
 printf "%-22s %s 线程\n" "压测线程数" "$LOAD_THR"
 printf "%-22s %s\n" "空闲 fd" "$IDLE_FD"
 printf "%-22s %s\n" "压测 fd" "$LOAD_FD"
+printf "%-22s %s KB\n" "8 并发登录后 VmHWM" "$LOGIN_HWM"
+printf "%-22s %s KB\n" "8 并发登录后 RSS" "$LOGIN_RSS"
 echo
 echo "说明：这是 HTTP 模式（无 TLS）。带 TLS 会多 4-6 MB 的会话与缓冲区。"
 echo "平台真实值还要加：SSE 连接状态、pct exec 子进程管理、日志缓冲。"
