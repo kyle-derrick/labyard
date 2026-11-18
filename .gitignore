@@ -1,0 +1,16 @@
+# Rust
+/target
+**/*.rs.bk
+
+# 前端依赖（产物 web/dist 要提交，见 README）
+/web/node_modules
+/web/.vite
+
+# 本地开发配置与数据
+/dev-config.toml
+/dev-data/
+
+# 系统
+.DS_Store
+*.log
+*.swp

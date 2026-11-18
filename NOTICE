@@ -1,0 +1,49 @@
+labyard
+Copyright 2026 labyard contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------
+
+This binary embeds the following third-party software. All are used
+unmodified, and their licenses are compatible with Apache-2.0.
+
+Rust crates (via Cargo, see Cargo.lock for exact versions):
+
+  axum, axum-core, hyper, http, tower      MIT
+  tokio, tokio-util, tokio-stream          MIT
+  serde, serde_json                        MIT OR Apache-2.0
+  serde_yaml_ng                            MIT OR Apache-2.0
+  rusqlite                                 MIT
+  SQLite (bundled via libsqlite3-sys)      Public Domain
+  rust-embed, mime_guess                   MIT
+  scrypt, hmac, sha2, subtle               MIT OR Apache-2.0
+  rand                                     MIT OR Apache-2.0
+  clap                                     MIT OR Apache-2.0
+  tracing, tracing-subscriber              MIT
+  chrono                                   MIT OR Apache-2.0
+  thiserror                                MIT OR Apache-2.0
+  async-trait, futures-util                MIT OR Apache-2.0
+  rustls (via axum-server)                 Apache-2.0 OR ISC OR MIT
+  toml, hex, libc                          MIT OR Apache-2.0
+
+Web frontend (bundled into the binary via rust-embed):
+
+  React, React DOM                         MIT
+  Ant Design, @ant-design/icons            MIT
+  @tanstack/react-query                    MIT
+  Vite                                     MIT
+
+--------------------------------------------------------------------------
+External programs (NOT bundled, invoked at runtime)
+--------------------------------------------------------------------------
+
+  Proxmox VE (pct, pvesh, pveam, qm)       AGPL-3.0
+  ttyd                                     MIT
+  nftables / iproute2                      GPL-2.0
+
+labyard invokes these as separate processes via their command-line
+interfaces. It does not link against, modify, or redistribute their code,
+so their licenses do not extend to labyard.
