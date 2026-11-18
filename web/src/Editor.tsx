@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Alert,
   App as AntApp,
@@ -7,6 +8,7 @@ import {
   Col,
   Input,
   Row,
+  Select,
   Space,
   Switch,
   Tag,
@@ -39,10 +41,16 @@ zones:
     uplink: wan
     v4: 10.10.1.0/24
     v6: auto
+    # 网关策略：出网开关 + 端口映射 + VPN（全在网关容器里用 nft / wg 落地）
+    gateway:
+      egress: true
+      pub:
+        - { proto: tcp, port: 2222, to: "10.10.1.20:22" }
+      vpn: { wireguard: true, clients: [alice] }
     hosts:
       gateway:   { role: gateway }
-      analysis:  { role: analysis, mirror: target, provisioner: apt-mirror }
-      server1:   { role: server,   mirror: source }
+      analysis:  { role: analysis, provisioner: apt-mirror }
+      server1:   { role: server }
       client1:   { role: client }
 
   # 嵌套：sub 的上联是 main 的网关
@@ -52,6 +60,10 @@ zones:
     hosts:
       gateway: { role: gateway }
       client1: { role: client }
+
+# 跨 zone 流量镜像：sub 的网关全部流量复制到 main 的分析机
+mirrors:
+  - { from: "sub:gateway", to: "main:analysis" }
 `;
 
 type LogLine = { cls: string; text: string };
@@ -62,12 +74,14 @@ const PHASE_ORDER = [
   "container",
   "net",
   "bootstrap",
+  "gateway",
   "mirror",
   "snapshot",
 ];
 
 export default function Editor() {
   const { message } = AntApp.useApp();
+  const [specName, setSpecName] = useState("lab");
   const [yaml, setYaml] = useState(SAMPLE);
   const [steps, setSteps] = useState<PreviewStep[]>([]);
   const [zones, setZones] = useState<unknown[]>([]);
@@ -83,29 +97,37 @@ export default function Editor() {
 
   const dirty = yaml !== (saved ?? SAMPLE);
 
-  // 挂载时把服务端那份读回来，覆盖内置样例。
-  // 读失败（未登录、后端不通）就保持样例，不弹错——预览时会给出更准确的报错。
+  // 规格下拉：让"编排"页也能切文件，不必回规格页
+  const specs = useQuery({ queryKey: ["specs"], queryFn: api.specs });
+  const names = (specs.data?.specs ?? []).map((s) => s.name);
+
+  // 切换规格时把那份读回来。读不到（还没建）就保持当前文本，保存时才创建。
   useEffect(() => {
     let alive = true;
     api
-      .getSpec()
+      .specDetail(specName)
       .then((r) => {
-        if (!alive || !r.exists || r.yaml == null) return;
-        setYaml(r.yaml);
-        setSaved(r.yaml);
+        if (!alive) return;
+        if (r.exists && r.yaml != null) {
+          setYaml(r.yaml);
+          setSaved(r.yaml);
+        } else {
+          setSaved(null);
+        }
+        setErr(null);
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, []);
+  }, [specName]);
 
   const onSave = async () => {
     setErr(null);
     try {
-      await api.putSpec(yaml);
+      await api.putSpecNamed(specName, yaml);
       setSaved(yaml);
-      message.success("已保存");
+      message.success(`已保存到 ${specName}.yaml`);
     } catch (e) {
       setErr((e as Error).message);
     }
@@ -154,7 +176,7 @@ export default function Editor() {
       // 跑成功就把这份规格落盘：下次刷新页面能拿回来。
       // 失败只提示不打断——apply 已经开始了，保存不成功不该影响它。
       api
-        .putSpec(sent)
+        .putSpecNamed(specName, sent)
         .then(() => setSaved(sent))
         .catch((e) => message.warning(`规格未能保存：${(e as Error).message}`));
 
@@ -220,7 +242,20 @@ export default function Editor() {
         <Card
           title={
             <Space size={8}>
-              <span>规格（lab.yaml）</span>
+              <Select
+                size="small"
+                style={{ width: 132 }}
+                value={specName}
+                onChange={setSpecName}
+                options={
+                  names.includes(specName)
+                    ? names.map((n) => ({ value: n, label: `${n}.yaml` }))
+                    : [...names.map((n) => ({ value: n, label: `${n}.yaml` })), {
+                        value: specName,
+                        label: `${specName}.yaml（未建）`,
+                      }]
+                }
+              />
               {dirty ? (
                 <Tag color="orange" style={{ marginInlineEnd: 0 }}>
                   未保存

@@ -5,6 +5,7 @@
 //! 只信记录会在"手工删了容器"之后谎报已完成，只信现状则改参数不会重跑。
 
 pub mod assets;
+pub mod gateway;
 pub mod net;
 
 use crate::core::plan::{Phase, Step, StepKind};
@@ -193,6 +194,7 @@ impl Executor {
             Phase::Container,
             Phase::Net,
             Phase::Bootstrap,
+            Phase::Gateway,
             Phase::Mirror,
             Phase::Snapshot,
         ] {
@@ -221,7 +223,7 @@ impl Executor {
             let steps = runnable;
             // 建容器最重：并发压低；建桥/网络很轻：可以放宽。
             let limit = match phase {
-                Phase::Bridge | Phase::Template | Phase::Mirror => 1,
+                Phase::Bridge | Phase::Template | Phase::Mirror | Phase::Gateway => 1,
                 Phase::Container | Phase::Bootstrap => concurrency.max(1),
                 _ => concurrency.max(1) * 2,
             };
@@ -474,28 +476,60 @@ async fn apply_step(
             dns,
             ..
         } => {
-            let script = if *is_gateway {
-                // 网关接口地址是它自己的 IP（10.77.0.1/24），不是网段号——
-                // 真机实测发现早期把网段地址写上了接口。
-                net::gateway_script(
+            // 地址/路由落成开机单元而不是"执行一次"：容器重启后这些运行时
+            // 状态全没了，而本步骤是哈希门控的——apply 不会再跑一遍。
+            let addressing = if *is_gateway {
+                net::gateway_addressing(ipv4, ipv6_prefix.as_deref(), "eth1", dns)
+            } else {
+                net::host_script(
                     ipv4,
-                    &zone_cidr_from(ipv4),
+                    gateway.as_deref(),
                     ipv6_prefix.as_deref(),
-                    "eth1",
-                    *nat,
+                    *default_route,
                     dns,
                 )
-            } else {
-                net::host_script(ipv4, gateway.as_deref(), ipv6_prefix.as_deref(), *default_route, dns)
             };
-            pve.ct_exec(
+            pve.ct_boot_script(
                 &format!("net:{host}"),
                 *vmid,
-                &["sh", "-c", &script],
+                "labyard-net",
+                "labyard: 容器地址与路由",
+                &addressing,
                 Duration::from_secs(120),
                 cancel,
             )
             .await?;
+
+            if *is_gateway {
+                // 基础策略与地址同时下发：网关一建立就是"默认拒绝入向"的状态，
+                // 不给它留一个没有任何过滤的窗口。端口映射/VPN 由后续的
+                // gateway 步骤用全量策略覆盖（同一套生成器，不会漂移）。
+                //
+                // nft 的规则表同样不随容器重启存活，所以也落成开机单元——
+                // 否则重启后网关会静默 fail-open。
+                let cidr = zone_cidr_from(ipv4);
+                let no_vpn = crate::core::spec::ResolvedVpn::default();
+                let base_policy = gateway::Policy {
+                    lan: "eth0",
+                    uplink: "eth1",
+                    zone_cidr: &cidr,
+                    nat: *nat,
+                    egress: true,
+                    v6_prefix: ipv6_prefix.as_deref(),
+                    pubs: &[],
+                    vpn: &no_vpn,
+                };
+                pve.ct_boot_script(
+                    &format!("net-nft:{host}"),
+                    *vmid,
+                    "labyard-nft",
+                    "labyard: 网关基础策略（入向默认拒绝）",
+                    &gateway::nft_script(&base_policy),
+                    Duration::from_secs(180),
+                    cancel,
+                )
+                .await?;
+            }
         }
 
         StepKind::Bootstrap {
@@ -572,6 +606,75 @@ async fn apply_step(
                     }
                 }
             }
+        }
+
+        StepKind::Gateway {
+            vmid,
+            host,
+            zone_cidr,
+            nat,
+            egress,
+            v6_prefix,
+            pubs,
+            vpn,
+            uplink,
+            ..
+        } => {
+            let policy = gateway::Policy {
+                lan: "eth0",
+                uplink,
+                zone_cidr,
+                nat: *nat,
+                egress: *egress,
+                v6_prefix: v6_prefix.as_deref(),
+                pubs,
+                vpn,
+            };
+            // 规则整份重建：改一条映射也走同一路径，不存在增量漂移。
+            // 同时覆盖 net 阶段装的那份基础策略单元——同一个单元名，
+            // 开机跑的就是"最后一次下发"的完整策略。
+            pve.ct_boot_script(
+                &format!("gw-nft:{vmid}"),
+                *vmid,
+                "labyard-nft",
+                "labyard: 网关策略（NAT / 映射 / 出网 / VPN）",
+                &gateway::nft_script(&policy),
+                Duration::from_secs(180),
+                cancel,
+            )
+            .await?;
+
+            // VPN 的"开"和"关"都要落地。只把规格里的开关关掉、容器里的 wg0
+            // 还在跑，是最糟的一种不一致：平台说没有，实际还开着。
+            if vpn.enabled() {
+                // VPN 需要 /dev/net/tun。补设备必须重启容器才生效——少了这一步，
+                // 表现是"配置写得好好的，wg0 就是起不来"，且容器内没有任何线索。
+                match pve.ensure_tun(*vmid, cancel).await {
+                    Ok(true) => {
+                        let _ = tx
+                            .send(Event::Line {
+                                key: step.key.clone(),
+                                stream: crate::core::runner::Stream::Stdout,
+                                line: format!(
+                                    "[VPN] 已为 {host} 补上 /dev/net/tun 并重启容器（设备需要重启才可见）"
+                                ),
+                            })
+                            .await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => return Err(format!("补 /dev/net/tun 失败: {e}").into()),
+                }
+            }
+            // 无论如何都跑一遍 VPN 同步脚本：开启时它建隧道，关闭时它把
+            // 单元停掉。脚本本身对"没装过"是幂等的（全部 || true）。
+            pve.push_and_run(
+                &format!("gw-vpn:{vmid}"),
+                *vmid,
+                &gateway::vpn_script(&policy),
+                Duration::from_secs(1500),
+                cancel,
+            )
+            .await?;
         }
 
         StepKind::Mirror {
@@ -666,6 +769,85 @@ mod tests {
     fn zone_cidr_normalises_last_octet() {
         assert_eq!(zone_cidr_from("10.10.1.1/24"), "10.10.1.0/24");
         assert_eq!(zone_cidr_from("192.168.5.254/16"), "192.168.5.0/16");
+    }
+}
+
+// ═════════════════════════ 镜像实例 ═════════════════════════
+
+impl Executor {
+    /// 停掉并移除一条镜像实例（规格里删掉连线时调用）。
+    ///
+    /// 只删规格不停实例，是"平台不知道它在跑"的最坏形态：流量还在灌，
+    /// 平台却认为没有这条连线，排查时两边对不上。
+    pub async fn remove_mirror_instance(
+        &self,
+        zone: &str,
+        src_vmid: u32,
+        dst_vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let instance = format!("{zone}-{src_vmid}-{dst_vmid}");
+        self.stop_units(&[instance], cancel).await
+    }
+
+    /// 停掉指定前缀的全部镜像实例，返回停掉的实例名。
+    /// `prefix` 形如 `main-`（整个 zone）或 `main-1001-`（某台主机当源）。
+    pub async fn stop_mirror_instances(
+        &self,
+        prefix: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, String> {
+        let cmd = format!(
+            "for f in /etc/labyard/mirror/{prefix}*.conf; do \
+               [ -e \"$f\" ] || continue; \
+               i=$(basename \"$f\" .conf); \
+               systemctl disable --now \"labmirror@$i.service\" >/dev/null 2>&1 || true; \
+               echo \"$i\"; \
+             done"
+        );
+        let out = self
+            .runner
+            .run(
+                &format!("mirror-stop:{prefix}"),
+                &CommandSpec::new("sh", ["-c", cmd.as_str()])
+                    .with_timeout(Duration::from_secs(60)),
+                None,
+                cancel,
+                true,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out
+            .stdout
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
+    /// 停单元 + 删配置。实例名拼法与执行镜像步骤时严格一致。
+    async fn stop_units(&self, instances: &[String], cancel: &CancellationToken) -> Result<(), String> {
+        let mut cmd = String::from("set -e\n");
+        for i in instances {
+            cmd.push_str(&format!(
+                "systemctl disable --now labmirror@{i}.service >/dev/null 2>&1 || true\n\
+                 rm -f /etc/labyard/mirror/{i}.conf\n\
+                 systemctl reset-failed labmirror@{i}.service >/dev/null 2>&1 || true\n"
+            ));
+        }
+        cmd.push_str("echo removed\n");
+        self.runner
+            .run(
+                "mirror-remove",
+                &CommandSpec::new("sh", ["-c", cmd.as_str()])
+                    .with_timeout(Duration::from_secs(60)),
+                None,
+                cancel,
+                true,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 

@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
-import { Layout, Menu, Button, Space, Typography, App as AntApp } from "antd";
+import { Suspense, lazy, useCallback, useEffect, useState } from "react";
+import { Layout, Menu, Button, Card, Space, Typography, App as AntApp } from "antd";
 import {
+  ApartmentOutlined,
   DashboardOutlined,
   ExperimentOutlined,
+  FileTextOutlined,
   HistoryOutlined,
   LogoutOutlined,
   CloudServerOutlined,
@@ -12,12 +14,17 @@ import Dashboard from "./Dashboard";
 import Editor from "./Editor";
 import Hosts from "./Hosts";
 import Runs from "./Runs";
+import Specs from "./Specs";
 import { api } from "./api";
+
+// 拓扑图把 react-flow + dagre 一起拖进来（约 300 KB gzip）。它只在一个页面用到，
+// 所以按需加载——首屏不该为一张可能不打开的图付代价。
+const TopologyPage = lazy(() => import("./TopologyPage"));
 
 const { Header, Content } = Layout;
 const { Text } = Typography;
 
-type Page = "dashboard" | "editor" | "hosts" | "runs";
+type Page = "dashboard" | "editor" | "specs" | "topology" | "hosts" | "runs";
 
 export default function App() {
   const { message } = AntApp.useApp();
@@ -70,12 +77,22 @@ export default function App() {
             mode="horizontal"
             selectedKeys={[page]}
             onClick={(e) => setPage(e.key as Page)}
-            style={{ borderBottom: "none", minWidth: 260 }}
+            style={{ borderBottom: "none", minWidth: 420 }}
             items={[
               {
                 key: "editor",
                 icon: <ExperimentOutlined />,
                 label: "编排",
+              },
+              {
+                key: "specs",
+                icon: <FileTextOutlined />,
+                label: "规格",
+              },
+              {
+                key: "topology",
+                icon: <ApartmentOutlined />,
+                label: "拓扑",
               },
               {
                 key: "hosts",
@@ -102,6 +119,12 @@ export default function App() {
 
       <Content style={{ padding: 20, maxWidth: 1600, width: "100%", margin: "0 auto" }}>
         {page === "editor" && <Editor />}
+        {page === "specs" && <Specs />}
+        {page === "topology" && (
+          <Suspense fallback={<Card loading style={{ minHeight: 320 }} />}>
+            <TopologyPage />
+          </Suspense>
+        )}
         {page === "hosts" && <Hosts />}
         {page === "runs" && <Runs />}
         {page === "dashboard" && <Dashboard />}

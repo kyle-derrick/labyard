@@ -21,9 +21,10 @@ pub enum DbError {
 }
 
 /// 一版迁移。顺序执行，版本号记在 `schema_version`。
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "001-init",
-    r#"
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "001-init",
+        r#"
 CREATE TABLE IF NOT EXISTS step_state (
     key         TEXT PRIMARY KEY,
     input_hash  TEXT NOT NULL,
@@ -57,7 +58,23 @@ CREATE TABLE IF NOT EXISTS run_steps (
     PRIMARY KEY (run_id, step_key)
 );
 "#,
-)];
+    ),
+    (
+        // retire 是**运行态**，不是声明式配置：它记录"这轮做完了，先收起来"，
+        // 必须跨 apply 存活（否则一次 apply 就把它复活了）。host = '*' 表示
+        // 整个 zone 被废弃。
+        "002-lifecycle",
+        r#"
+CREATE TABLE IF NOT EXISTS retired (
+    zone       TEXT NOT NULL,
+    host       TEXT NOT NULL,
+    note       TEXT,
+    retired_at TEXT NOT NULL,
+    PRIMARY KEY (zone, host)
+);
+"#,
+    ),
+];
 
 /// run 历史行（只读视图，运维页直接序列化）。
 #[derive(Debug, serde::Serialize)]
@@ -353,6 +370,69 @@ impl Db {
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
+    }
+
+    /// 按 LIKE 模式清步骤记录。
+    ///
+    /// retire 用它把与某个 zone / 主机相关的镜像与网关步骤清掉：revive 时
+    /// 这些步骤才会真的重跑一遍，把策略与镜像实例原样装回去。
+    pub fn forget_steps_matching(&self, pattern: &str) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM step_state WHERE key LIKE ?1", params![pattern])
+            .unwrap_or(0)
+    }
+
+    // ── retire / revive（运行态，不是声明式配置）──
+
+    /// 标记废弃。`host = "*"` 表示整个 zone。
+    ///
+    /// 与 destroy 的区别只有一个但很关键：**保留 vmid 与步骤记录**——
+    /// 否则重建时同一台 `main-server1` 可能拿到另一个 IP，笔记就全废了。
+    pub fn retire(&self, zone: &str, host: &str, note: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO retired (zone, host, note, retired_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(zone, host) DO UPDATE SET note = excluded.note, retired_at = excluded.retired_at",
+            params![zone, host, note, now()],
+        );
+    }
+
+    /// 取消废弃。返回是否真的有一条记录被删（用于判断"本来就没废弃"）。
+    pub fn unretire(&self, zone: &str, host: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM retired WHERE zone = ?1 AND host = ?2",
+            params![zone, host],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// 全部废弃记录：(zone, host, retired_at, note)。host = "*" 表示整个 zone。
+    pub fn retired_list(&self) -> Vec<(String, String, String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT zone, host, retired_at, COALESCE(note,'') FROM retired ORDER BY retired_at DESC",
+        ) {
+            Ok(st) => st,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// zone 级与主机级同时判断：zone 被标 `*` 时，其中每台主机都算废弃。
+    pub fn is_retired(&self, zone: &str, host: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM retired WHERE zone = ?1 AND (host = ?2 OR host = '*') LIMIT 1",
+            params![zone, host],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap_or(None)
+        .unwrap_or(false)
     }
 
     pub fn all_step_states(&self) -> Vec<(String, String, String)> {

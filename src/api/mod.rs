@@ -1,15 +1,18 @@
 //! HTTP 层：axum 路由、SSE 日志流、认证、静态资源。
 
 pub mod auth;
+pub mod ops;
+pub mod specs;
+pub mod topology;
 
 use axum::{
     extract::{FromRequestParts, Path, Query, State},
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use rust_embed::RustEmbed;
@@ -69,6 +72,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/me", get(me))
         .route("/api/state", get(state_of_world))
         .route("/api/spec", get(get_spec).put(put_spec))
+        // 多份规格：文件级 CRUD + 文件内的 zone 级 CRUD
+        .route("/api/specs", get(ops::list_specs).post(ops::create_spec))
+        .route(
+            "/api/specs/{name}",
+            get(ops::get_spec_named)
+                .put(ops::put_spec_named)
+                .delete(ops::delete_spec),
+        )
+        .route("/api/specs/{name}/zones", post(ops::add_zone))
+        .route(
+            "/api/specs/{name}/zones/{z}",
+            get(ops::get_zone)
+                .put(ops::update_zone)
+                .delete(ops::delete_zone),
+        )
         .route("/api/preview", post(preview))
         .route("/api/apply", post(apply))
         .route("/api/runs/{id}/events", get(run_events))
@@ -79,8 +97,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/runs/{id}/retry", post(retry_run))
         .route("/api/hosts", get(hosts))
         .route("/api/hosts/{z}/{h}/power", post(power))
+        .route("/api/hosts/{z}/{h}/retire", post(ops::retire_host))
+        .route("/api/hosts/{z}/{h}/revive", post(ops::revive_host))
         .route("/api/snapshots/{z}/{h}", get(list_snapshots).post(snapshot_op))
         .route("/api/destroy", post(destroy))
+        .route("/api/topology", get(ops::topology_view))
+        .route("/api/zones/{z}/gateway/status", get(ops::gateway_status))
+        .route("/api/zones/{z}/gateway/egress", post(ops::gateway_egress))
+        .route("/api/zones/{z}/gateway/pub", post(ops::gateway_pub_add))
+        .route("/api/zones/{z}/gateway/pub/{idx}", delete(ops::gateway_pub_del))
+        .route("/api/zones/{z}/gateway/vpn", post(ops::gateway_vpn))
+        .route(
+            "/api/zones/{z}/gateway/vpn/{proto}/client",
+            get(ops::gateway_vpn_client),
+        )
+        .route("/api/zones/{z}/retire", post(ops::retire_zone))
+        .route("/api/zones/{z}/revive", post(ops::revive_zone))
+        .route("/api/mirrors", get(ops::list_mirrors).post(ops::add_mirror))
+        .route("/api/mirrors/{*id}", delete(ops::delete_mirror))
         .route("/terminal/{z}/{h}", any(terminal_bare))
         .route("/terminal/{z}/{h}/", any(terminal_trailing))
         .route("/terminal/{z}/{h}/{*path}", any(terminal_proxy))
@@ -227,7 +261,12 @@ async fn state_of_world(State(state): State<Arc<AppState>>, headers: HeaderMap) 
             message: msg,
         })
         .collect();
-    Json(serde_json::json!({ "steps": steps })).into_response()
+    Json(serde_json::json!({
+        "steps": steps,
+        // 废弃标记是运行态，前端要能直接看到"这台是我有意收起来的"
+        "retired": state.db.retired_list(),
+    }))
+    .into_response()
 }
 
 fn phase_of_key(key: &str) -> String {
@@ -241,8 +280,10 @@ fn phase_of_key(key: &str) -> String {
 /// `paths.specs` 在配置里本来就有，之前只建了目录没用上。
 const SPEC_MAX_BYTES: usize = 512 * 1024;
 
+/// 默认规格文件（`/api/spec` 与 retry / destroy 的兜底）。
+/// 多份规格由 `/api/specs/{name}` 管理，这里只是"没指定哪一份"时的落点。
 fn spec_file(cfg: &Config) -> std::path::PathBuf {
-    cfg.paths.specs.join("lab.yaml")
+    specs::path_of(&cfg.paths.specs, specs::DEFAULT_SPEC)
 }
 
 #[derive(Deserialize)]
@@ -314,9 +355,39 @@ async fn put_spec(
 
 #[derive(Deserialize)]
 struct SpecReq {
-    yaml: String,
+    /// 直接给 YAML（编辑器路径）
+    #[serde(default)]
+    yaml: Option<String>,
+    /// 或指定一份已保存的规格（规格列表页的"应用"按钮）
+    #[serde(default)]
+    spec: Option<String>,
     #[serde(default)]
     snapshot: bool,
+}
+
+impl SpecReq {
+    /// 取出本次要执行的 YAML。两个字段都给时以 `yaml` 为准（编辑器里的
+    /// 未保存内容是用户当下看到的，优先于磁盘上的旧版本）。
+    async fn resolve(&self, state: &AppState) -> Result<String, (StatusCode, String)> {
+        if let Some(y) = &self.yaml {
+            return Ok(y.clone());
+        }
+        let Some(name) = &self.spec else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "需要 `yaml` 或 `spec`（规格名）".into(),
+            ));
+        };
+        let text = tokio::fs::read_to_string(specs::path_of(&state.cfg.paths.specs, name))
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("规格 `{name}` 不存在"),
+                )
+            })?;
+        Ok(text)
+    }
 }
 
 #[derive(Serialize)]
@@ -338,7 +409,13 @@ async fn preview(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(re
                 .into_response()
         }
     };
-    match build_plan(&state, &req.yaml, req.snapshot) {
+    let yaml = match req.resolve(&state).await {
+        Ok(y) => y,
+        Err((code, msg)) => {
+            return (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+    };
+    match build_plan(&state, &yaml, req.snapshot) {
         Ok((zones, plan)) => Json(PreviewResp {
             zones: zones
                 .iter()
@@ -364,9 +441,10 @@ async fn preview(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(re
 
 fn build_plan(state: &AppState, yaml: &str, snapshot: bool) -> Result<(Vec<crate::core::spec::ResolvedZone>, Plan), String> {
     let spec = Spec::parse(yaml).map_err(|e| e.to_string())?;
-    let mut zones = spec
-        .resolve(&state.cfg.pve.wan_bridge)
+    let resolved = spec
+        .resolve_all(&state.cfg.pve.wan_bridge)
         .map_err(|e| e.to_string())?;
+    let mut zones = resolved.zones;
     let db = state.db.clone();
     let base = state.cfg.pve.vmid_base;
 
@@ -382,16 +460,12 @@ fn build_plan(state: &AppState, yaml: &str, snapshot: bool) -> Result<(Vec<crate
 
     let plan = Plan::build(
         &zones,
+        &resolved.mirrors,
         &|p| assets::Assets::provisioner_hash(p),
         &|z, h| db.vmid_for(z, h, base),
         snapshot,
     );
     Ok((zones, plan))
-}
-
-#[derive(Serialize)]
-struct ApplyResp {
-    run_id: String,
 }
 
 async fn apply(
@@ -400,7 +474,13 @@ async fn apply(
     Json(req): Json<SpecReq>,
 ) -> Response {
     require_auth!(state, headers);
-    apply_core(state, req.yaml, req.snapshot).await
+    let yaml = match req.resolve(&state).await {
+        Ok(y) => y,
+        Err((code, msg)) => {
+            return (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+    };
+    apply_core(state, yaml, req.snapshot).await
 }
 
 fn run_id_seed() -> String {
@@ -409,6 +489,65 @@ fn run_id_seed() -> String {
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
         std::process::id()
     )
+}
+
+/// 起一个 run 并返回 run_id。
+///
+/// apply / retry / 网关策略改动 / revive 全走这一条路径，只换 plan 与标签。
+/// 好处是所有入口的 run 记录、SSE 流、取消语义完全一致——不会出现"从网关
+/// 面板触发的操作在历史里查不到"这种事。
+pub(crate) async fn spawn_plan(state: &Arc<AppState>, plan: &Plan, label: &str) -> String {
+    let run_id = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S"),
+        &crate::core::plan::sha256_hex(run_id_seed().as_bytes())[..6]
+    );
+    state.db.create_run(&run_id, label);
+
+    let (btx, _) = broadcast::channel::<Event>(1024);
+    let cancel = CancellationToken::new();
+    state.runs.lock().await.insert(
+        run_id.clone(),
+        RunHandle {
+            tx: btx.clone(),
+            cancel: cancel.clone(),
+        },
+    );
+
+    let db = state.db.clone();
+    let pve = state.pve.clone();
+    let runner = state.runner.clone();
+    let conc = state.concurrency;
+    let rid = run_id.clone();
+    let plan = plan.clone();
+
+    tokio::spawn(async move {
+        let (mtx, mut mrx) = mpsc::channel::<Event>(500);
+        let btx2 = btx.clone();
+        let fwd = tokio::spawn(async move {
+            while let Some(ev) = mrx.recv().await {
+                let _ = btx2.send(ev);
+            }
+        });
+        let ex = Executor::new(pve, db.clone(), runner);
+        let summary = ex.execute(&plan, &rid, mtx, cancel.clone(), conc).await;
+        let _ = fwd.await;
+        let final_status = if cancel.is_cancelled() {
+            "cancelled"
+        } else if summary.ok() {
+            "ok"
+        } else {
+            "failed"
+        };
+        db.finish_run(&rid, final_status);
+        let _ = btx.send(Event::Finished {
+            key: format!("run:{rid}"),
+            code: Some(if summary.ok() { 0 } else { 1 }),
+            duration_ms: 0,
+        });
+    });
+
+    run_id
 }
 
 // ───────────────────────── 运维：历史 / 电源 / 快照 / 销毁 ─────────────────────────
@@ -450,11 +589,7 @@ async fn retry_run(
 }
 
 /// 把 apply handler 的主体抽出来，apply 与 retry 共用。
-async fn apply_core(
-    state: Arc<AppState>,
-    yaml: String,
-    snapshot: bool,
-) -> Response {
+async fn apply_core(state: Arc<AppState>, yaml: String, snapshot: bool) -> Response {
     {
         let cancel = CancellationToken::new();
         if let Err(e) = state.pve.require_pve9(&cancel).await {
@@ -465,7 +600,7 @@ async fn apply_core(
                 .into_response();
         }
     }
-    let (zones, plan) = match build_plan(&state, &yaml, snapshot) {
+    let (_zones, plan) = match build_plan(&state, &yaml, snapshot) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -476,56 +611,7 @@ async fn apply_core(
         }
     };
 
-    let run_id = format!(
-        "{}-{}",
-        chrono::Utc::now().format("%Y%m%d%H%M%S"),
-        &crate::core::plan::sha256_hex(run_id_seed().as_bytes())[..6]
-    );
-    state.db.create_run(&run_id, "web");
-
-    let (btx, _) = broadcast::channel::<Event>(1024);
-    let cancel = CancellationToken::new();
-    state.runs.lock().await.insert(
-        run_id.clone(),
-        RunHandle {
-            tx: btx.clone(),
-            cancel: cancel.clone(),
-        },
-    );
-
-    let db = state.db.clone();
-    let pve = state.pve.clone();
-    let runner = state.runner.clone();
-    let conc = state.concurrency;
-    let rid = run_id.clone();
-    let _ = zones;
-
-    tokio::spawn(async move {
-        let (mtx, mut mrx) = mpsc::channel::<Event>(500);
-        let btx2 = btx.clone();
-        let fwd = tokio::spawn(async move {
-            while let Some(ev) = mrx.recv().await {
-                let _ = btx2.send(ev);
-            }
-        });
-        let ex = Executor::new(pve, db.clone(), runner);
-        let summary = ex.execute(&plan, &rid, mtx, cancel.clone(), conc).await;
-        let _ = fwd.await;
-        let final_status = if cancel.is_cancelled() {
-            "cancelled"
-        } else if summary.ok() {
-            "ok"
-        } else {
-            "failed"
-        };
-        db.finish_run(&rid, final_status);
-        let _ = btx.send(Event::Finished {
-            key: format!("run:{rid}"),
-            code: Some(if summary.ok() { 0 } else { 1 }),
-            duration_ms: 0,
-        });
-    });
-
+    let run_id = spawn_plan(&state, &plan, "web").await;
     Json(serde_json::json!({ "run_id": run_id })).into_response()
 }
 
@@ -534,12 +620,42 @@ async fn hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     require_auth!(state, headers);
     let cancel = CancellationToken::new();
     let vms = state.pve.cluster_vms(&cancel).await.unwrap_or_default();
+
+    // DB 只知道 (zone, host) → vmid；角色与地址在规格里。运维页要能直接看到
+    // "哪台是网关、地址是多少、属于哪份规格"，所以在这一层补齐。
+    let mut info: HashMap<(String, String), (String, String, String)> = HashMap::new();
+    for meta in specs::list(&state.cfg.paths.specs, &state.cfg.pve.wan_bridge) {
+        if !meta.valid {
+            continue;
+        }
+        let Ok(Some(text)) = specs::read(&state.cfg.paths.specs, &meta.name) else {
+            continue;
+        };
+        let Ok(sp) = Spec::parse(&text) else { continue };
+        let Ok(res) = sp.resolve_all(&state.cfg.pve.wan_bridge) else {
+            continue;
+        };
+        for z in res.zones {
+            for h in z.hosts {
+                info.insert(
+                    (z.name.clone(), h.name.clone()),
+                    (
+                        h.role.as_str().to_string(),
+                        h.ipv4.clone(),
+                        meta.name.clone(),
+                    ),
+                );
+            }
+        }
+    }
+
     let rows: Vec<serde_json::Value> = state
         .db
         .all_vmids()
         .into_iter()
         .map(|(zone, host, vmid)| {
             let row = vms.iter().find(|r| r.vmid_parsed() == Some(vmid));
+            let meta = info.get(&(zone.clone(), host.clone()));
             serde_json::json!({
                 "zone": zone,
                 "host": host,
@@ -547,6 +663,10 @@ async fn hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
                 "exists": row.is_some(),
                 "status": row.and_then(|r| r.status.clone()).unwrap_or_else(|| "absent".to_string()),
                 "name": row.map(|r| r.name.clone()),
+                "role": meta.map(|m| m.0.clone()),
+                "ipv4": meta.map(|m| m.1.clone()),
+                "spec": meta.map(|m| m.2.clone()),
+                "retired": state.db.is_retired(&zone, &host),
             })
         })
         .collect();
@@ -692,14 +812,11 @@ async fn destroy(
         )
             .into_response();
     }
-    let yaml = match tokio::fs::read_to_string(spec_file(&state.cfg)).await {
-        Ok(y) => y,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "没有已保存的规格"})),
-            )
-                .into_response()
+    // zone 可能在任何一份规格里：先按名字定位，找不到才报错
+    let (_, yaml) = match ops::locate_zone(&state, &req.zone) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            return (code, Json(serde_json::json!({ "error": msg }))).into_response()
         }
     };
     let text_specs = match Spec::parse(&yaml) {
@@ -771,6 +888,10 @@ async fn terminal_bare(
     Path((z, h)): Path<(String, String)>,
     req: axum::extract::Request,
 ) -> Response {
+    // 重定向也要认证：否则未登录的人能借这条路由探测哪些主机存在
+    if current_user(&state, req.headers()).is_none() {
+        return unauthorized();
+    }
     // ttyd 的 base path 必须以 / 结尾，裸路径补上斜杠后由浏览器重新请求，
     // 页面里的相对资源才对得上
     let q = req

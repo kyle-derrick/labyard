@@ -3,8 +3,9 @@
 声明式攻防实验网络编排。给 Proxmox VE 单节点用：写一份 YAML，得到一个可以复现、
 可以推倒重来的实验网络。
 
-**状态：可运行的骨架。** 核心引擎、PVE 命令层、Web 界面、幂等与并发控制已完成并有
-单元测试；**已在真实 PVE 9.2.2 上跑通完整链路**（详见文末「已验证 / 未验证」）。
+**状态：功能完整，已在真实 PVE 9.2.2 上端到端验证。** 核心引擎、PVE 命令层、Web 界面
+（规格管理 / 拓扑图 / 网关面板 / 运维 / 终端）、幂等与并发控制全部实现，91 项单元测试
+与真机全链路验证通过（详见文末「已验证 / 未验证」）。
 
 ---
 
@@ -53,7 +54,38 @@ zones:
 - 同角色主机不写 `ip` 时自动取不同主机位（两台 `server` 是 `.20`/`.21`，不会撞）
 - 幂等的单位是「步骤 key + 输入哈希」，不是版本号
 
-Web 界面里编辑的规格保存在服务端（`paths.specs/lab.yaml`），刷新不丢；改动未保存时标题旁有提示。
+### 网关、镜像与生命周期
+
+```yaml
+zones:
+  lab:
+    uplink: wan
+    v4: 10.77.0.0/24
+    hosts:
+      gw:    { role: gateway, ip: 1 }
+      cache: { role: analysis, ip: 10, provisioner: apt-mirror, mirror: target }
+      t1:    { role: server, ip: 20, mirror: source,
+               apt_mirror: http://10.77.0.10:3142/debian }
+    gateway:
+      egress: true            # 内网是否允许出网（关 = 立刻切断，已建立连接一起断）
+      pub:                    # 端口映射：宿主端口 → 内网某台机
+        - { proto: tcp, port: 17681, to: "10.77.0.20:7681" }
+      vpn:                    # 远程接入；私钥只存在容器里，下载时现读现拼
+        wireguard: false
+        openvpn: false
+
+mirrors:                      # 跨 zone 的精确镜像连线（host 级 mirror: 是同 zone 全连的简写）
+  - { from: "sub:victim", to: "main:analysis" }
+```
+
+- `role: gateway` 每个 zone 唯一，拿网段 `.1`；`egress` / `pub` / `vpn` 只作用于它
+- 网关策略每次**整表重建**（`nft -f` 单事务），不做增量——不存在"删了映射规则还在"
+- **retire ≠ destroy**：retire 停机 + 摘镜像单元 + 拓扑折叠，保留 vmid / IP / 磁盘 / 快照，
+  `revive` 原样回来；destroy 才是真删。
+- 规格可以有多份：`paths.specs/*.yaml` 下的文件就是唯一真相源，Web 里可新建/复制/删除，
+  单个 zone 可以单独打开编辑（原位改，保留注释与顺序）
+
+写入走「先 parse + resolve 校验，再临时文件 + rename 原子替换」——非法 YAML 一律 400 且不碰旧文件。刷新页面从服务端读回；改动没保存时标题旁有提示。
 
 ## 快速开始
 
@@ -94,15 +126,16 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 | 宿主依赖 | `pct` `pvesh` `pveam` `ip` `nft` | `install.sh` 检查，不自动装 PVE 组件 |
 | 存储 | 用户指定，**没有默认值** | 选错代价太大，强制每次确认 |
 
-**自身开销（实测，Debian 13 / arm64，HTTP 模式）**：常驻 **6.9 MB**、二进制 **8.0 MB**
-（含 1.07 MB 前端）、峰值 **≈38 MB**（37.9–38.1，多次实测）。
+**自身开销（实测，Debian 13 / amd64，HTTPS，含拓扑图与规格管理）**：常驻 **12.0 MB**、
+二进制 **12.4 MB**（含 1.52 MB 前端）、峰值 **44.9 MB**（`VmHWM`）。
 
-峰值比常驻高 31 MB，原因只有一个：`scrypt(N=2¹⁵, r=8)` 的工作内存是
+峰值比常驻高 33 MB，原因只有一个：`scrypt(N=2¹⁵, r=8)` 的工作内存是
 `128·N·r = 32 MB`，只在启动生成密码和登录的那一瞬间存在。实测确认——`VmHWM`
-在启动完成时就已到 ≈38 MB，之后 200 个并发请求（20 并发）只让常驻从 6.9 涨到 7.5 MB。
-8 个并发登录只把峰值从 38 推到 ≈39 MB——这是哈希串行化真的生效的证据。
+在登录完成时就已封顶，之后反复刷新拓扑 / 规格 / 主机列表，常驻稳定在
+12.0–12.1 MB（12024 → 12092 kB）。这也是登录必须串行化（`hash_gate`）的原因：
+并发 scrypt 会把 64 MB 的 `MemoryMax` 顶穿。
 
-因此 `systemd` 的 `MemoryMax` 取 **64 MB**（32 + 7 + 余量），并且密码哈希与规格解析
+因此 `systemd` 的 `MemoryMax` 取 **64 MB**（32 + 12 + 余量），并且密码哈希与规格解析
 都做了串行/限流。取 16 MB 会在第一次登录时被 OOM kill。
 
 **内存分配器**：实测**不用换**。glibc 默认 4.4 MB / churn 后 5.5 MB，jemalloc 是
@@ -157,18 +190,22 @@ docs/design.md   唯一权威设计文档
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | 54 项：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
+| ✅ 单元测试通过 | **91 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
-| ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（8.0 MB）与内存（常驻 6.9 MB / 峰值 ≈38 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
-| ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` 8/8 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、靶机**无默认路由**、宿主入向被网关丢弃；幂等重跑 8/8 跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、靶机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）。真机暴露并修复了 6 处缺陷（见 git log `9eb34c1`）|
-| ✅ IPv6（区域内） | ULA 正确下发（gw `::1`、靶机 `::14`）、区域内互通、NAT66 masquerade 规则在位；出公网未测（宿主无 IPv6 上游，环境限制）|
-| ⚠️ 仅设计推演 | IPv6 双栈全链路（ULA 已在真机下发、NAT66 规则在位，但端到端连通未测）、厚 LVM 快照、`pct snapshot` |
-| ✅ **Web 终端** | ttyd 1.7.7 静态二进制注入容器（systemd 单元、绑容器内网地址）→ axum HTTP+WS 反代（hyper client + tokio-tungstenite）→ iframe 嵌入（ttyd 自带 xterm.js、CJK 输入、ZMODEM 传文件）。真机验证：页面 200、WS 握手 101 |
+| ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.4 MB，含 1.52 MB 前端）与内存（常驻 12.0 MB / 峰值 44.9 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
+| ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` **14/14** 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、靶机**无默认路由**、宿主入向被网关丢弃；幂等重跑全部跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、靶机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）|
 | ✅ **Web 运维** | 主机表格（电源 start/stop/reboot）、快照（列/建/回滚/删）、run 历史与明细、retry、destroy（zone 名二次确认）。真机逐项验证通过 |
 | ✅ **mirror/analysis** | analysis 主机自动挂 `mirr` 桥（纯二层无 IP）+ 宿主侧 `labmirror@` 单元（tc mirred），落点按桥探测自愈；apt-cacher-ng 缓存链路端到端验证（无外网靶机经缓存装包成功） |
-| ❌ 未实现 | retire/revive、gateway egress/pub/vpn、zone 多规格管理、升级迁移 |
+| ✅ **网关策略** | `egress` 关：`forward` 里 drop 排在 `established` 之前，容器立刻断网（含已建立连接）；开：`http=200`。端口映射 `tcp:17681 → 10.77.0.20:7681` 实测可穿透（回 `404` 是 ttyd 自己的响应，说明链路通），删除后端口关闭 |
+| ✅ **VPN** | WireGuard：`wg0` 起来、公钥/peer/allowed-ips 正确、客户端 `.conf` 可下载；OpenVPN：`openvpn-server@labyard` active、监听 1194、`.ovpn` 可下载。**关闭也落地**（`disable --now` + 删 `wg0`），平台显示与实际一致 |
+| ✅ **retire / revive** | 主机级与整 zone 级都闭环：停机 → 摘镜像单元 → 拓扑折叠，保留 vmid/IP/磁盘/快照；revive 原样回来且 `gateway` / `mirror` 自动重跑恢复 |
+| ✅ **多规格管理** | 创建/复制（重名 409、非法名 400）、列表、zone 片段单独读写（往返只做块状序列化的风格归一，注释与其他 zone 不动）、增删 zone、删除规格 |
+| ✅ **拓扑** | `/api/topology` 输出已解析的 nodes + edges（真机 6 节点 6 边，含 `uplink` / `member` / `mirror` / `mirror-port`），前端 react-flow + dagre 只负责画，跨规格同名 zone 去重 |
+| ✅ **重启自愈** | 地址与 nft 规则落成容器内开机单元（`labyard-net` / `labyard-nft`）：`pct reboot` 后地址、含端口映射的完整策略、关闭态的 egress 都原样恢复。这一步是真机发现的——早先只 `ip addr` 一次性下发，容器重启后整个 zone 静默失联，网关静默 fail-open |
+| ✅ **Web 终端** | ttyd 1.7.7 静态二进制注入容器（systemd 单元、绑容器内网地址）→ axum HTTP+WS 反代（hyper client + tokio-tungstenite）→ iframe 嵌入（ttyd 自带 xterm.js、CJK 输入、ZMODEM 传文件）。真机验证：页面 200（729 KB）、WS 握手 `101 Switching Protocols` |
+| ⚠️ 仅设计推演 | IPv6 出公网（宿主无 IPv6 上游，环境限制；区域内 ULA 互通与 NAT66 已实测）、厚 LVM 快照、`pct snapshot`、升级迁移（**从未发布，刻意不做**） |
 
-**mock 全绿不等于真机通过**，这一条不含糊——但现在已经有了真机证据。
+**mock 全绿不等于真机通过**，这一条不含糊——现在的每一条 ✅ 都有真机证据。
 
 ## 许可
 

@@ -15,6 +15,11 @@ pub struct Spec {
     #[serde(default)]
     pub defaults: Defaults,
     pub zones: BTreeMap<String, ZoneSpec>,
+    /// 显式镜像连线（源主机 → 分析机）。host 级的 `mirror: source/target`
+    /// 仍然有效（同 zone 内全连），这里是它的精确版：可以跨 zone 指定。
+    /// 两条路径最后都收敛成同一批 `ResolvedMirror`，执行器不需要知道来源。
+    #[serde(default)]
+    pub mirrors: Vec<MirrorLink>,
 }
 
 /// 全局默认值。全部 Option，因为"没写"和"写了空值"要区分。
@@ -90,8 +95,75 @@ pub struct ZoneSpec {
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
     pub password: Option<String>,
+    /// 网关的运行策略：出网、端口映射、VPN。只有含 `role: gateway` 主机的
+    /// zone 能写——没有网关时这些字段无处落地，resolve 会直接报错。
+    pub gateway: Option<GatewaySpec>,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostSpec>,
+}
+
+/// 网关策略（声明式）。运行时改这些字段会**写回规格**，不在容器里留影子状态。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewaySpec {
+    /// 内网是否允许出网。默认 true（实验网靶机要装包）。
+    /// 关掉 = 转发链上把 LAN→WAN 丢弃，NAT 规则保留（打开即恢复）。
+    pub egress: Option<bool>,
+    /// 入向端口映射（DNAT）。列表即全量：删掉一行就删规则。
+    #[serde(default, rename = "pub")]
+    pub pubs: Vec<PubSpec>,
+    #[serde(default)]
+    pub vpn: VpnSpec,
+}
+
+/// 一条端口映射：`{proto: tcp, port: 2222, to: "10.10.1.20:22"}`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PubSpec {
+    #[serde(default)]
+    pub proto: Proto,
+    /// 网关对外的端口
+    pub port: u16,
+    /// 内网目标，`ip` 或 `ip:port`（省略端口 = 与 `port` 相同）
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Proto {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl Proto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        }
+    }
+}
+
+/// VPN 开关。具体实现用成熟组件：内核 wireguard + openvpn，不自己写隧道。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VpnSpec {
+    #[serde(default)]
+    pub wireguard: bool,
+    #[serde(default)]
+    pub openvpn: bool,
+    /// 客户端名（决定生成的配置文件名）。空 = `["lab"]`
+    #[serde(default)]
+    pub clients: Vec<String>,
+}
+
+/// 一条显式镜像连线。`from`/`to` 是 `host` 或 `zone:host`。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorLink {
+    pub from: String,
+    pub to: String,
 }
 
 /// IPv6 策略。默认 `Auto`（发 ULA /64 + NAT66）。
@@ -247,7 +319,72 @@ pub struct ResolvedZone {
     pub bridge_mgmt_ip: String,
     pub v6_prefix: Option<String>,
     pub nat: bool,
+    /// 网关策略；zone 里没有 gateway 角色主机时为 None
+    pub gateway: Option<ResolvedGateway>,
     pub hosts: Vec<ResolvedHost>,
+}
+
+/// 网关策略的确定形态（端口已拆成数值，客户端列表已补默认值）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedGateway {
+    pub egress: bool,
+    pub pubs: Vec<ResolvedPub>,
+    pub vpn: ResolvedVpn,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ResolvedPub {
+    pub proto: Proto,
+    /// 网关对外端口
+    pub port: u16,
+    pub to_ip: String,
+    pub to_port: u16,
+}
+
+impl ResolvedPub {
+    /// `tcp:2222:10.10.1.20:22` —— 脚本与前端都用这一个形态，避免三处拼接。
+    pub fn spec_string(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.proto.as_str(),
+            self.port,
+            self.to_ip,
+            self.to_port
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ResolvedVpn {
+    pub wireguard: bool,
+    pub openvpn: bool,
+    pub clients: Vec<String>,
+}
+
+impl ResolvedVpn {
+    pub fn enabled(&self) -> bool {
+        self.wireguard || self.openvpn
+    }
+}
+
+/// 解析后的整份规格：zone 与镜像连线。
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedSpec {
+    pub zones: Vec<ResolvedZone>,
+    pub mirrors: Vec<ResolvedMirror>,
+}
+
+/// 一条要落地的镜像连线。
+///
+/// 只带 `zone:host` 与源桥名，不带 vmid——vmid 是 DB 分配的，由计划层填。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ResolvedMirror {
+    pub from_zone: String,
+    pub from_host: String,
+    /// 源桥（zone 名与桥名不一定相同：lab → lablab）
+    pub src_bridge: String,
+    pub to_zone: String,
+    pub to_host: String,
 }
 
 /// 解析错误。
@@ -271,6 +408,20 @@ pub enum SpecError {
     ZoneNameTooLong(String),
     #[error("vmid 冲突: {0} 被 `{1}` 和 `{2}` 同时占用")]
     VmidConflict(u32, String, String),
+    #[error("zone `{0}` 配了 `gateway` 但没有 role: gateway 的主机——策略无处落地")]
+    GatewayWithoutHost(String),
+    #[error("zone `{0}` 的端口映射目标 `{1}` 不是合法的 ip 或 ip:port")]
+    BadPubTarget(String, String),
+    #[error("zone `{0}` 的端口映射里 {1} 被写了两次——后一条永远不会命中")]
+    PubPortConflict(String, String),
+    #[error("VPN 客户端名 `{0}` 非法（只允许小写字母、数字、- _，最长 20）")]
+    BadVpnClient(String),
+    #[error("镜像连线引用的主机 `{0}` 不存在")]
+    MirrorUnknownHost(String),
+    #[error("镜像连线 `{0}` 有歧义：多个 zone 里都有这个主机名，请写成 zone:host")]
+    MirrorAmbiguous(String),
+    #[error("镜像连线 `{0}` → `{1}`：目标必须是 role: analysis（只有它挂了 mirr 口）")]
+    MirrorTargetNotAnalysis(String, String),
 }
 
 impl Spec {
@@ -279,7 +430,15 @@ impl Spec {
     }
 
     /// 解析成可直接执行的形态：合并默认值、展开地址、拓扑排序 zone。
+    ///
+    /// 只要 zone 的调用方（多数）用这个；需要镜像连线的一律用 `resolve_all`，
+    /// 否则镜像会被静默丢掉——这正是"解析有两套"最容易出的事故。
     pub fn resolve(&self, wan_bridge: &str) -> Result<Vec<ResolvedZone>, SpecError> {
+        Ok(self.resolve_all(wan_bridge)?.zones)
+    }
+
+    /// 完整解析：zone + 镜像连线。
+    pub fn resolve_all(&self, wan_bridge: &str) -> Result<ResolvedSpec, SpecError> {
         let order = self.topo_order()?;
         let mut out = Vec::with_capacity(order.len());
         let mut used_vmids: HashMap<u32, String> = HashMap::new();
@@ -512,6 +671,28 @@ impl Spec {
                 }
             });
 
+            // ── 网关策略 ──
+            // 没有网关主机时，`gateway:` 里写的任何东西都没有落地的地方。
+            // 静默忽略会让"我明明配了端口映射"变成一场排查——这里直接拒绝。
+            let has_gateway = hosts.iter().any(|h| h.role == Role::Gateway);
+            let gateway = if !has_gateway {
+                if z.gateway.is_some() {
+                    return Err(SpecError::GatewayWithoutHost(zone_name.clone()));
+                }
+                None
+            } else {
+                // 有网关但没写策略：给出默认（出网开、无映射、无 VPN），
+                // 让执行器只处理一种形态，不必到处 Option 判断
+                Some(match &z.gateway {
+                    Some(g) => resolve_gateway(zone_name, g)?,
+                    None => ResolvedGateway {
+                        egress: true,
+                        pubs: Vec::new(),
+                        vpn: ResolvedVpn::default(),
+                    },
+                })
+            };
+
             out.push(ResolvedZone {
                 name: zone_name.clone(),
                 bridge,
@@ -521,12 +702,108 @@ impl Spec {
                 bridge_mgmt_ip: mgmt,
                 v6_prefix,
                 nat: z.nat,
+                gateway,
                 hosts,
             });
         }
 
+        let mirrors = self.resolve_mirrors(&out)?;
+        Ok(ResolvedSpec { zones: out, mirrors })
+    }
+
+    /// 镜像连线：显式 `mirrors:` 优先，host 级 `mirror: source/target` 兜底
+    /// （同 zone 内源×目标全连，保持旧语义）。两者按 `zone:host` 去重。
+    fn resolve_mirrors(&self, zones: &[ResolvedZone]) -> Result<Vec<ResolvedMirror>, SpecError> {
+        let mut out: Vec<ResolvedMirror> = Vec::new();
+        let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
+
+        let find = |r: &str| -> Result<(String, String), SpecError> {
+            // `zone:host` 或裸 `host`
+            if let Some((z, h)) = r.split_once(':') {
+                return zones
+                    .iter()
+                    .find(|zz| zz.name == z && zz.hosts.iter().any(|x| x.name == h))
+                    .map(|zz| (zz.name.clone(), h.to_string()))
+                    .ok_or_else(|| SpecError::MirrorUnknownHost(r.to_string()));
+            }
+            let hits: Vec<&ResolvedZone> = zones
+                .iter()
+                .filter(|zz| zz.hosts.iter().any(|x| x.name == r))
+                .collect();
+            match hits.len() {
+                0 => Err(SpecError::MirrorUnknownHost(r.to_string())),
+                1 => Ok((hits[0].name.clone(), r.to_string())),
+                _ => Err(SpecError::MirrorAmbiguous(r.to_string())),
+            }
+        };
+
+        let push = |zones: &[ResolvedZone], from: (String, String), to: (String, String), out: &mut Vec<ResolvedMirror>, seen: &mut BTreeSet<_>| -> Result<(), SpecError> {
+            let (fz, fh) = from;
+            let (tz, th) = to;
+            let target = zones
+                .iter()
+                .find(|z| z.name == tz)
+                .and_then(|z| z.hosts.iter().find(|h| h.name == th))
+                .ok_or_else(|| SpecError::MirrorUnknownHost(format!("{tz}:{th}")))?;
+            if target.role != Role::Analysis {
+                return Err(SpecError::MirrorTargetNotAnalysis(
+                    format!("{fz}:{fh}"),
+                    format!("{tz}:{th}"),
+                ));
+            }
+            let src_bridge = zones
+                .iter()
+                .find(|z| z.name == fz)
+                .map(|z| z.bridge.clone())
+                .ok_or_else(|| SpecError::MirrorUnknownHost(format!("{fz}:{fh}")))?;
+            if seen.insert((fz.clone(), fh.clone(), tz.clone(), th.clone())) {
+                out.push(ResolvedMirror {
+                    from_zone: fz,
+                    from_host: fh,
+                    src_bridge,
+                    to_zone: tz,
+                    to_host: th,
+                });
+            }
+            Ok(())
+        };
+
+        // 1) 显式连线
+        for m in &self.mirrors {
+            let from = find(&m.from)?;
+            let to = find(&m.to)?;
+            push(zones, from, to, &mut out, &mut seen)?;
+        }
+
+        // 2) host 级 role（旧语义）
+        for z in zones {
+            let sources: Vec<String> = z
+                .hosts
+                .iter()
+                .filter(|h| h.mirror == MirrorRole::Source)
+                .map(|h| h.name.clone())
+                .collect();
+            let targets: Vec<String> = z
+                .hosts
+                .iter()
+                .filter(|h| h.mirror == MirrorRole::Target)
+                .map(|h| h.name.clone())
+                .collect();
+            for s in &sources {
+                for t in &targets {
+                    push(
+                        zones,
+                        (z.name.clone(), s.clone()),
+                        (z.name.clone(), t.clone()),
+                        &mut out,
+                        &mut seen,
+                    )?;
+                }
+            }
+        }
         Ok(out)
     }
+
 
     /// 拓扑排序：被依赖的 zone 排在前面（上游先建）。
     pub fn topo_order(&self) -> Result<Vec<String>, SpecError> {
@@ -577,6 +854,72 @@ impl Spec {
         Ok(order)
     }
 
+}
+
+/// 网关策略解析：把 `to` 拆成 ip + port，校验客户端名，检查端口重复。
+///
+/// 校验做在解析层而不是执行层：一条写错的映射如果等到 apply 才在 nft 里报
+/// 语法错，用户看到的是"网关策略步骤失败"，而不是"第 2 条 pub 写错了"。
+fn resolve_gateway(zone: &str, g: &GatewaySpec) -> Result<ResolvedGateway, SpecError> {
+    let mut pubs = Vec::with_capacity(g.pubs.len());
+    let mut used: BTreeSet<(String, u16)> = BTreeSet::new();
+    for p in &g.pubs {
+        let bad = || SpecError::BadPubTarget(zone.to_string(), p.to.clone());
+        if p.port == 0 {
+            return Err(bad());
+        }
+        let (ip, port) = match p.to.split_once(':') {
+            Some((ip, po)) => (ip, po.parse::<u16>().map_err(|_| bad())?),
+            None => (p.to.trim(), p.port),
+        };
+        // 只接受 IPv4 字面量：这里会直接进 nft 规则，主机名/网段会让语义
+        // 变得不确定（DNS 在网关容器里，规则却在内核里）
+        let mut it = ip.split('.');
+        let four = (0..4)
+            .map(|_| it.next().and_then(|x| x.parse::<u8>().ok()))
+            .collect::<Option<Vec<u8>>>();
+        if four.is_none() || it.next().is_some() || port == 0 {
+            return Err(bad());
+        }
+        if !used.insert((p.proto.as_str().to_string(), p.port)) {
+            return Err(SpecError::PubPortConflict(
+                zone.to_string(),
+                format!("{}/{}", p.proto.as_str(), p.port),
+            ));
+        }
+        pubs.push(ResolvedPub {
+            proto: p.proto,
+            port: p.port,
+            to_ip: ip.to_string(),
+            to_port: port,
+        });
+    }
+
+    let clients = if g.vpn.clients.is_empty() {
+        vec!["lab".to_string()]
+    } else {
+        g.vpn.clients.clone()
+    };
+    for c in &clients {
+        let ok = !c.is_empty()
+            && c.len() <= 20
+            && c
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_');
+        if !ok {
+            return Err(SpecError::BadVpnClient(c.clone()));
+        }
+    }
+
+    Ok(ResolvedGateway {
+        egress: g.egress.unwrap_or(true),
+        pubs,
+        vpn: ResolvedVpn {
+            wireguard: g.vpn.wireguard,
+            openvpn: g.vpn.openvpn,
+            clients,
+        },
+    })
 }
 
 fn sanitize(name: &str) -> String {
@@ -854,5 +1197,228 @@ zones:
             spec.resolve("vmbr0"),
             Err(SpecError::VmidConflict(100, _, _))
         ));
+    }
+
+    // ───────────────────── 网关策略 ─────────────────────
+
+    const GW: &str = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    gateway:
+      egress: true
+      pub:
+        - { proto: tcp, port: 2222, to: "10.10.1.20:22" }
+        - { proto: udp, port: 5353, to: "10.10.1.30" }
+      vpn: { wireguard: true, openvpn: false, clients: [lab, red] }
+    hosts:
+      gateway: { role: gateway }
+      web: { role: server }
+"#;
+
+    #[test]
+    fn gateway_policy_resolves_ports_and_clients() {
+        let z = Spec::parse(GW).unwrap().resolve("vmbr0").unwrap();
+        let g = z[0].gateway.as_ref().expect("有网关主机就该有策略");
+        assert!(g.egress);
+        assert_eq!(
+            g.pubs,
+            vec![
+                ResolvedPub {
+                    proto: Proto::Tcp,
+                    port: 2222,
+                    to_ip: "10.10.1.20".into(),
+                    to_port: 22
+                },
+                ResolvedPub {
+                    proto: Proto::Udp,
+                    port: 5353,
+                    to_ip: "10.10.1.30".into(),
+                    to_port: 5353,
+                },
+            ],
+            "省略端口时应回落到对外端口"
+        );
+        assert!(g.vpn.wireguard && !g.vpn.openvpn);
+        assert_eq!(g.vpn.clients, vec!["lab", "red"]);
+        assert_eq!(g.pubs[0].spec_string(), "tcp:2222:10.10.1.20:22");
+    }
+
+    #[test]
+    fn gateway_defaults_when_unspecified() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts: { gateway: { role: gateway } }
+"#;
+        let z = Spec::parse(y).unwrap().resolve("vmbr0").unwrap();
+        let g = z[0].gateway.as_ref().unwrap();
+        assert!(g.egress, "默认出网开——靶机要装包");
+        assert!(g.pubs.is_empty());
+        assert!(!g.vpn.enabled());
+    }
+
+    #[test]
+    fn gateway_block_without_gateway_host_is_rejected() {
+        // 静默忽略等于配置撒谎：写了 pub 却没网关，映射永远不生效
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    gateway: { pub: [{ proto: tcp, port: 80, to: "10.10.1.20" }] }
+    hosts: { web: { role: server } }
+"#;
+        assert!(matches!(
+            Spec::parse(y).unwrap().resolve("vmbr0"),
+            Err(SpecError::GatewayWithoutHost(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_pub_port_is_rejected() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    gateway:
+      pub:
+        - { proto: tcp, port: 80, to: "10.10.1.20" }
+        - { proto: tcp, port: 80, to: "10.10.1.30" }
+    hosts: { gateway: { role: gateway } }
+"#;
+        assert!(matches!(
+            Spec::parse(y).unwrap().resolve("vmbr0"),
+            Err(SpecError::PubPortConflict(_, _))
+        ));
+    }
+
+    #[test]
+    fn pub_target_must_be_ipv4() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    gateway: { pub: [{ proto: tcp, port: 80, to: "web" }] }
+    hosts: { gateway: { role: gateway } }
+"#;
+        assert!(matches!(
+            Spec::parse(y).unwrap().resolve("vmbr0"),
+            Err(SpecError::BadPubTarget(_, _))
+        ));
+    }
+
+    #[test]
+    fn bad_vpn_client_name_is_rejected() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    gateway: { vpn: { wireguard: true, clients: ["../../etc/passwd"] } }
+    hosts: { gateway: { role: gateway } }
+"#;
+        assert!(matches!(
+            Spec::parse(y).unwrap().resolve("vmbr0"),
+            Err(SpecError::BadVpnClient(_))
+        ));
+    }
+
+    // ───────────────────── 镜像连线 ─────────────────────
+
+    #[test]
+    fn explicit_mirror_can_cross_zones() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      analysis: { role: analysis }
+  sub:
+    uplink: main
+    v4: 10.20.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      victim: { role: server }
+mirrors:
+  - { from: "sub:victim", to: "main:analysis" }
+"#;
+        let s = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
+        assert_eq!(s.mirrors.len(), 1);
+        let m = &s.mirrors[0];
+        assert_eq!((m.from_zone.as_str(), m.from_host.as_str()), ("sub", "victim"));
+        assert_eq!((m.to_zone.as_str(), m.to_host.as_str()), ("main", "analysis"));
+        assert_eq!(m.src_bridge, "labsub", "桥名是 lab + zone 名，不是 zone 名本身");
+    }
+
+    #[test]
+    fn mirror_target_must_be_analysis() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      web: { role: server }
+mirrors:
+  - { from: gateway, to: web }
+"#;
+        assert!(matches!(
+            Spec::parse(y).unwrap().resolve_all("vmbr0"),
+            Err(SpecError::MirrorTargetNotAnalysis(_, _))
+        ));
+    }
+
+    #[test]
+    fn mirror_refs_are_validated() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts: { gateway: { role: gateway }, analysis: { role: analysis } }
+mirrors:
+  - { from: "main:nope", to: "main:analysis" }
+"#;
+        assert!(matches!(
+            Spec::parse(y).unwrap().resolve_all("vmbr0"),
+            Err(SpecError::MirrorUnknownHost(_))
+        ));
+    }
+
+    #[test]
+    fn host_level_mirror_roles_still_work_and_dedup() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      analysis: { role: analysis, mirror: target }
+      s1: { role: server, mirror: source }
+mirrors:
+  - { from: s1, to: analysis }
+"#;
+        let s = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
+        assert_eq!(s.mirrors.len(), 1, "同一对连线只应落一条");
     }
 }

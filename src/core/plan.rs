@@ -6,10 +6,12 @@
 //! 依赖不是靠"隐式顺序"保证，而是显式写在 `deps` 里——这样执行器可以并行
 //! 阶段内无依赖的步骤，也可以只重跑失败的后半段。
 
-use crate::core::spec::{MirrorRole, ResolvedHost, ResolvedZone};
+use crate::core::spec::{
+    ResolvedMirror, ResolvedPub, ResolvedVpn, ResolvedZone, Role,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// 执行阶段。顺序即语义：前面的阶段必须先完成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -20,6 +22,9 @@ pub enum Phase {
     Container,
     Net,
     Bootstrap,
+    /// 网关策略（nft 端口映射/出网、VPN）。排在 bootstrap 之后——
+    /// openvpn/wireguard 的包要在 bootstrap 里装好。
+    Gateway,
     Mirror,
     Snapshot,
 }
@@ -32,11 +37,27 @@ impl Phase {
             Phase::Container => "container",
             Phase::Net => "net",
             Phase::Bootstrap => "bootstrap",
+            Phase::Gateway => "gateway",
             Phase::Mirror => "mirror",
             Phase::Snapshot => "snapshot",
         }
     }
 }
+
+/// 运行时脚本的"模板版本"。
+///
+/// 步骤哈希只看输入（规格里的参数），不看生成器代码——生成器修好了，
+/// 已完成的步骤仍然是 done，容器里跑的还是老的脚本。这在"改一条规则"时
+/// 很隐蔽：改了 gateway.rs，apply 全跳过，表面上一切正常。
+/// 所以生成逻辑有实质变化就把它 +1，让所有相关步骤重跑一遍。
+///
+/// 管两处：`Gateway` 的 nft/VPN 脚本，`Net` 的地址/路由脚本。两者都是
+/// "把生成的脚本塞进容器"的步骤，症状一样（改好了但不生效）。
+///
+///   1 → 初版（逐条 `nft add rule`）
+///   2 → 原子批次 + `dnat ip to` + 映射回程 SNAT + VPN 关闭落地
+///   3 → 地址与 nft 规则落成容器内开机单元（容器重启后自愈）
+pub const RULESET_VERSION: u32 = 3;
 
 /// 一个步骤的完整描述。`kind` 里带全部参数，执行器不需要再去查 spec。
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +119,8 @@ pub enum StepKind {
         /// 网关是否做地址转换（来自 zone 的 `nat`）。只对网关有意义，
         /// 非网关恒为 false——写在步骤里是为了让执行器不必回头查 spec。
         nat: bool,
+        /// 生成器版本，见 RULESET_VERSION
+        ruleset: u32,
     },
     Bootstrap {
         zone: String,
@@ -107,12 +130,34 @@ pub enum StepKind {
         /// 渲染后的参数（进 hash，实际内容在执行时才落盘）
         args: BTreeMap<String, String>,
     },
+    /// 网关策略：nft 规则 + 可选 VPN。整份策略是**全量**的——每次重建规则表，
+    /// 不做增量，避免"删了一条映射但规则还在"这种漂移。
+    Gateway {
+        zone: String,
+        host: String,
+        vmid: u32,
+        /// 内网网段（NAT 源）
+        zone_cidr: String,
+        /// 是否做地址转换
+        nat: bool,
+        /// 内网是否允许出网
+        egress: bool,
+        v6_prefix: Option<String>,
+        pubs: Vec<ResolvedPub>,
+        vpn: ResolvedVpn,
+        /// 上联网卡名（容器内固定 eth1）
+        uplink: String,
+        /// 生成器版本，见 RULESET_VERSION
+        ruleset: u32,
+    },
     Mirror {
         zone: String,
         /// 源桥的实际名字（zone 名与桥名不一定相同：lab → lablab）
         bridge: String,
         source_host: String,
         source_vmid: u32,
+        /// 目标所在 zone（可以不是源 zone——mirr 桥是全局的）
+        target_zone: String,
         target_host: String,
         target_vmid: u32,
         target_iface: String,
@@ -147,6 +192,7 @@ impl Plan {
     /// 展开。`vmid_for` 负责给出每台主机的 vmid（由调用方查 DB 或按基数分配）。
     pub fn build(
         zones: &[ResolvedZone],
+        mirrors: &[ResolvedMirror],
         provisioner_hash: &dyn Fn(&str) -> String,
         vmid_for: &dyn Fn(&str, &str) -> u32,
         want_snapshot: bool,
@@ -156,7 +202,7 @@ impl Plan {
         // ── 0. mirr 桥：有 analysis 主机才建（纯二层、无 IP、不挂网关）──
         let has_analysis = zones
             .iter()
-            .any(|z| z.hosts.iter().any(|h| h.role == crate::core::spec::Role::Analysis));
+            .any(|z| z.hosts.iter().any(|h| h.role == Role::Analysis));
         if has_analysis {
             let kind = StepKind::Bridge {
                 zone: "mirr".into(),
@@ -223,11 +269,11 @@ impl Plan {
             let gw_ipv4 = z
                 .hosts
                 .iter()
-                .find(|h| h.role == crate::core::spec::Role::Gateway)
+                .find(|h| h.role == Role::Gateway)
                 .map(|h| strip_prefix(&h.ipv4));
             for h in &z.hosts {
                 let vmid = h.vmid.unwrap_or_else(|| vmid_for(&z.name, &h.name));
-                let gateway = if h.role == crate::core::spec::Role::Gateway {
+                let gateway = if h.role == Role::Gateway {
                     None
                 } else {
                     gw_ipv4.clone()
@@ -242,7 +288,7 @@ impl Plan {
                     template: h.template.clone(),
                     storage: h.storage.clone(),
                     template_storage: h.template_storage.clone(),
-                    mirr_bridge: if h.role == crate::core::spec::Role::Analysis {
+                    mirr_bridge: if h.role == Role::Analysis {
                         Some("mirr".to_string())
                     } else {
                         None
@@ -253,7 +299,7 @@ impl Plan {
                     //（设计里是"可选"，但不给就没法装缓存服务）
                     uplink_bridge: if matches!(
                         h.role,
-                        crate::core::spec::Role::Gateway | crate::core::spec::Role::Analysis
+                        Role::Gateway | Role::Analysis
                     ) {
                         z.uplink_bridge.clone()
                     } else {
@@ -286,15 +332,15 @@ impl Plan {
             let gw_ipv4 = z
                 .hosts
                 .iter()
-                .find(|h| h.role == crate::core::spec::Role::Gateway)
+                .find(|h| h.role == Role::Gateway)
                 .map(|h| strip_prefix(&h.ipv4));
             for h in &z.hosts {
                 let vmid = h.vmid.unwrap_or_else(|| vmid_for(&z.name, &h.name));
-                let is_gw = h.role == crate::core::spec::Role::Gateway;
+                let is_gw = h.role == Role::Gateway;
                 // 网关要出网（走 eth1），分析机要装包，靶机必须隔离
                 let wants_route = matches!(
                     h.role,
-                    crate::core::spec::Role::Gateway | crate::core::spec::Role::Analysis
+                    Role::Gateway | Role::Analysis
                 );
                 let kind = StepKind::Net {
                     zone: z.name.clone(),
@@ -307,6 +353,7 @@ impl Plan {
                     default_route: wants_route,
                     nat: is_gw && z.nat,
                     dns: h.dns.clone(),
+                    ruleset: RULESET_VERSION,
                 };
                 steps.push(Step {
                     key: format!("net:{}:{}", z.name, h.name),
@@ -323,6 +370,24 @@ impl Plan {
         // 对**所有**主机执行（不再要求有 provisioner）：基础配置——时区、
         // 语言、apt 源、预装包——是每台机器的需求，不该以"配了 provisioner"
         // 为前提。没配 provisioner 的按 "none" 走，只跑 base bootstrap。
+        //
+        // 但有一条隐式依赖必须显式化：`apt_mirror` 指向内网缓存时，缓存那台
+        // 必须先装完 apt-cacher-ng。真机上撞到过——靶机的 bootstrap 与缓存的
+        // provisioner 同时在跑，靶机 apt update 打到一个还没人监听的 3142，
+        // 整步失败，而"网络没问题"的表象会让人怀疑到错的地方去。
+        let mut apt_source: HashMap<(String, String), String> = HashMap::new();
+        for z in zones {
+            for h in &z.hosts {
+                let has_prov = h
+                    .provisioner
+                    .as_deref()
+                    .map(|p| p != "none")
+                    .unwrap_or(false);
+                if has_prov {
+                    apt_source.insert((z.name.clone(), strip_prefix(&h.ipv4)), h.name.clone());
+                }
+            }
+        }
         for z in zones {
             for h in &z.hosts {
                 let prov = h
@@ -364,57 +429,95 @@ impl Plan {
                 // hash 里必须含脚本内容，否则改脚本不会触发重跑
                 let mut hsh = hash_of(&kind);
                 hsh.push_str(&provisioner_hash(&prov));
+                let mut deps = vec![format!("net:{}:{}", z.name, h.name)];
+                if let Some(m) = &h.apt_mirror {
+                    if let Some(ip) = host_of_url(m) {
+                        if let Some(src) = apt_source.get(&(z.name.clone(), ip)) {
+                            if src != &h.name {
+                                deps.push(format!("bootstrap:{}:{}", z.name, src));
+                            }
+                        }
+                    }
+                }
                 steps.push(Step {
                     key: format!("bootstrap:{}:{}", z.name, h.name),
                     phase: Phase::Bootstrap,
                     zone: z.name.clone(),
                     input_hash: sha256_hex(hsh.as_bytes()),
-                    deps: vec![format!("net:{}:{}", z.name, h.name)],
+                    deps,
                     kind,
                 });
             }
         }
 
-        // ── 6. 镜像链路：每个 source → 每个 target 一条 ──
+        // ── 6. 网关策略：每个有网关的 zone 一步 ──
+        // 这一步是**全量重建** nft 规则表 + 落地 VPN，输入哈希覆盖整份策略：
+        // 改一条端口映射 → 重跑；出网开关翻转 → 重跑。
         for z in zones {
-            let sources: Vec<&ResolvedHost> = z
-                .hosts
-                .iter()
-                .filter(|h| h.mirror == MirrorRole::Source)
-                .collect();
-            let targets: Vec<&ResolvedHost> = z
-                .hosts
-                .iter()
-                .filter(|h| h.mirror == MirrorRole::Target)
-                .collect();
-            for s in &sources {
-                for t in &targets {
-                    let kind = StepKind::Mirror {
-                        zone: z.name.clone(),
-                        bridge: z.bridge.clone(),
-                        source_host: s.name.clone(),
-                        source_vmid: s.vmid.unwrap_or_else(|| vmid_for(&z.name, &s.name)),
-                        target_host: t.name.clone(),
-                        target_vmid: t.vmid.unwrap_or_else(|| vmid_for(&z.name, &t.name)),
-                        // 落点是 analysis 在 mirr 桥上的宿主侧 veth，执行时探测
-                        target_iface: String::new(),
-                    };
-                    steps.push(Step {
-                        key: format!("mirror:{}:{}->{}", z.name, s.name, t.name),
-                        phase: Phase::Mirror,
-                        zone: z.name.clone(),
-                        input_hash: hash_of(&kind),
-                        deps: vec![
-                            format!("bootstrap:{}:{}", z.name, s.name),
-                            format!("net:{}:{}", z.name, t.name),
-                        ],
-                        kind,
-                    });
-                }
-            }
+            let Some(gw) = &z.gateway else { continue };
+            let Some(h) = z.hosts.iter().find(|h| h.role == Role::Gateway) else {
+                continue;
+            };
+            let vmid = h.vmid.unwrap_or_else(|| vmid_for(&z.name, &h.name));
+            let kind = StepKind::Gateway {
+                zone: z.name.clone(),
+                host: h.name.clone(),
+                vmid,
+                zone_cidr: zone_cidr(&z.v4_cidr),
+                nat: z.nat,
+                egress: gw.egress,
+                v6_prefix: z.v6_prefix.clone(),
+                pubs: gw.pubs.clone(),
+                vpn: gw.vpn.clone(),
+                uplink: "eth1".into(),
+                ruleset: RULESET_VERSION,
+            };
+            steps.push(Step {
+                key: format!("gateway:{}", z.name),
+                phase: Phase::Gateway,
+                zone: z.name.clone(),
+                input_hash: hash_of(&kind),
+                deps: vec![
+                    format!("net:{}:{}", z.name, h.name),
+                    format!("bootstrap:{}:{}", z.name, h.name),
+                ],
+                kind,
+            });
         }
 
-        // ── 7. 快照 ──
+        // ── 7. 镜像链路：解析层已经展开成确定的连线表 ──
+        // 计划层只负责补 vmid 与依赖。跨 zone 的连线在这里和同 zone 的没有区别——
+        // mirr 桥是全局的，源桥由解析层给。
+        for m in mirrors {
+            let kind = StepKind::Mirror {
+                zone: m.from_zone.clone(),
+                bridge: m.src_bridge.clone(),
+                source_host: m.from_host.clone(),
+                source_vmid: vmid_for(&m.from_zone, &m.from_host),
+                target_zone: m.to_zone.clone(),
+                target_host: m.to_host.clone(),
+                target_vmid: vmid_for(&m.to_zone, &m.to_host),
+                // 落点是 analysis 在 mirr 桥上的宿主侧 veth，执行时探测
+                target_iface: String::new(),
+            };
+            steps.push(Step {
+                key: format!(
+                    "mirror:{}:{}->{}:{}",
+                    m.from_zone, m.from_host, m.to_zone, m.to_host
+                ),
+                phase: Phase::Mirror,
+                zone: m.from_zone.clone(),
+                input_hash: hash_of(&kind),
+                deps: vec![
+                    format!("bootstrap:{}:{}", m.from_zone, m.from_host),
+                    format!("net:{}:{}", m.to_zone, m.to_host),
+                    "bridge:mirr".to_string(),
+                ],
+                kind,
+            });
+        }
+
+        // ── 8. 快照 ──
         if want_snapshot {
             for z in zones {
                 for h in &z.hosts {
@@ -451,6 +554,64 @@ impl Plan {
     pub fn by_phase(&self, p: Phase) -> impl Iterator<Item = &Step> {
         self.steps.iter().filter(move |s| s.phase == p)
     }
+
+    /// 只保留某个 zone 的步骤（revive、单 zone 重跑用）。
+    ///
+    /// 跨出子计划的依赖必须剔掉：否则执行器会认为"上游没跑过"，把步骤
+    /// 一直往后拖——而那个上游本来就不在这个 run 里。
+    pub fn for_zone(&self, zone: &str) -> Plan {
+        let steps: Vec<Step> = self
+            .steps
+            .iter()
+            .filter(|s| s.zone == zone)
+            .cloned()
+            .collect();
+        let keys: std::collections::HashSet<String> =
+            steps.iter().map(|s| s.key.clone()).collect();
+        let steps = steps
+            .into_iter()
+            .map(|mut s| {
+                s.deps.retain(|d| keys.contains(d));
+                s
+            })
+            .collect();
+        Plan { steps }
+    }
+}
+
+/// zone 网段归一：`10.10.1.7/24` 也要变成 `10.10.1.0/24`，
+/// 否则它会直接进 nft 的 `ip saddr`，规则语义就错了。
+fn zone_cidr(cidr: &str) -> String {
+    let (ip, len) = cidr.split_once('/').unwrap_or((cidr, "24"));
+    let plen: u32 = len.parse().unwrap_or(24).min(32);
+    let octets: Vec<u32> = ip.split('.').filter_map(|x| x.parse().ok()).collect();
+    if octets.len() != 4 {
+        return format!("{ip}/{len}");
+    }
+    let addr = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+    let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+    let net = addr & mask;
+    format!(
+        "{}.{}.{}.{}/{}",
+        (net >> 24) & 0xff,
+        (net >> 16) & 0xff,
+        (net >> 8) & 0xff,
+        net & 0xff,
+        plen
+    )
+}
+
+/// 从 `http://10.77.0.10:3142/debian` 里抠出主机。只认 IPv4 字面量：
+/// 域名（tuna 之类）指向的是外网，不可能是"内网里某台机器"。
+fn host_of_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.split(':').next().unwrap_or(authority);
+    let ok = host.split('.').count() == 4
+        && host
+            .split('.')
+            .all(|o| !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()));
+    ok.then(|| host.to_string())
 }
 
 fn strip_prefix(ipv4_with_len: &str) -> String {
@@ -504,8 +665,8 @@ zones:
 
     fn build(y: &str) -> Plan {
         let spec = Spec::parse(y).unwrap();
-        let zs = spec.resolve("vmbr0").unwrap();
-        Plan::build(&zs, &|_| "noop".into(), &|z, h| {
+        let s = spec.resolve_all("vmbr0").unwrap();
+        Plan::build(&s.zones, &s.mirrors, &|_| "noop".into(), &|z, h| {
             // 测试用确定性分配
             let idx = match h {
                 "gateway" => 1,
@@ -590,6 +751,26 @@ zones:
     }
 
     #[test]
+    fn net_step_carries_the_ruleset_version() {
+        // 地址/路由脚本也是"生成器输出塞进容器"，靠这个字段顶掉已完成的步骤。
+        // 漏填空就等于"改了 net.rs 但不生效"，且 apply 全程显示 done。
+        let p = build(Y);
+        let versions: Vec<u32> = p
+            .steps
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StepKind::Net { ruleset, .. } => Some(*ruleset),
+                _ => None,
+            })
+            .collect();
+        assert!(!versions.is_empty(), "应该有 net 步骤");
+        assert!(
+            versions.iter().all(|v| *v == RULESET_VERSION),
+            "net 步骤必须带当前生成器版本 {RULESET_VERSION}"
+        );
+    }
+
+    #[test]
     fn bootstrap_env_names_match_the_script() {
         // 契约测试：参数键会变成 `LABYARD_<KEY>`，而脚本按名字读。
         // 两边差一个字母，参数就静默传不进去（真实踩过：ipv6_prefix vs V6_PREFIX），
@@ -617,7 +798,79 @@ zones:
         let p = build(Y);
         let m: Vec<_> = p.by_phase(Phase::Mirror).collect();
         assert_eq!(m.len(), 1);
-        assert_eq!(m[0].key, "mirror:main:server1->analysis");
+        assert_eq!(m[0].key, "mirror:main:server1->main:analysis");
+    }
+
+    #[test]
+    fn gateway_step_sits_between_bootstrap_and_mirror() {
+        let y = r#"
+defaults: { cores: 2, memory: 1024, disk: 8, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    gateway:
+      egress: false
+      pub:
+        - { proto: tcp, port: 2222, to: "10.10.1.20:22" }
+    hosts:
+      gateway: { role: gateway }
+      web: { role: server }
+      analysis: { role: analysis, mirror: target }
+mirrors:
+  - { from: web, to: analysis }
+"#;
+        let p = build(y);
+        let gw = p
+            .steps
+            .iter()
+            .find(|s| s.key == "gateway:main")
+            .expect("有网关主机的 zone 必须有 gateway 步骤");
+        assert_eq!(gw.phase, Phase::Gateway);
+        assert!(gw.deps.contains(&"bootstrap:main:gateway".to_string()));
+        match &gw.kind {
+            StepKind::Gateway { egress, nat, pubs, .. } => {
+                assert!(!*egress, "egress: false 必须传进步骤");
+                assert!(*nat);
+                assert_eq!(pubs.len(), 1);
+            }
+            _ => panic!("类型不对"),
+        }
+        // 阶段顺序：bootstrap < gateway < mirror
+        let idx = |ph: Phase| p.steps.iter().position(|s| s.phase == ph).unwrap();
+        assert!(idx(Phase::Bootstrap) < idx(Phase::Gateway));
+        assert!(idx(Phase::Gateway) < idx(Phase::Mirror));
+    }
+
+    #[test]
+    fn plan_can_be_filtered_to_one_zone() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts: { gateway: { role: gateway }, web: { role: server } }
+  sub:
+    uplink: main
+    v4: 10.20.1.0/24
+    hosts: { gateway: { role: gateway } }
+"#;
+        let p = build(y);
+        let sub = p.for_zone("sub");
+        assert!(!sub.steps.is_empty());
+        assert!(sub.steps.iter().all(|s| s.zone == "sub"));
+        // 跨 zone 依赖（bridge:main）必须被剔掉，否则 sub 的桥永远等不到上游
+        let b = sub.steps.iter().find(|s| s.key == "bridge:sub").unwrap();
+        assert!(b.deps.is_empty(), "跨 zone 依赖应被剔掉: {:?}", b.deps);
+    }
+
+    #[test]
+    fn zone_cidr_normalises_network_address() {
+        assert_eq!(zone_cidr("10.10.1.0/24"), "10.10.1.0/24");
+        assert_eq!(zone_cidr("10.10.1.77/24"), "10.10.1.0/24");
+        assert_eq!(zone_cidr("10.20.5.9/16"), "10.20.0.0/16");
+        assert_eq!(zone_cidr("garbage"), "garbage/24");
     }
 
     #[test]
@@ -637,5 +890,44 @@ zones:
         let ha = a.steps.iter().find(|s| s.key == "ct:main:server1").unwrap();
         let hb = b.steps.iter().find(|s| s.key == "ct:main:server1").unwrap();
         assert_ne!(ha.input_hash, hb.input_hash);
+    }
+
+    #[test]
+    fn apt_mirror_host_waits_for_the_cache() {
+        // 真机上撞到的竞态：靶机的 apt_mirror 指向内网缓存，而缓存的
+        // apt-cacher-ng 还没装完，靶机 apt update 直接 connection refused。
+        // 依赖必须显式写出来，靠并发调度"大概先跑"是不行的。
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: debian-13, storage: local-lvm }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      cache:   { role: analysis, ip: 10, provisioner: apt-mirror }
+      client1: { role: client, ip: 20, apt_mirror: "http://10.10.1.10:3142/debian" }
+      other:   { role: server, ip: 21, apt_mirror: "http://mirrors.tuna.tsinghua.edu.cn/debian" }
+"#;
+        let p = build(y);
+        let c = p.steps.iter().find(|s| s.key == "bootstrap:main:client1").unwrap();
+        assert!(
+            c.deps.contains(&"bootstrap:main:cache".to_string()),
+            "指向内网缓存的靶机必须等缓存装完: {:?}",
+            c.deps
+        );
+        let o = p.steps.iter().find(|s| s.key == "bootstrap:main:other").unwrap();
+        assert!(
+            !o.deps.iter().any(|d| d.starts_with("bootstrap:")),
+            "外网源不该凭空多出依赖: {:?}",
+            o.deps
+        );
+    }
+
+    #[test]
+    fn url_host_parsing() {
+        assert_eq!(host_of_url("http://10.77.0.10:3142/debian").as_deref(), Some("10.77.0.10"));
+        assert_eq!(host_of_url("https://mirrors.tuna.tsinghua.edu.cn/debian"), None);
+        assert_eq!(host_of_url("10.0.0.5/debian"), Some("10.0.0.5".to_string()));
     }
 }

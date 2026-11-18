@@ -77,7 +77,10 @@ export const api = {
 
   logout: () => req<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
 
-  state: () => req<{ steps: StepState[] }>("/api/state"),
+  state: () =>
+    req<{ steps: StepState[]; retired?: [string, string, string, string][] }>(
+      "/api/state",
+    ),
 
   /** 读取服务端已保存的规格；从未保存过时 exists=false、yaml=null。 */
   getSpec: () =>
@@ -102,10 +105,141 @@ export const api = {
       body: JSON.stringify({ yaml, snapshot }),
     }),
 
+  /** 直接执行某份已保存的规格（规格列表页用）。 */
+  applySpec: (spec: string, snapshot = false) =>
+    req<{ run_id: string }>("/api/apply", {
+      method: "POST",
+      body: JSON.stringify({ spec, snapshot }),
+    }),
+
   cancel: (runId: string) =>
     req<{ ok: boolean }>(`/api/runs/${runId}/cancel`, { method: "POST" }),
 
   doctor: () => req<{ items: DoctorItem[] }>("/api/doctor"),
+
+  // ── 规格文件（多份） ──
+  specs: () => req<{ specs: SpecMeta[] }>("/api/specs"),
+
+  createSpec: (body: { name: string; yaml?: string; copy_of?: string }) =>
+    req<{ ok: boolean; name: string }>("/api/specs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  specDetail: (name: string) =>
+    req<{ yaml: string | null; exists: boolean; name: string }>(
+      `/api/specs/${encodeURIComponent(name)}`,
+    ),
+
+  putSpecNamed: (name: string, yaml: string) =>
+    req<{ ok: boolean }>(`/api/specs/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ yaml }),
+    }),
+
+  deleteSpec: (name: string) =>
+    req<{ ok: boolean }>(`/api/specs/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+
+  addZone: (spec: string, zone: string, yaml: string) =>
+    req<{ ok: boolean }>(`/api/specs/${encodeURIComponent(spec)}/zones`, {
+      method: "POST",
+      body: JSON.stringify({ zone, yaml }),
+    }),
+
+  /** 取某个 zone 的 YAML 片段，作为编辑框的起点。 */
+  zoneDetail: (spec: string, zone: string) =>
+    req<{ zone: string; yaml: string | null; exists: boolean }>(
+      `/api/specs/${encodeURIComponent(spec)}/zones/${encodeURIComponent(zone)}`,
+    ),
+
+  updateZone: (spec: string, zone: string, yaml: string) =>
+    req<{ ok: boolean }>(
+      `/api/specs/${encodeURIComponent(spec)}/zones/${encodeURIComponent(zone)}`,
+      { method: "PUT", body: JSON.stringify({ yaml }) },
+    ),
+
+  deleteZone: (spec: string, zone: string) =>
+    req<{ ok: boolean }>(
+      `/api/specs/${encodeURIComponent(spec)}/zones/${encodeURIComponent(zone)}`,
+      { method: "DELETE" },
+    ),
+
+  // ── 拓扑 ──
+  topology: (spec?: string) =>
+    req<{ nodes: TopoNode[]; edges: TopoEdge[]; specs: string[] }>(
+      `/api/topology${spec ? `?spec=${encodeURIComponent(spec)}` : ""}`,
+    ),
+
+  // ── 网关 ──
+  gateway: (zone: string) =>
+    req<GatewayStatus>(`/api/zones/${encodeURIComponent(zone)}/gateway/status`),
+
+  setEgress: (zone: string, on: boolean) =>
+    req<{ ok: boolean; run_id: string }>(
+      `/api/zones/${encodeURIComponent(zone)}/gateway/egress`,
+      { method: "POST", body: JSON.stringify({ on }) },
+    ),
+
+  addPub: (zone: string, body: { proto: string; port: number; to: string }) =>
+    req<{ ok: boolean; run_id: string }>(
+      `/api/zones/${encodeURIComponent(zone)}/gateway/pub`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  delPub: (zone: string, idx: number) =>
+    req<{ ok: boolean; run_id: string }>(
+      `/api/zones/${encodeURIComponent(zone)}/gateway/pub/${idx}`,
+      { method: "DELETE" },
+    ),
+
+  setVpn: (zone: string, proto: "wireguard" | "openvpn", action: "on" | "off") =>
+    req<{ ok: boolean; run_id: string }>(
+      `/api/zones/${encodeURIComponent(zone)}/gateway/vpn`,
+      { method: "POST", body: JSON.stringify({ proto, action }) },
+    ),
+
+  // ── 镜像连线 ──
+  mirrors: (spec?: string) =>
+    req<{ mirrors: MirrorRow[] }>(
+      `/api/mirrors${spec ? `?spec=${encodeURIComponent(spec)}` : ""}`,
+    ),
+
+  addMirror: (from: string, to: string, spec?: string) =>
+    req<{ ok: boolean; spec: string; run_id: string | null }>("/api/mirrors", {
+      method: "POST",
+      body: JSON.stringify({ from, to, spec }),
+    }),
+
+  delMirror: (id: string) =>
+    req<{ ok: boolean }>(`/api/mirrors/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+
+  // ── retire / revive ──
+  retireZone: (zone: string) =>
+    req<RetireResp>(`/api/zones/${encodeURIComponent(zone)}/retire`, {
+      method: "POST",
+    }),
+
+  reviveZone: (zone: string) =>
+    req<{ ok: boolean; started: string[]; run_id: string | null }>(
+      `/api/zones/${encodeURIComponent(zone)}/revive`,
+      { method: "POST" },
+    ),
+
+  retireHost: (zone: string, host: string) =>
+    req<RetireResp>(
+      `/api/hosts/${encodeURIComponent(zone)}/${encodeURIComponent(host)}/retire`,
+      { method: "POST" },
+    ),
+
+  reviveHost: (zone: string, host: string) =>
+    req<{ ok: boolean; started: string[]; run_id: string | null }>(
+      `/api/hosts/${encodeURIComponent(zone)}/${encodeURIComponent(host)}/revive`,
+      { method: "POST" },
+    ),
 
   // ── 运维 ──
   runs: () => req<{ runs: RunRow[] }>("/api/runs"),
@@ -176,7 +310,85 @@ export type HostRow = {
   exists: boolean;
   status: string;
   name: string | null;
+  role: string | null;
+  ipv4: string | null;
+  spec: string | null;
+  retired: boolean;
 };
+
+export type SpecMeta = {
+  name: string;
+  zones: number;
+  hosts: number;
+  bytes: number;
+  modified: string | null;
+  valid: boolean;
+  error: string | null;
+};
+
+export type GatewayStatus = {
+  zone: string;
+  spec: string;
+  gateway: { host: string; vmid: number | null; ipv4: string };
+  v4_cidr: string;
+  nat: boolean;
+  egress: boolean;
+  pubs: { proto: string; port: number; to: string; spec: string }[];
+  vpn: {
+    wireguard: boolean;
+    openvpn: boolean;
+    clients: string[];
+    wireguard_active: boolean;
+    openvpn_active: boolean;
+  };
+  retired_hosts: string[];
+};
+
+export type RetireResp = {
+  ok: boolean;
+  spec: string;
+  stopped: string[];
+  absent: string[];
+  mirror_units_stopped: string[];
+  note: string;
+};
+
+export type TopoNode = {
+  id: string;
+  kind: "wan" | "zone" | "host" | "mirr";
+  label: string;
+  zone: string | null;
+  role: string | null;
+  vmid: number | null;
+  ipv4: string | null;
+  status: string | null;
+  retired: boolean;
+  meta: Record<string, unknown>;
+};
+
+export type TopoEdge = {
+  from: string;
+  to: string;
+  kind: "uplink" | "member" | "mirror-port" | "mirror";
+  label: string | null;
+};
+
+export type MirrorRow = {
+  spec: string;
+  from: string;
+  to: string;
+  src_bridge: string;
+};
+
+/** VPN 客户端配置的下载地址（后端现读容器里的私钥现拼，平台不存副本）。 */
+export function vpnClientUrl(
+  zone: string,
+  proto: "wireguard" | "openvpn",
+  client?: string,
+): string {
+  const q = client ? `?client=${encodeURIComponent(client)}` : "";
+  return `/api/zones/${encodeURIComponent(zone)}/gateway/vpn/${proto}/client${q}`;
+}
 
 /** Web 终端的 iframe 地址（ttyd 的 base path 与后端反代一致）。 */
 export function terminalUrl(zone: string, host: string): string {

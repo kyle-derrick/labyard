@@ -305,13 +305,14 @@ async fn apply(
     let (cfg, _) = Config::load(&config_path);
     let text = std::fs::read_to_string(&file)?;
     let spec = Spec::parse(&text)?;
-    let zones = spec.resolve(&cfg.pve.wan_bridge)?;
+    let resolved = spec.resolve_all(&cfg.pve.wan_bridge)?;
 
     let db = Arc::new(Db::open(&cfg.paths.db)?);
     let base = cfg.pve.vmid_base;
     let db2 = db.clone();
     let plan = Plan::build(
-        &zones,
+        &resolved.zones,
+        &resolved.mirrors,
         &|p| assets::Assets::provisioner_hash(p),
         &|z, h| db2.vmid_for(z, h, base),
         snapshot,

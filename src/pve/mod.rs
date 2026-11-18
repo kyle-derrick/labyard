@@ -537,13 +537,151 @@ fi
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<Output, PveError> {
-        // 用 base64 传输，避免引号/换行在多层转义里出错
+        // 用 base64 传输，避免引号/换行在多层转义里出错。
+        // 临时文件名带 key：同一台容器上并发跑两条脚本（gateway + vpn）时，
+        // 固定路径会让后一条覆盖前一条，症状是"脚本内容对但行为不对"。
         let b64 = base64_encode(script.as_bytes());
+        let safe: String = key
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .take(40)
+            .collect();
+        let file = format!("/tmp/labyard-step-{safe}.sh");
         let inner = format!(
-            "set -e; echo {b64} | base64 -d > /tmp/labyard-step.sh; chmod +x /tmp/labyard-step.sh; /tmp/labyard-step.sh"
+            "set -e; echo {b64} | base64 -d > {file}; chmod +x {file}; {file}; rc=$?; rm -f {file}; exit $rc"
         );
         self.ct_exec(key, vmid, &["sh", "-c", &inner], timeout, cancel)
             .await
+    }
+
+    /// 把一段脚本装成容器内的开机 oneshot 单元，并立刻执行一次。
+    ///
+    /// 为什么必须落成单元：容器一重启（retire→revive、`pct reboot`、宿主
+    /// 重启），`ip addr` 配的地址和 nft 的规则表**全部消失**，而 net /
+    /// gateway 这两步是哈希门控的——apply 认为"已经做过"直接跳过。结果是
+    /// 重启后整个 zone 静默失联（地址没了），或者网关静默 fail-open
+    /// （规则表没了 = 默认放行，平台还显示"策略已下发"）。
+    ///
+    /// 落成单元之后，重启由 systemd 自愈；单元里的脚本与本步骤共用同一份
+    /// 生成器输出，不会出现"开机跑的是旧规则"。
+    ///
+    /// `unit` 不含 `.service` 后缀，形如 `labyard-net`。
+    pub async fn ct_boot_script(
+        &self,
+        key: &str,
+        vmid: u32,
+        unit: &str,
+        description: &str,
+        script: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Output, PveError> {
+        let b64 = base64_encode(script.as_bytes());
+        // ExecStart 显式走 `/bin/sh`：脚本是生成器吐出的纯命令片段，没有
+        // shebang，直接当可执行文件起会 `Exec format error`（真机踩过：
+        // 单元 installed+enabled 但一启动就 203/EXEC，容器里连地址都没有）。
+        let unit_body = format!(
+            "[Unit]\n\
+             Description={description}\n\
+             After=network-pre.target\n\
+             Before=network.target\n\
+             \n\
+             [Service]\n\
+             Type=oneshot\n\
+             RemainAfterExit=yes\n\
+             ExecStart=/bin/sh /usr/local/lib/labyard/{unit}.sh\n\
+             \n\
+             [Install]\n\
+             WantedBy=multi-user.target\n"
+        );
+        let b64_unit = base64_encode(unit_body.as_bytes());
+        // 先写临时文件再 mv：写到一半被打断时不会留下半截脚本，而开机时
+        // systemd 恰好读到它就是"容器起不来 + 没有任何提示"。
+        let inner = format!(
+            "set -e\n\
+             install -d /usr/local/lib/labyard\n\
+             echo {b64} | base64 -d > /usr/local/lib/labyard/{unit}.sh.new\n\
+             chmod 0755 /usr/local/lib/labyard/{unit}.sh.new\n\
+             mv /usr/local/lib/labyard/{unit}.sh.new /usr/local/lib/labyard/{unit}.sh\n\
+             echo {b64_unit} | base64 -d > /etc/systemd/system/{unit}.service.new\n\
+             mv /etc/systemd/system/{unit}.service.new /etc/systemd/system/{unit}.service\n\
+             systemctl daemon-reload\n\
+             systemctl enable {unit}.service >/dev/null 2>&1 || true\n\
+             systemctl restart {unit}.service"
+        );
+        self.ct_exec(key, vmid, &["sh", "-c", &inner], timeout, cancel)
+            .await
+    }
+
+    /// 读容器内文件（VPN 客户端配置、证书等）。读不到就是错误——调用方
+    /// 要返回给用户的是"文件不存在"，而不是一份空的下载。
+    pub async fn ct_read(
+        &self,
+        vmid: u32,
+        path: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, PveError> {
+        let out = self
+            .ct_exec(
+                &format!("read:{vmid}"),
+                vmid,
+                &["cat", path],
+                Duration::from_secs(20),
+                cancel,
+            )
+            .await?;
+        Ok(out.stdout)
+    }
+
+    /// 确保容器有 `/dev/net/tun`（VPN 必需）。返回 true 表示这次新加了设备。
+    ///
+    /// PVE 的 `dev0: /dev/net/tun` 会同时写 cgroup 白名单与 bind mount，
+    /// 两者都只在容器**启动时**生效——所以新加设备必须重启容器，否则
+    /// 容器里永远看不到 /dev/net/tun，而 `pct set` 自己不会告诉你这件事。
+    pub async fn ensure_tun(
+        &self,
+        vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<bool, PveError> {
+        let out = self
+            .runner
+            .run(
+                &format!("tun-check:{vmid}"),
+                &CommandSpec::new("pct", vec!["config".into(), vmid.to_string()])
+                    .with_timeout(Duration::from_secs(20)),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        let has = out
+            .stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with("dev0:") && l.contains("/dev/net/tun"));
+        if has {
+            return Ok(false);
+        }
+        self.cmd(
+            "tun-add",
+            CommandSpec::new(
+                "pct",
+                vec![
+                    "set".into(),
+                    vmid.to_string(),
+                    "--dev0".into(),
+                    "/dev/net/tun".into(),
+                ],
+            )
+            .with_timeout(Duration::from_secs(60)),
+            cancel,
+        )
+        .await?;
+        // 重启让设备生效。停着的容器直接 start（reboot 对停着的容器会报错）
+        match self.ct_status(vmid, cancel).await? {
+            Some(st) if st == "running" => self.ct_action(vmid, "reboot", cancel).await?,
+            _ => self.ct_action(vmid, "start", cancel).await?,
+        }
+        Ok(true)
     }
 
     /// 起/停/删。

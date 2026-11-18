@@ -2,67 +2,42 @@
 //!
 //! 全部是**纯函数**：给定参数返回一段 sh 脚本，脚本本身幂等（重复执行结果相同）。
 //! 这样可以在没有 PVE 的机器上把每种组合的输出快照下来做回归测试。
+//!
+//! 分工：这里只负责**地址/路由/解析器**；防火墙与端口映射在
+//! `resources::gateway`（nft 整表重建）。分开是因为两者的失败模式不同——
+//! 地址配错是"连不上"，规则配错是"连得上但不该连的也能连"。
 
-/// 网关容器：转发 + 可选 NAT（v4 与 v6 一起开关）。
+/// 网关容器：接口地址、默认路由、转发开关、解析器。
 ///
-/// `nat = false` 的用法：上游已经把整个网段路由过来了（宿主加了静态路由，
-/// 或 v6 拿到的是真正可分发的前缀），这时网关只做转发、不做地址转换，
-/// 内网地址在外部可见——这在"要让靶机直接从外部被访问"的实验里是必需的。
-/// `gw_v4` 是网关自己的地址（10.77.0.1/24），`zone_cidr` 是整个网段
-/// （10.77.0.0/24）——前者上接口，后者做 NAT 源。真机实测发现早期把
-/// 网段地址写上了接口，网关拿不到 .1 这个身份。
-pub fn gateway_script(
+/// `gw_v4` 是网关自己的地址（10.77.0.1/24），`uplink` 是上联网卡名（eth1）。
+/// 真机实测教训：早期把网段地址写上了接口，网关拿不到 .1 这个身份。
+pub fn gateway_addressing(
     gw_v4: &str,
-    zone_cidr: &str,
     v6_prefix: Option<&str>,
     uplink: &str,
-    nat: bool,
     dns: &[String],
 ) -> String {
     let mut s = String::new();
     s.push_str("set -eu\n");
     s.push_str("# 网关：内网口 = eth0，上联口 = eth1\n");
     s.push_str("ip link set eth0 up\n");
-    s.push_str("ip link set eth1 up\n");
-    s.push_str(&format!(
-        "ip addr replace {gw_v4} dev eth0\n"
-    ));
+    s.push_str(&format!("ip link set {uplink} up\n"));
+    s.push_str(&format!("ip addr replace {gw_v4} dev eth0\n"));
     if let Some(p) = v6_prefix {
         // ::1 作为网关地址
         let base = p.trim_end_matches("/64").trim_end_matches(':');
         s.push_str(&format!("ip -6 addr replace {base}::1/64 dev eth0\n"));
     }
     // 上联口走 DHCP（PVE 的 wan 桥通常有 DHCP 或用户自己配）
-    s.push_str("if ! ip -4 addr show eth1 | grep -q 'inet '; then\n");
-    s.push_str("  (command -v dhclient >/dev/null && dhclient -1 eth1) || true\n");
-    s.push_str("fi\n");
+    s.push_str(&format!(
+        "if ! ip -4 addr show {uplink} | grep -q 'inet '; then\n  \
+         (command -v dhclient >/dev/null && dhclient -1 {uplink}) || true\nfi\n"
+    ));
     s.push_str(&format!(
         "ip route replace default via $(ip -4 route show dev {uplink} | awk '/default/{{print $3; exit}}') dev {uplink} 2>/dev/null || true\n"
     ));
-
     s.push_str("sysctl -qw net.ipv4.ip_forward=1\n");
     s.push_str("sysctl -qw net.ipv6.conf.all.forwarding=1\n");
-
-    s.push_str("nft delete table inet labyard 2>/dev/null || true\n");
-    s.push_str("nft add table inet labyard\n");
-    s.push_str("nft 'add chain inet labyard forward { type filter hook forward priority 0; policy accept; }'\n");
-    s.push_str("nft 'add chain inet labyard postrouting { type nat hook postrouting priority 100; }'\n");
-    if nat {
-        s.push_str(&format!(
-            "nft add rule inet labyard postrouting ip saddr {zone_cidr} oifname \"{uplink}\" masquerade\n"
-        ));
-    }
-    if let (true, Some(p)) = (nat, v6_prefix) {
-        let base = p.trim_end_matches("/64").trim_end_matches(':');
-        s.push_str(&format!(
-            "nft add rule inet labyard postrouting ip6 saddr {base}::/64 oifname \"{uplink}\" masquerade\n"
-        ));
-    }
-    s.push_str("# 出向放行，入向默认丢弃（除已建立连接）\n");
-    s.push_str("nft add rule inet labyard forward ct state established,related accept\n");
-    s.push_str(&format!(
-        "nft add rule inet labyard forward iifname \"{uplink}\" oifname \"eth0\" drop\n"
-    ));
     // 网关自己也要能解析（apt 装包、provisioner 用）
     s.push_str(&resolv_conf(dns));
     s
@@ -157,25 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_nat66_present_when_v6_on() {
-        // nat=false 但 v6 开着：只做 v6 NAT，不做 v4 NAT
-        let s = gateway_script("10.10.1.1/24", "10.10.1.0/24", Some("fd00:1::/64"), "eth1", true, &[]);
-        assert!(s.contains("masquerade"));
-        assert!(s.contains("ip6 saddr fd00:1::/64"));
-        assert!(s.contains("ip saddr 10.10.1.0/24 oifname"));
-    }
-
-    #[test]
-    fn gateway_with_nat_off_does_not_masquerade() {
-        // 上游已经路由了整个网段时，网关只转发。这条如果退化成"永远 NAT"，
-        // 用户设的 `nat: false` 就变成了一个没有任何效果的字段。
-        let s = gateway_script("10.10.1.1/24", "10.10.1.0/24", Some("fd00:1::/64"), "eth1", false, &[]);
-        assert!(!s.contains("masquerade"), "nat=false 不应有任何 masquerade");
-        assert!(s.contains("ip_forward=1"), "但转发必须打开");
-        assert!(s.contains("ip -6 addr replace fd00:1::1/64"));
-    }
-
-    #[test]
     fn dns_comes_from_the_spec() {
         // 写了 dns 就必须用写的——实验网里靶机要靠内网 DNS 才能解析假域名
         let dns = vec!["10.10.1.10".to_string(), "1.1.1.1".to_string()];
@@ -183,7 +139,7 @@ mod tests {
         assert!(h.contains("nameserver 10.10.1.10"));
         assert!(h.contains("nameserver 1.1.1.1"));
         assert!(!h.contains("223.5.5.5"), "显式 dns 不应被公共解析器混进来");
-        let g = gateway_script("10.10.1.1/24", "10.10.1.0/24", None, "eth1", true, &dns);
+        let g = gateway_addressing("10.10.1.1/24", None, "eth1", &dns);
         assert!(g.contains("nameserver 10.10.1.10"), "网关自己也要能解析");
     }
 
@@ -197,16 +153,16 @@ mod tests {
     fn gateway_uses_its_own_ip_not_the_zone_cidr() {
         // 真机教训：早期把网段地址 10.10.1.0/24 写上接口——网段号当 IP 是错的，
         // 网关必须拿 .1 这个身份，靶机的默认路由才有落点。
-        let s = gateway_script("10.10.1.1/24", "10.10.1.0/24", None, "eth1", true, &[]);
+        let s = gateway_addressing("10.10.1.1/24", None, "eth1", &[]);
         assert!(s.contains("ip addr replace 10.10.1.1/24 dev eth0"));
         assert!(!s.contains("ip addr replace 10.10.1.0/24"), "网段号不该上接口");
-        // NAT 源仍然是整个网段
-        assert!(s.contains("ip saddr 10.10.1.0/24"));
     }
 
     #[test]
-    fn gateway_drops_inbound_from_uplink() {
-        let s = gateway_script("10.10.1.1/24", "10.10.1.0/24", None, "eth1", true, &[]);
-        assert!(s.contains("iifname \"eth1\" oifname \"eth0\" drop"));
+    fn gateway_turns_forwarding_on() {
+        let s = gateway_addressing("10.10.1.1/24", Some("fd00:1::/64"), "eth1", &[]);
+        assert!(s.contains("net.ipv4.ip_forward=1"));
+        assert!(s.contains("net.ipv6.conf.all.forwarding=1"));
+        assert!(s.contains("ip -6 addr replace fd00:1::1/64 dev eth0"));
     }
 }
