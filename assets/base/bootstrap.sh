@@ -6,6 +6,7 @@
 set -eu
 
 HOSTNAME_V="${LABYARD_HOSTNAME:-lab}"
+ZONE="${LABYARD_ZONE:-}"
 ROLE="${LABYARD_ROLE:-server}"
 IPV4="${LABYARD_IPV4:-}"
 V6_PREFIX="${LABYARD_V6_PREFIX:-}"
@@ -74,6 +75,7 @@ mkdir -p /var/lib/labyard
 cat > /var/lib/labyard/provisioned.json <<EOF
 {
   "hostname": "$HOSTNAME_V",
+  "zone": "$ZONE",
   "role": "$ROLE",
   "ipv4": "$IPV4",
   "ipv6_prefix": "$V6_PREFIX",
@@ -81,4 +83,4 @@ cat > /var/lib/labyard/provisioned.json <<EOF
 }
 EOF
 
-log "done: $HOSTNAME_V ($ROLE)"
+log "done: $HOSTNAME_V zone=$ZONE role=$ROLE"

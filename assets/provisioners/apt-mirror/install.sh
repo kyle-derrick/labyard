@@ -15,7 +15,8 @@ if ! dpkg -s apt-cacher-ng >/dev/null 2>&1; then
   apt-get install -y -qq --no-install-recommends apt-cacher-ng
 fi
 
-# 只监听内网口，不对外
+# 绑 0.0.0.0：这台机器只有内网口（analysis 挂在 zone 的网桥上），
+# 所以 0.0.0.0 的可达范围就是整个 zone。要更紧就改成它自己的内网地址。
 if [ -f /etc/apt-cacher-ng/acng.conf ]; then
   if ! grep -q '^BindAddress: 0.0.0.0' /etc/apt-cacher-ng/acng.conf; then
     sed -i 's/^#\?BindAddress:.*/BindAddress: 0.0.0.0/' /etc/apt-cacher-ng/acng.conf

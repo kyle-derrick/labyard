@@ -282,8 +282,11 @@ impl Plan {
                 args.insert("zone".into(), z.name.clone());
                 args.insert("ipv4".into(), h.ipv4.clone());
                 args.insert("role".into(), h.role.as_str().into());
+                // 键名会变成 `LABYARD_<KEY>`，必须与 assets/base/bootstrap.sh 里
+                // 读的变量名逐字对齐。之前这里是 `ipv6_prefix`，脚本读 `V6_PREFIX`，
+                // 前缀永远传不进去也不报错——所以两个名字只能存在一个。
                 if let Some(p) = &h.ipv6_prefix {
-                    args.insert("ipv6_prefix".into(), p.clone());
+                    args.insert("v6_prefix".into(), p.clone());
                 }
                 let kind = StepKind::Bootstrap {
                     zone: z.name.clone(),
@@ -516,6 +519,29 @@ zones:
                 }
             }
         }
+    }
+
+    #[test]
+    fn bootstrap_env_names_match_the_script() {
+        // 契约测试：参数键会变成 `LABYARD_<KEY>`，而脚本按名字读。
+        // 两边差一个字母，参数就静默传不进去（真实踩过：ipv6_prefix vs V6_PREFIX），
+        // 所以直接拿脚本源码核对，而不是靠人记住。
+        let script = crate::resources::assets::Assets::text("base/bootstrap.sh").expect("内置脚本");
+        let p = build(Y);
+        let mut checked = 0;
+        for s in &p.steps {
+            if let StepKind::Bootstrap { args, .. } = &s.kind {
+                for k in args.keys() {
+                    let env = format!("LABYARD_{}", k.to_uppercase().replace('-', "_"));
+                    assert!(
+                        script.contains(&env),
+                        "脚本里没有读 {env}，键 `{k}` 传了也不会生效"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 4, "应该至少检查到 hostname/role/ipv4/v6_prefix，实际 {checked}");
     }
 
     #[test]
