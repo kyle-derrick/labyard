@@ -13,6 +13,7 @@ pub fn gateway_script(
     v6_prefix: Option<&str>,
     uplink: &str,
     nat: bool,
+    dns: &[String],
 ) -> String {
     let mut s = String::new();
     s.push_str("set -eu\n");
@@ -58,11 +59,19 @@ pub fn gateway_script(
     s.push_str(&format!(
         "nft add rule inet labyard forward iifname \"{uplink}\" oifname \"eth0\" drop\n"
     ));
+    // 网关自己也要能解析（apt 装包、provisioner 用）
+    s.push_str(&resolv_conf(dns));
     s
 }
 
 /// 普通主机：静态地址；靶机不给默认路由（避免从内网直接出网）。
-pub fn host_script(ipv4: &str, gateway: Option<&str>, v6_prefix: Option<&str>, default_route: bool) -> String {
+pub fn host_script(
+    ipv4: &str,
+    gateway: Option<&str>,
+    v6_prefix: Option<&str>,
+    default_route: bool,
+    dns: &[String],
+) -> String {
     let mut s = String::new();
     s.push_str("set -eu\n");
     s.push_str("ip link set eth0 up\n");
@@ -95,8 +104,25 @@ pub fn host_script(ipv4: &str, gateway: Option<&str>, v6_prefix: Option<&str>, d
             s.push_str("ip -6 route del default 2>/dev/null || true\n");
         }
     }
-    s.push_str("cat > /etc/resolv.conf <<'EOF'\n");
-    s.push_str("nameserver 223.5.5.5\nnameserver 119.29.29.29\n");
+    s.push_str(&resolv_conf(dns));
+    s
+}
+
+/// 解析器列表。spec 里写了就用 spec 的——实验网经常要把靶机指向内网 DNS
+/// 才能解析到假域名；没写才退回公共解析器。
+///
+/// 之所以在这里写而不是靠 `pct create --nameserver`：net 步骤在此之后执行，
+/// 会整份覆盖 `/etc/resolv.conf`，PVE 写的那份留不下来。一个地方说了算。
+fn resolv_conf(dns: &[String]) -> String {
+    let list: Vec<&str> = if dns.is_empty() {
+        vec!["223.5.5.5", "119.29.29.29"]
+    } else {
+        dns.iter().map(|s| s.as_str()).collect()
+    };
+    let mut s = String::from("cat > /etc/resolv.conf <<'EOF'\n");
+    for ns in list {
+        s.push_str(&format!("nameserver {ns}\n"));
+    }
     s.push_str("EOF\n");
     s
 }
@@ -107,21 +133,21 @@ mod tests {
 
     #[test]
     fn host_has_no_default_route_when_asked() {
-        let s = host_script("10.10.1.20/24", Some("10.10.1.1"), None, false);
+        let s = host_script("10.10.1.20/24", Some("10.10.1.1"), None, false, &[]);
         assert!(s.contains("ip route del default"), "靶机必须删默认路由");
         assert!(!s.contains("ip route replace default"));
     }
 
     #[test]
     fn host_has_default_route_when_asked() {
-        let s = host_script("10.10.1.20/24", Some("10.10.1.1"), None, true);
+        let s = host_script("10.10.1.20/24", Some("10.10.1.1"), None, true, &[]);
         assert!(s.contains("ip route replace default via 10.10.1.1"));
     }
 
     #[test]
     fn ipv6_suffix_is_derived_and_stable() {
-        let a = host_script("10.10.1.20/24", None, Some("fd00:1::/64"), true);
-        let b = host_script("10.10.1.20/24", None, Some("fd00:1::/64"), true);
+        let a = host_script("10.10.1.20/24", None, Some("fd00:1::/64"), true, &[]);
+        let b = host_script("10.10.1.20/24", None, Some("fd00:1::/64"), true, &[]);
         assert!(a.contains("fd00:1::14/64"), "20 的十六进制是 14，实际: {a}");
         assert_eq!(a, b);
     }
@@ -129,7 +155,7 @@ mod tests {
     #[test]
     fn gateway_nat66_present_when_v6_on() {
         // nat=false 但 v6 开着：只做 v6 NAT，不做 v4 NAT
-        let s = gateway_script("10.10.1.0/24", Some("fd00:1::/64"), "eth1", true);
+        let s = gateway_script("10.10.1.0/24", Some("fd00:1::/64"), "eth1", true, &[]);
         assert!(s.contains("masquerade"));
         assert!(s.contains("ip6 saddr fd00:1::/64"));
         assert!(s.contains("ip saddr 10.10.1.0/24 oifname"));
@@ -139,15 +165,33 @@ mod tests {
     fn gateway_with_nat_off_does_not_masquerade() {
         // 上游已经路由了整个网段时，网关只转发。这条如果退化成"永远 NAT"，
         // 用户设的 `nat: false` 就变成了一个没有任何效果的字段。
-        let s = gateway_script("10.10.1.0/24", Some("fd00:1::/64"), "eth1", false);
+        let s = gateway_script("10.10.1.0/24", Some("fd00:1::/64"), "eth1", false, &[]);
         assert!(!s.contains("masquerade"), "nat=false 不应有任何 masquerade");
         assert!(s.contains("ip_forward=1"), "但转发必须打开");
         assert!(s.contains("ip -6 addr replace fd00:1::1/64"));
     }
 
     #[test]
+    fn dns_comes_from_the_spec() {
+        // 写了 dns 就必须用写的——实验网里靶机要靠内网 DNS 才能解析假域名
+        let dns = vec!["10.10.1.10".to_string(), "1.1.1.1".to_string()];
+        let h = host_script("10.10.1.20/24", Some("10.10.1.1"), None, true, &dns);
+        assert!(h.contains("nameserver 10.10.1.10"));
+        assert!(h.contains("nameserver 1.1.1.1"));
+        assert!(!h.contains("223.5.5.5"), "显式 dns 不应被公共解析器混进来");
+        let g = gateway_script("10.10.1.0/24", None, "eth1", true, &dns);
+        assert!(g.contains("nameserver 10.10.1.10"), "网关自己也要能解析");
+    }
+
+    #[test]
+    fn default_dns_when_unspecified() {
+        let h = host_script("10.10.1.20/24", None, None, false, &[]);
+        assert!(h.contains("nameserver 223.5.5.5"));
+    }
+
+    #[test]
     fn gateway_drops_inbound_from_uplink() {
-        let s = gateway_script("10.10.1.0/24", None, "eth1", true);
+        let s = gateway_script("10.10.1.0/24", None, "eth1", true, &[]);
         assert!(s.contains("iifname \"eth1\" oifname \"eth0\" drop"));
     }
 }

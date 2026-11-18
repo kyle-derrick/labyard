@@ -413,12 +413,13 @@ async fn apply_step(
             is_gateway,
             default_route,
             nat,
+            dns,
             ..
         } => {
             let script = if *is_gateway {
-                net::gateway_script(&zone_cidr_from(ipv4), ipv6_prefix.as_deref(), "eth1", *nat)
+                net::gateway_script(&zone_cidr_from(ipv4), ipv6_prefix.as_deref(), "eth1", *nat, dns)
             } else {
-                net::host_script(ipv4, gateway.as_deref(), ipv6_prefix.as_deref(), *default_route)
+                net::host_script(ipv4, gateway.as_deref(), ipv6_prefix.as_deref(), *default_route, dns)
             };
             pve.ct_exec(
                 &format!("net:{host}"),

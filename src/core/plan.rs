@@ -68,7 +68,7 @@ pub enum StepKind {
         uplink_bridge: Option<String>,
         ipv4: String,
         gateway: Option<String>,
-        dns: Vec<String>,
+        // dns 不在这里：解析器由 net 步骤写 /etc/resolv.conf，这里再存一份只会漂
         ssh_keys: Vec<String>,
         /// 建机时的 root 密码；不写就用 PVE 默认（无密码 + SSH key）
         password: Option<String>,
@@ -85,6 +85,8 @@ pub enum StepKind {
         is_gateway: bool,
         /// 是否需要默认路由。网关与分析机需要（要出网装包），靶机不要
         default_route: bool,
+        /// 解析器列表（来自 spec，逐级继承）。空 = 用内置公共 DNS。
+        dns: Vec<String>,
         /// 网关是否做地址转换（来自 zone 的 `nat`）。只对网关有意义，
         /// 非网关恒为 false——写在步骤里是为了让执行器不必回头查 spec。
         nat: bool,
@@ -216,7 +218,6 @@ impl Plan {
                     },
                     ipv4: h.ipv4.clone(),
                     gateway,
-                    dns: h.dns.clone(),
                     ssh_keys: h.ssh_keys.clone(),
                     password: h.password.clone(),
                     hostname: format!("{}-{}", sanitize(&z.name), sanitize(&h.name)),
@@ -260,6 +261,7 @@ impl Plan {
                     is_gateway: is_gw,
                     default_route: wants_route,
                     nat: is_gw && z.nat,
+                    dns: h.dns.clone(),
                 };
                 steps.push(Step {
                     key: format!("net:{}:{}", z.name, h.name),

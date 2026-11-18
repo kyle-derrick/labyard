@@ -953,6 +953,8 @@ Rust 默认使用系统 malloc（Linux 上是 glibc 的 ptmalloc2）。它在**�
 | **网关只有一块网卡** | 网关脚本 `ip link set eth1 up` 直接失败 | `ensure_ct` 从不建 `net1`，而脚本通篇配 `eth1` | `Container` 步骤带 `uplink_bridge`（仅网关），建机时加 `--net1`；老容器用 `pct set --net1` 补 |
 | **`nat` 字段是装饰品** | 设 `nat: false` 仍然全程 NAT | 参数没传到 `gateway_script`，`nat44` 硬编码 `true` | 见 §5.8.1，默认值同时改成 `true` |
 | **`password` 字段是装饰品** | 设了密码，容器里登不进去 | `ensure_ct(..., None, ...)` 写死 | 进 `Container` 步骤并透传 |
+| **`dns` 字段是装饰品** | 写了内网 DNS，容器里解析的还是公共 DNS | `host_script` 把 `resolv.conf` 写成了常量 | `resolv_conf()` 用 spec 的列表，空才退回公共 DNS |
+| **bootstrap 环境变量名对不上** | v6 前缀、zone 名永远传不进容器 | plan 传 `ipv6_prefix`，脚本读 `LABYARD_V6_PREFIX`；`zone` 压根没被读 | 键名对齐，并加契约测试：从步骤参数反推变量名，断言脚本源码里真的有 |
 | **同角色主机撞 IP** | 一个 zone 里两台 `server` 都是 `.20`，后建的覆盖前面的 | 直接用角色的默认主机位，没有占用表 | 按角色默认位往后找第一个空位；显式重复直接报 `DuplicateIp` |
 | **`specs` 目录建了从没用** | 刷新页面 YAML 全丢 | 前端只存在 `useState` 里 | `GET/PUT /api/spec`，原子写，校验后才落盘 |
 
