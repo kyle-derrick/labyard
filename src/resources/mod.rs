@@ -8,6 +8,7 @@ pub mod assets;
 pub mod net;
 
 use crate::core::plan::{Phase, Step, StepKind};
+use crate::core::spec::ResolvedZone;
 use crate::core::runner::{CommandSpec, Event, Runner};
 use crate::db::Db;
 use crate::pve::Pve;
@@ -318,7 +319,8 @@ async fn execute_one(
     };
 
     if decision == Decision::Done {
-        db.record_run_step(run_id, &step.key, "skipped", None);
+        // run 明细记不上不影响正确性（下次 run 会有新行），但显式标记意图
+        let _ = db.record_run_step(run_id, &step.key, "skipped", None);
         let _ = tx
             .try_send(Event::Line {
                 key: step.key.clone(),
@@ -388,8 +390,9 @@ async fn execute_one(
         }
         Err(e) => {
             let msg = e.to_string();
-            db.record_step(&step.key, &step.input_hash, "failed", Some(&msg));
-            db.record_run_step(run_id, &step.key, "failed", Some(&msg));
+            // 已经在处理失败，这里的记录失败没有更好的去处，显式丢弃
+            let _ = db.record_step(&step.key, &step.input_hash, "failed", Some(&msg));
+            let _ = db.record_run_step(run_id, &step.key, "failed", Some(&msg));
             let _ = tx.try_send(Event::Failed {
                 key: step.key.clone(),
                 error: msg.clone(),
@@ -591,5 +594,111 @@ mod tests {
     fn zone_cidr_normalises_last_octet() {
         assert_eq!(zone_cidr_from("10.10.1.1/24"), "10.10.1.0/24");
         assert_eq!(zone_cidr_from("192.168.5.254/16"), "192.168.5.0/16");
+    }
+}
+
+// ═════════════════════════ destroy ═════════════════════════
+
+/// 一个 zone 的销毁结果。`kept_bridge` 非 None 表示桥被保留（还有别的成员）。
+#[derive(Debug, Default)]
+pub struct DestroyReport {
+    pub destroyed_cts: Vec<(String, u32)>,
+    pub absent_cts: Vec<String>,
+    pub bridge_deleted: bool,
+    pub kept_bridge: Option<String>,
+}
+
+impl Executor {
+    /// 删除一个 zone 的全部资源（CT + 桥 + 分配记录 + 步骤状态）。
+    ///
+    /// 设计原则（docs/design.md §4.6）：**硬检查不满足就整体中止**，不做
+    /// "尽力而为"——删到一半发现还有别人引用，剩下的不删，状态保持一致。
+    /// 模板不删：它是共享资产（多个 zone 可能用同一个），留着无害。
+    pub async fn destroy_zone(
+        &self,
+        zone: &ResolvedZone,
+        all_zones: &[ResolvedZone],
+        cancel: &CancellationToken,
+    ) -> Result<DestroyReport, String> {
+        // ── 硬检查 1：被其他 zone 当 uplink 引用 → 拒绝 ──
+        let dependents: Vec<&str> = all_zones
+            .iter()
+            .filter(|z| z.name != zone.name && z.uplink_bridge.as_deref() == Some(zone.bridge.as_str()))
+            .map(|z| z.name.as_str())
+            .collect();
+        if !dependents.is_empty() {
+            return Err(format!(
+                "zone `{}` 的桥 {} 仍被 {} 上联引用——先改它们的 uplink 再销毁",
+                zone.name,
+                zone.bridge,
+                dependents.join(", ")
+            ));
+        }
+
+        let mut report = DestroyReport::default();
+
+        // ── 容器：存在才删（stop → destroy --purge），不存在记 absent ──
+        let vms = self.pve.cluster_vms(cancel).await.map_err(|e| e.to_string())?;
+        for h in &zone.hosts {
+            // spec 固定 vmid 或 DB 分配过，二者都没有 = 从没建过
+            let vmid = h.vmid.or_else(|| self.db.vmid_of(&zone.name, &h.name));
+            let Some(vmid) = vmid else {
+                report.absent_cts.push(h.name.clone());
+                continue;
+            };
+            let hostname = format!("{}-{}", zone.name, h.name);
+            let exists = vms
+                .iter()
+                .any(|r| r.is_lxc() && r.vmid_parsed() == Some(vmid));
+            if !exists {
+                report.absent_cts.push(hostname);
+            } else {
+                match self.pve.ct_status(vmid, cancel).await {
+                    Ok(Some(st)) if st == "running" => {
+                        self.pve
+                            .ct_action(vmid, "stop", cancel)
+                            .await
+                            .map_err(|e| format!("停 {hostname} 失败: {e}"))?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(format!("查 {hostname} 状态失败: {e}")),
+                }
+                self.pve
+                    .ct_action(vmid, "destroy", cancel)
+                    .await
+                    .map_err(|e| format!("删 {hostname} 失败: {e}"))?;
+                report.destroyed_cts.push((hostname, vmid));
+            }
+            // 分配与步骤状态一律释放——即使 PVE 上本来就不存在（状态不一致时
+            // 正好借 destroy 收拾干净，下次 apply 从零重建）
+            self.db.release_vmid(&zone.name, &h.name);
+            for prefix in ["ct", "net", "bootstrap", "snapshot"] {
+                self.db
+                    .forget_step(&format!("{prefix}:{}:{}", zone.name, h.name));
+            }
+        }
+
+        // ── 硬检查 2：桥上还有别的成员口 → 不删，打印剩余成员 ──
+        let members = self
+            .pve
+            .bridge_members(&zone.bridge, cancel)
+            .await
+            .map_err(|e| e.to_string())?;
+        if members.is_empty() {
+            self.pve
+                .destroy_bridge(&zone.bridge, cancel)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.db.forget_step(&format!("bridge:{}", zone.name));
+            report.bridge_deleted = true;
+        } else {
+            report.kept_bridge = Some(format!(
+                "{} 仍被 {} 占用（可能是容器重建或残留 veth），桥已保留",
+                zone.bridge,
+                members.join(", ")
+            ));
+        }
+
+        Ok(report)
     }
 }

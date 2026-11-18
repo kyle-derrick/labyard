@@ -157,11 +157,8 @@ impl Db {
     }
 
     /// 清掉某个 key 的记录（销毁资源后调用，否则下次 apply 会以为已完成）。
-    ///
-    /// 只有测试在用：真正的 destroy 路径还没实现（README「未实现」里有列）。
-    /// 标 `cfg(test)` 是为了让"没有调用方"这件事在编译期就说清楚，
-    /// 而不是靠一个 `#[allow(dead_code)]` 掩盖过去。
-    #[cfg(test)]
+    /// 删除步骤状态（destroy 调：资源没了，状态也该跟着没）。
+    /// 之前 destroy 未实现时标过 cfg(test)——现在有真实调用方，转正。
     pub fn forget_step(&self, key: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM step_state WHERE key = ?1", [key]);
@@ -202,14 +199,27 @@ impl Db {
         candidate
     }
 
-    /// 删除资源时一并释放 vmid（destroy 才调）。同 `forget_step`，仅测试使用。
-    #[cfg(test)]
+    /// 删除资源时释放 vmid（destroy 调）。retire 不调——retire 保留占用。
     pub fn release_vmid(&self, zone: &str, host: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "DELETE FROM vmids WHERE zone = ?1 AND host = ?2",
             params![zone, host],
         );
+    }
+
+    /// 只读查询：这台主机是否分配过 vmid。destroy 用它判断"有没有东西可删"，
+    /// 不能用 `vmid_for`——那会在查不到时顺手分配一个，destroy 拿它一查
+    /// 就"资源存在"了，实际 PVE 上根本没有这台容器。
+    pub fn vmid_of(&self, zone: &str, host: &str) -> Option<u32> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT vmid FROM vmids WHERE zone = ?1 AND host = ?2",
+            params![zone, host],
+            |r| r.get::<_, u32>(0),
+        )
+        .optional()
+        .unwrap_or(None)
     }
 
     // ── runs ──

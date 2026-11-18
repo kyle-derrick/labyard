@@ -280,9 +280,15 @@ impl Plan {
         }
 
         // ── 5. provisioning ──
+        // 对**所有**主机执行（不再要求有 provisioner）：基础配置——时区、
+        // 语言、apt 源、预装包——是每台机器的需求，不该以"配了 provisioner"
+        // 为前提。没配 provisioner 的按 "none" 走，只跑 base bootstrap。
         for z in zones {
             for h in &z.hosts {
-                let Some(prov) = &h.provisioner else { continue };
+                let prov = h
+                    .provisioner
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string());
                 let vmid = h.vmid.unwrap_or_else(|| vmid_for(&z.name, &h.name));
                 let mut args = BTreeMap::new();
                 args.insert("hostname".into(), format!("{}-{}", sanitize(&z.name), sanitize(&h.name)));
@@ -295,6 +301,19 @@ impl Plan {
                 if let Some(p) = &h.ipv6_prefix {
                     args.insert("v6_prefix".into(), p.clone());
                 }
+                if let Some(tz) = &h.timezone {
+                    args.insert("timezone".into(), tz.clone());
+                }
+                if let Some(l) = &h.lang {
+                    args.insert("lang".into(), l.clone());
+                }
+                if let Some(m) = &h.apt_mirror {
+                    args.insert("apt_mirror".into(), m.clone());
+                }
+                if !h.packages.is_empty() {
+                    // 空格连接：bootstrap.sh 里按 word splitting 展开
+                    args.insert("packages".into(), h.packages.join(" "));
+                }
                 let kind = StepKind::Bootstrap {
                     zone: z.name.clone(),
                     host: h.name.clone(),
@@ -304,7 +323,7 @@ impl Plan {
                 };
                 // hash 里必须含脚本内容，否则改脚本不会触发重跑
                 let mut hsh = hash_of(&kind);
-                hsh.push_str(&provisioner_hash(prov));
+                hsh.push_str(&provisioner_hash(&prov));
                 steps.push(Step {
                     key: format!("bootstrap:{}:{}", z.name, h.name),
                     phase: Phase::Bootstrap,

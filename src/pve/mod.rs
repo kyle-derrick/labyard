@@ -549,6 +549,81 @@ fi
         Ok(())
     }
 
+    /// 容器状态：Some("running"/"stopped"/...) 或 None（不存在）。
+    /// destroy 用它决定要不要先 stop，不能对着停着的容器 pct stop——
+    /// 那会退出非零，把"本来就停着"当成失败。
+    pub async fn ct_status(
+        &self,
+        vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, PveError> {
+        let out = self
+            .runner
+            .run(
+                &format!("status:{vmid}"),
+                &CommandSpec::new("pct", vec!["status".into(), vmid.to_string()]),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(out
+            .stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("status: "))
+            .map(|s| s.trim().to_string()))
+    }
+
+    /// 删网桥 + 清掉 /etc/network/interfaces 里持久化的段。幂等：桥不存在
+    /// 只清配置段。用 begin/end 行匹配整段删除，段格式见 ensure_bridge。
+    pub async fn destroy_bridge(
+        &self,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), PveError> {
+        let script = format!(r#"set -e
+ip link del {name} 2>/dev/null && echo "bridge {name} deleted" || echo "bridge {name} absent"
+# 从 interfaces 里删掉持久化段（auto {name} 起到本段空行止）
+if grep -q "^iface {name} " /etc/network/interfaces 2>/dev/null; then
+  sed -i "/^auto {name}$/,+5d" /etc/network/interfaces
+  ifreload -a 2>/dev/null || true
+fi
+echo done"#);
+        self.runner
+            .run(
+                &format!("bridge-destroy:{name}"),
+                &CommandSpec::new("sh", vec!["-c".into(), script]).with_timeout(Duration::from_secs(30)),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 桥的成员口列表（不含桥自身）。
+    pub async fn bridge_members(
+        &self,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, PveError> {
+        let out = self
+            .runner
+            .run(
+                &format!("bridge-members:{name}"),
+                &CommandSpec::new("ip", vec!["-o", "link", "show", "master", name]),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| l.split(':').nth(1).map(|s| s.trim().to_string()))
+            .collect())
+    }
+
     /// 快照。已存在同名则跳过。
     pub async fn ensure_snapshot(
         &self,

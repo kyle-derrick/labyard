@@ -66,6 +66,20 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         concurrency: usize,
     },
+    /// 删除一个 zone 的全部资源（容器、网桥、分配记录）。不可逆。
+    Destroy {
+        /// 规格文件（用于解析 zone 的主机与桥名）
+        #[arg(long, short = 'f')]
+        file: PathBuf,
+        #[arg(long, default_value = "/etc/labyard/config.toml")]
+        config: PathBuf,
+        /// 要销毁的 zone 名——必须与规格里的名字一致，这是第二道确认
+        #[arg(long)]
+        zone: String,
+        /// 确认执行（缺了直接拒绝）
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -96,6 +110,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             snapshot,
             concurrency,
         } => apply(file, dry_run, config, snapshot, concurrency).await,
+        Cmd::Destroy { file, config, zone, yes } => {
+            destroy_cmd(file, config, zone, yes).await
+        }
     }
 }
 
@@ -350,5 +367,59 @@ async fn apply(
     if !summary.ok() {
         std::process::exit(2);
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn destroy_cmd(
+    file: PathBuf,
+    config_path: PathBuf,
+    zone: String,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    // 硬检查：--yes 且 zone 名与规格一致（docs/design.md §4.6 的两次确认）
+    if !yes {
+        return Err("destroy 不可逆：必须带 --yes，且 --zone 指明要销毁的 zone 名".into());
+    }
+    let (cfg, _) = Config::load(&config_path);
+    let text = std::fs::read_to_string(&file)?;
+    let spec = Spec::parse(&text)?;
+    let zones = spec.resolve(&cfg.pve.wan_bridge)?;
+    let Some(z) = zones.iter().find(|z| z.name == zone) else {
+        return Err(format!(
+            "规格里没有 zone `{zone}`（现有: {}）",
+            zones
+                .iter()
+                .map(|z| z.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into());
+    };
+
+    let db = Arc::new(Db::open(&cfg.paths.db)?);
+    let runner = Arc::new(RealRunner::new());
+    let pve = Arc::new(Pve::new(runner.clone(), cfg.pve.node.clone()));
+    let ex = Executor::new(pve, db.clone(), runner);
+
+    let report = ex
+        .destroy_zone(z, &zones, &CancellationToken::new())
+        .await?;
+
+    println!("zone `{}` 销毁结果：", z.name);
+    for (name, vmid) in &report.destroyed_cts {
+        println!("  ✓ 已删除 {name} (CT {vmid})");
+    }
+    for name in &report.absent_cts {
+        println!("  · {name}: PVE 上不存在，只清理了分配记录");
+    }
+    if report.bridge_deleted {
+        println!("  ✓ 已删除网桥 {}", z.bridge);
+    }
+    if let Some(reason) = &report.kept_bridge {
+        println!("  ! 桥保留：{reason}");
+    }
+    println!("  vmid 分配与步骤状态已释放，下次 apply 会从零重建");
     Ok(())
 }

@@ -45,6 +45,7 @@ zones:
 其余约定：
 
 - 三层默认值：`defaults` → `zone` → `host`，逐字段覆盖
+- 主机基础配置同样三层合并：`timezone`（时区）、`lang`（locale，如 `zh_CN.UTF-8`）、`apt_mirror`（apt 源，无外网机器可指向内网 apt-cacher-ng）、`packages`（预装包；`packages: []` 显式不要——无外网靶机用它退出继承）
 - `storage` 是 rootfs 落点；`template_storage` 是模板（vztmpl）落点，**默认跟随 `storage`**。rootfs 用 lvmthin/zfspool 时模板必须分开放（如 `template_storage: local`），一体存储（dir/NFS）零配置
 - IPv6 默认开启，只发 ULA（`fd` 开头，按 zone 名确定性派生）+ NAT66，不向上游要前缀
 - 靶机（server/client）**不给默认路由**，只能从内网发起
@@ -159,9 +160,10 @@ docs/design.md   唯一权威设计文档
 | ✅ 单元测试通过 | 54 项：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
 | ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（8.0 MB）与内存（常驻 6.9 MB / 峰值 ≈38 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
-| ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` 6/6 步成功（网桥 → 模板 → 2×CT → 2×网络）；网关拿 `.1`、NAT 出网生效、靶机**无默认路由**、宿主入向被网关丢弃；幂等重跑 6/6 跳过。真机暴露并修复了 6 处缺陷（见 git log `9eb34c1`）——单测全绿没拦住它们，只有真机拦住了 |
+| ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` 8/8 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、靶机**无默认路由**、宿主入向被网关丢弃；幂等重跑 8/8 跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、靶机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）。真机暴露并修复了 6 处缺陷（见 git log `9eb34c1`）|
+| ✅ IPv6（区域内） | ULA 正确下发（gw `::1`、靶机 `::14`）、区域内互通、NAT66 masquerade 规则在位；出公网未测（宿主无 IPv6 上游，环境限制）|
 | ⚠️ 仅设计推演 | IPv6 双栈全链路（ULA 已在真机下发、NAT66 规则在位，但端到端连通未测）、厚 LVM 快照、`pct snapshot` |
-| ❌ 完全未验证 | ttyd 反代与文件传输、升级迁移、destroy 路径 |
+| ❌ 未实现 | ttyd 反代与文件面板、retire/revive、升级迁移（此前 README 误写为"未验证"——它们尚未实现） |
 
 **mock 全绿不等于真机通过**，这一条不含糊——但现在已经有了真机证据。
 

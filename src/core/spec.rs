@@ -32,6 +32,16 @@ pub struct Defaults {
     /// 不支持 vztmpl 内容的存储时必须显式分开写（PVE 约定放在 `local`）。
     /// 真机验证教训：把模板下载打到 lvmthin 上，`pveam download` 直接 255。
     pub template_storage: Option<String>,
+    /// 时区（如 Asia/Shanghai）。走容器内 bootstrap 落地。
+    pub timezone: Option<String>,
+    /// 系统 locale（如 zh_CN.UTF-8）。设置后 bootstrap 里 locale-gen 生成。
+    pub lang: Option<String>,
+    /// apt 源地址（如清华源）。无外网的靶机可指向内网 apt-cacher-ng。
+    /// 不写则只把官方 http 源升级成 https。
+    pub apt_mirror: Option<String>,
+    /// 额外预装包（vim curl jq 之类）。显式声明的包安装失败会让步骤失败——
+    /// 你点名要的东西装不上不该被静默跳过。
+    pub packages: Option<Vec<String>>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -68,6 +78,10 @@ pub struct ZoneSpec {
     pub template: Option<String>,
     pub storage: Option<String>,
     pub template_storage: Option<String>,
+    pub timezone: Option<String>,
+    pub lang: Option<String>,
+    pub apt_mirror: Option<String>,
+    pub packages: Option<Vec<String>>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -124,6 +138,10 @@ pub struct HostSpec {
     pub template: Option<String>,
     pub storage: Option<String>,
     pub template_storage: Option<String>,
+    pub timezone: Option<String>,
+    pub lang: Option<String>,
+    pub apt_mirror: Option<String>,
+    pub packages: Option<Vec<String>>,
     pub node: Option<String>,
     pub dns: Option<Vec<String>>,
     pub ssh_keys: Option<Vec<String>>,
@@ -191,6 +209,10 @@ pub struct ResolvedHost {
     pub storage: String,
     /// 模板所在存储；默认跟随 storage
     pub template_storage: String,
+    pub timezone: Option<String>,
+    pub lang: Option<String>,
+    pub apt_mirror: Option<String>,
+    pub packages: Vec<String>,
     pub node: Option<String>,
     pub dns: Vec<String>,
     pub ssh_keys: Vec<String>,
@@ -341,6 +363,31 @@ impl Spec {
                     .or_else(|| z.template_storage.clone())
                     .or_else(|| self.defaults.template_storage.clone())
                     .unwrap_or_else(|| storage.clone());
+                // 基础配置三层合并：host > zone > defaults，全 None 时留给
+                // bootstrap.sh 的内置默认（时区上海、官方源 https 化）。
+                let timezone = h
+                    .timezone
+                    .clone()
+                    .or_else(|| z.timezone.clone())
+                    .or_else(|| self.defaults.timezone.clone());
+                let lang = h
+                    .lang
+                    .clone()
+                    .or_else(|| z.lang.clone())
+                    .or_else(|| self.defaults.lang.clone());
+                let apt_mirror = h
+                    .apt_mirror
+                    .clone()
+                    .or_else(|| z.apt_mirror.clone())
+                    .or_else(|| self.defaults.apt_mirror.clone());
+                // Option 链而不是"空列表当未设置"：`packages: []` 必须能表达
+                // "显式不要包"——无外网的靶机继承 defaults 的包清单只会装不上。
+                let packages = h
+                    .packages
+                    .clone()
+                    .or_else(|| z.packages.clone())
+                    .or_else(|| self.defaults.packages.clone())
+                    .unwrap_or_default();
 
                 // 主机号：写了就校验，没写就按角色默认位往后找第一个空的。
                 // 早先的实现直接用角色默认位，**同一个 zone 里两台 server 会拿到
@@ -409,6 +456,10 @@ impl Spec {
                     template,
                     storage,
                     template_storage,
+                    timezone,
+                    lang,
+                    apt_mirror,
+                    packages,
                     node: h
                         .node
                         .clone()
