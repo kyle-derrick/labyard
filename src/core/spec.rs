@@ -480,15 +480,20 @@ fn parse_v4_cidr(zone: &str, cidr: &str) -> Result<(String, u8), SpecError> {
 
 /// 从 zone 名确定性地派生一个 ULA /64 前缀（fd00::/8 内）。
 /// 同一个 zone 名永远得到同一个前缀，不需要持久化。
+///
+/// 格式必须是 `fdXX:XXXX:XXXX::/64`——IPv6 每 16 bit 一组、每组 4 个 hex。
+/// 之前这里漏了中间冒号，产出了 `fd0d6e40:e367::/64` 这种非法地址。
 pub fn ula_prefix(zone: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(zone.as_bytes());
     let d = h.finalize();
-    // fd + 40bit global id + 16bit subnet
+    // fd + 40 bit global id + 16 bit subnet = 48 bit 前缀。
+    // 注意分组：`fd` 本身占 8 bit，所以第一组是 `fdXX`（共 4 hex），
+    // 不能写成 `fdXXXX`（8 hex，非法）。
     format!(
-        "fd{:02x}{:02x}{:02x}{:02x}:{:02x}{:02x}::/64",
-        d[0], d[1], d[2], d[3], d[4], d[5]
+        "fd{:02x}:{:02x}{:02x}:{:02x}{:02x}::/64",
+        d[0], d[1], d[2], d[3], d[4]
     )
 }
 
@@ -610,6 +615,26 @@ zones:
         assert_eq!(ula_prefix("main"), ula_prefix("main"));
         assert_ne!(ula_prefix("main"), ula_prefix("sub"));
         assert!(ula_prefix("main").starts_with("fd"));
+    }
+
+    #[test]
+    fn ula_prefix_is_well_formed_ipv6() {
+        // 这条是回归测试：曾经产出 `fd0d6e40:e367::/64`，第一组 8 个 hex，非法
+        for zone in ["main", "sub", "a", "zone-with-long-name", "红队"] {
+            let p = ula_prefix(zone);
+            assert!(p.ends_with("::/64"), "{p} 应以 ::/64 结尾");
+            let core = p.strip_suffix("::/64").unwrap();
+            let groups: Vec<&str> = core.split(':').collect();
+            assert_eq!(groups.len(), 3, "{p} 应有 3 组（48 bit 前缀），实际 {groups:?}");
+            for g in &groups {
+                assert_eq!(g.len(), 4, "{p} 的每组必须是 4 个 hex，实际 {g}");
+                assert!(
+                    g.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{p} 含非 hex 字符"
+                );
+            }
+            assert!(groups[0].starts_with("fd"), "{p} 必须落在 fd00::/8");
+        }
     }
 
     #[test]

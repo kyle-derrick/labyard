@@ -278,11 +278,22 @@ async fn preview(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(re
 
 fn build_plan(state: &AppState, yaml: &str, snapshot: bool) -> Result<(Vec<crate::core::spec::ResolvedZone>, Plan), String> {
     let spec = Spec::parse(yaml).map_err(|e| e.to_string())?;
-    let zones = spec
+    let mut zones = spec
         .resolve(&state.cfg.pve.wan_bridge)
         .map_err(|e| e.to_string())?;
     let db = state.db.clone();
     let base = state.cfg.pve.vmid_base;
+
+    // 回填 vmid：预览时就应该显示真实号，而不是"?"。
+    // 这里分配的号会被写进 DB，与随后 Plan 里用的是同一个值（vmid_for 是幂等的）。
+    for z in &mut zones {
+        for h in &mut z.hosts {
+            if h.vmid.is_none() {
+                h.vmid = Some(db.vmid_for(&z.name, &h.name, base));
+            }
+        }
+    }
+
     let plan = Plan::build(
         &zones,
         &|p| assets::Assets::provisioner_hash(p),
