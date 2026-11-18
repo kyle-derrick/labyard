@@ -126,11 +126,7 @@ async fn serve_with(cfg: Config, concurrency: usize) -> Result<(), Box<dyn std::
     db.mark_interrupted();
 
     let runner = Arc::new(RealRunner::new());
-    let pve = Arc::new(Pve::new(
-        runner.clone(),
-        cfg.pve.node.clone(),
-        cfg.pve.wan_bridge.clone(),
-    ));
+    let pve = Arc::new(Pve::new(runner.clone(), cfg.pve.node.clone()));
 
     let secret = Arc::new(api::auth::load_or_create_secret(&cfg.server.secret_file)?);
 
@@ -189,7 +185,7 @@ async fn doctor(config_path: PathBuf, json: bool) -> Result<(), Box<dyn std::err
     init_tracing();
     let (cfg, warn) = Config::load(&config_path);
     let runner = Arc::new(RealRunner::new());
-    let pve = Pve::new(runner, cfg.pve.node.clone(), cfg.pve.wan_bridge.clone());
+    let pve = Pve::new(runner, cfg.pve.node.clone());
     let cancel = CancellationToken::new();
 
     let mut rows: Vec<(String, bool, String)> = Vec::new();
@@ -302,11 +298,12 @@ async fn apply(
     db.create_run(&run_id, &file.display().to_string());
 
     let runner = Arc::new(RealRunner::new());
-    let pve = Arc::new(Pve::new(
-        runner.clone(),
-        cfg.pve.node.clone(),
-        cfg.pve.wan_bridge.clone(),
-    ));
+    let pve = Arc::new(Pve::new(runner.clone(), cfg.pve.node.clone()));
+
+    // 与 Web 路径同一道门槛：不做 PVE 8 兼容层，就在动手前拒绝。
+    // CLI 更容易被脚本调用，静默跑在错版本上比报错糟得多。
+    pve.require_pve9(&CancellationToken::new()).await?;
+
     let ex = Executor::new(pve, db.clone(), runner);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(500);

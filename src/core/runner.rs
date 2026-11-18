@@ -105,8 +105,8 @@ pub struct Output {
     pub code: Option<i32>,
     /// 完整 stdout（仅在 `capture` 为真时有值）
     pub stdout: String,
-    pub duration: Duration,
-    pub skipped_lines: u64,
+    // 耗时与丢弃行数不进这里：它们已经通过 `Event::Finished` / `Event::Skipped`
+    // 推给了订阅者。放在返回值里只会多一份没人读的副本。
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -320,8 +320,6 @@ impl Runner for RealRunner {
                 Ok(Output {
                     code,
                     stdout: stdout_buf,
-                    duration,
-                    skipped_lines: skipped,
                 })
             }
             Err(e) => {

@@ -7,5 +7,6 @@ pub mod plan;
 pub mod runner;
 pub mod spec;
 
-pub use plan::{Phase, Plan, Step, StepKind};
-pub use spec::{ResolvedHost, ResolvedZone, Role, Spec, SpecError, V6Mode};
+// 不做根级 re-export：全仓统一写 `crate::core::plan::Plan` 这种全路径，
+// 一眼能看出东西在哪一层。加了 re-export 反而会攒出一堆"unused import"警告，
+// 并且让 `core::Spec` 和 `spec::Spec` 两种写法并存。

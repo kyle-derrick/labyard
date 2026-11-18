@@ -78,6 +78,17 @@ export const api = {
 
   state: () => req<{ steps: StepState[] }>("/api/state"),
 
+  /** 读取服务端已保存的规格；从未保存过时 exists=false、yaml=null。 */
+  getSpec: () =>
+    req<{ yaml: string | null; exists: boolean }>("/api/spec"),
+
+  /** 保存规格。服务端会先 parse + resolve 校验，非法直接 400。 */
+  putSpec: (yaml: string) =>
+    req<{ ok: boolean }>("/api/spec", {
+      method: "PUT",
+      body: JSON.stringify({ yaml }),
+    }),
+
   preview: (yaml: string, snapshot = false) =>
     req<PreviewResp>("/api/preview", {
       method: "POST",

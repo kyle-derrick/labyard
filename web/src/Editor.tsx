@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   App as AntApp,
@@ -20,6 +20,7 @@ import {
   EyeOutlined,
   StopOutlined,
   ReloadOutlined,
+  SaveOutlined,
 } from "@ant-design/icons";
 import { api, streamRun, type PreviewStep, type RunEvent } from "./api";
 import Topology, { type Zone } from "./Topology";
@@ -75,8 +76,40 @@ export default function Editor() {
   const [runId, setRunId] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [snapshot, setSnapshot] = useState(false);
+  // 服务端保存的那一份。null = 从未保存过（此时以内置样例为基准判断是否改动）
+  const [saved, setSaved] = useState<string | null>(null);
   const stopRef = useRef<null | (() => void)>(null);
   const logRef = useRef<HTMLDivElement>(null);
+
+  const dirty = yaml !== (saved ?? SAMPLE);
+
+  // 挂载时把服务端那份读回来，覆盖内置样例。
+  // 读失败（未登录、后端不通）就保持样例，不弹错——预览时会给出更准确的报错。
+  useEffect(() => {
+    let alive = true;
+    api
+      .getSpec()
+      .then((r) => {
+        if (!alive || !r.exists || r.yaml == null) return;
+        setYaml(r.yaml);
+        setSaved(r.yaml);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const onSave = async () => {
+    setErr(null);
+    try {
+      await api.putSpec(yaml);
+      setSaved(yaml);
+      message.success("已保存");
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  };
 
   const pushLog = (l: LogLine) => {
     setLogs((prev) => {
@@ -110,10 +143,20 @@ export default function Editor() {
     setErr(null);
     setBusy(true);
     setLogs([]);
+    // 记下这一刻提交的文本：执行期间用户可能继续改编辑器，
+    // 自动保存要存的是"跑的那一份"，不是改过的新文本。
+    const sent = yaml;
     try {
-      const r = await api.apply(yaml, snapshot);
+      const r = await api.apply(sent, snapshot);
       setRunId(r.run_id);
       message.info(`已启动 ${r.run_id}`);
+
+      // 跑成功就把这份规格落盘：下次刷新页面能拿回来。
+      // 失败只提示不打断——apply 已经开始了，保存不成功不该影响它。
+      api
+        .putSpec(sent)
+        .then(() => setSaved(sent))
+        .catch((e) => message.warning(`规格未能保存：${(e as Error).message}`));
 
       const stop = streamRun(
         r.run_id,
@@ -173,7 +216,20 @@ export default function Editor() {
     <Row gutter={[16, 16]}>
       <Col xs={24} xl={10}>
         <Card
-          title="规格（lab.yaml）"
+          title={
+            <Space size={8}>
+              <span>规格（lab.yaml）</span>
+              {dirty ? (
+                <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                  未保存
+                </Tag>
+              ) : saved !== null ? (
+                <Tag color="green" style={{ marginInlineEnd: 0 }}>
+                  已保存
+                </Tag>
+              ) : null}
+            </Space>
+          }
           size="small"
           extra={
             <Space>
@@ -185,13 +241,15 @@ export default function Editor() {
                   <Switch size="small" checked={snapshot} onChange={setSnapshot} />
                 </Space>
               </Tooltip>
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                onClick={() => setYaml(SAMPLE)}
-              >
-                重置
-              </Button>
+              <Tooltip title="恢复到内置样例（不覆盖已保存的那份）">
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  onClick={() => setYaml(SAMPLE)}
+                >
+                  重置
+                </Button>
+              </Tooltip>
             </Space>
           }
         >
@@ -226,6 +284,11 @@ export default function Editor() {
             >
               取消
             </Button>
+            <Tooltip title="保存到服务端，刷新页面后自动读回">
+              <Button icon={<SaveOutlined />} onClick={onSave} disabled={!dirty}>
+                保存
+              </Button>
+            </Tooltip>
           </Space>
 
           {err && (

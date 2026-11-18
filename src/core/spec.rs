@@ -37,6 +37,10 @@ pub struct Defaults {
 }
 
 /// 一个 zone = 一个网桥 + 一组主机 + 一个上联。
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoneSpec {
@@ -47,7 +51,10 @@ pub struct ZoneSpec {
     pub v4: String,
     #[serde(default)]
     pub v6: V6Mode,
-    #[serde(default)]
+    /// 网关是否做地址转换。**默认开**——实验网的靶机要靠网关出网装包，
+    /// 默认关掉会让每份 spec 都得显式写 `nat: true`，那是反的。
+    /// 设 false 用于上游已经路由了整个网段的情形。
+    #[serde(default = "default_true")]
     pub nat: bool,
     pub bridge: Option<String>,
     pub cores: Option<u32>,
@@ -216,6 +223,8 @@ pub enum SpecError {
     BadCidr(String, String),
     #[error("zone `{0}` 主机 `{1}` 的 IP `{2}` 不在网段 `{3}` 内")]
     IpOutOfRange(String, String, String, String),
+    #[error("zone `{0}` 内主机 `{2}` 与 `{3}` 都占用 .{1}，地址冲突")]
+    DuplicateIp(String, u8, String, String),
     #[error("zone 名 `{0}` 超过 10 字符，网桥名会超出 IFNAMSIZ(15) 限制")]
     ZoneNameTooLong(String),
     #[error("vmid 冲突: {0} 被 `{1}` 和 `{2}` 同时占用")]
@@ -282,6 +291,9 @@ impl Spec {
             };
 
             let mut hosts = Vec::with_capacity(z.hosts.len());
+            // 同一 zone 内主机号必须唯一。用手里的 HashSet 而不是事后扫一遍，
+            // 是因为要能报出"谁跟谁撞了"。
+            let mut used_octets: HashMap<u8, String> = HashMap::new();
             for (host_name, h) in &z.hosts {
                 let cores = h
                     .cores
@@ -311,12 +323,53 @@ impl Spec {
                     .or_else(|| self.defaults.storage.clone())
                     .ok_or_else(|| SpecError::MissingField(zone_name.clone(), "storage".into()))?;
 
+                // 主机号：写了就校验，没写就按角色默认位往后找第一个空的。
+                // 早先的实现直接用角色默认位，**同一个 zone 里两台 server 会拿到
+                // 同一个 .20**，两台机器抢一个 IP，而 YAML 看起来完全正常。
                 let host_octet = match &h.ip {
-                    Some(s) => s
-                        .parse::<u8>()
-                        .map_err(|_| SpecError::BadCidr(zone_name.clone(), s.clone()))?,
-                    None => h.role.default_host_octet(),
+                    Some(s) => {
+                        let o: u8 = s
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|v| (1..=254).contains(v))
+                            .ok_or_else(|| {
+                                SpecError::BadCidr(zone_name.clone(), format!("ip {s}"))
+                            })? as u8;
+                        o
+                    }
+                    None => {
+                        let mut o = h.role.default_host_octet();
+                        while used_octets.contains_key(&o) {
+                            o = o.saturating_add(1);
+                            if o > 254 {
+                                return Err(SpecError::IpOutOfRange(
+                                    zone_name.clone(),
+                                    host_name.clone(),
+                                    "（无可用主机号）".into(),
+                                    z.v4.clone(),
+                                ));
+                            }
+                        }
+                        o
+                    }
                 };
+                // 0 是网络地址、255 是广播地址，都不能给主机用
+                if host_octet == 0 || host_octet == 255 {
+                    return Err(SpecError::IpOutOfRange(
+                        zone_name.clone(),
+                        host_name.clone(),
+                        format!("{v4_net}.{host_octet}"),
+                        z.v4.clone(),
+                    ));
+                }
+                if let Some(prev) = used_octets.insert(host_octet, host_name.clone()) {
+                    return Err(SpecError::DuplicateIp(
+                        zone_name.clone(),
+                        host_octet,
+                        prev,
+                        host_name.clone(),
+                    ));
+                }
                 let ipv4 = format!("{}.{}/{}", v4_net, host_octet, v4_prefix);
 
                 let qualified = format!("{}:{}", zone_name, host_name);
@@ -429,16 +482,6 @@ impl Spec {
         Ok(order)
     }
 
-    /// 列出所有被引用但未定义的 uplink（给 doctor 用）。
-    pub fn dangling_uplinks(&self) -> Vec<(String, String)> {
-        let mut v = Vec::new();
-        for (name, z) in &self.zones {
-            if z.uplink != "wan" && !self.zones.contains_key(&z.uplink) {
-                v.push((name.clone(), z.uplink.clone()));
-            }
-        }
-        v
-    }
 }
 
 fn sanitize(name: &str) -> String {
@@ -635,6 +678,68 @@ zones:
             }
             assert!(groups[0].starts_with("fd"), "{p} 必须落在 fd00::/8");
         }
+    }
+
+    #[test]
+    fn same_role_hosts_get_distinct_octets() {
+        // 回归：早先每台机器都直接用角色默认位，同 zone 的第二个 server
+        // 会拿到同一个 .20，两台机器抢一个 IP 而 YAML 看起来完全正常。
+        let y = r#"
+defaults: { cores: 2, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      s1: { role: server }
+      s2: { role: server }
+      s3: { role: server }
+"#;
+        let z = Spec::parse(y).unwrap().resolve("vmbr0").unwrap();
+        let ips: Vec<&str> = z[0].hosts.iter().map(|h| h.ipv4.as_str()).collect();
+        assert_eq!(
+            ips,
+            vec!["10.10.1.20/24", "10.10.1.21/24", "10.10.1.22/24"]
+        );
+    }
+
+    #[test]
+    fn explicit_duplicate_ip_is_rejected() {
+        let y = r#"
+defaults: { cores: 2, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      a: { role: server, ip: 30 }
+      b: { role: client, ip: 30 }
+"#;
+        let err = Spec::parse(y).unwrap().resolve("vmbr0").unwrap_err();
+        assert!(
+            matches!(err, SpecError::DuplicateIp(..)),
+            "应报地址冲突，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn nat_defaults_to_true_and_can_be_turned_off() {
+        let y = r#"
+defaults: { cores: 2, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  on:
+    uplink: wan
+    v4: 10.1.0.0/24
+    hosts: { g: { role: gateway } }
+  off:
+    uplink: on
+    v4: 10.2.0.0/24
+    nat: false
+    hosts: { g: { role: gateway } }
+"#;
+        let z = Spec::parse(y).unwrap().resolve("vmbr0").unwrap();
+        assert!(z[0].nat, "不写 nat 时默认开——否则靶机出不了网");
+        assert!(!z[1].nat, "显式 nat: false 必须生效");
     }
 
     #[test]

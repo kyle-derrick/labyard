@@ -3,14 +3,16 @@
 //! 全部是**纯函数**：给定参数返回一段 sh 脚本，脚本本身幂等（重复执行结果相同）。
 //! 这样可以在没有 PVE 的机器上把每种组合的输出快照下来做回归测试。
 
-use crate::core::plan::StepKind;
-
-/// 网关容器：转发 + NAT66 + 可选 NAT44。
+/// 网关容器：转发 + 可选 NAT（v4 与 v6 一起开关）。
+///
+/// `nat = false` 的用法：上游已经把整个网段路由过来了（宿主加了静态路由，
+/// 或 v6 拿到的是真正可分发的前缀），这时网关只做转发、不做地址转换，
+/// 内网地址在外部可见——这在"要让靶机直接从外部被访问"的实验里是必需的。
 pub fn gateway_script(
     v4_cidr: &str,
     v6_prefix: Option<&str>,
     uplink: &str,
-    nat44: bool,
+    nat: bool,
 ) -> String {
     let mut s = String::new();
     s.push_str("set -eu\n");
@@ -40,12 +42,12 @@ pub fn gateway_script(
     s.push_str("nft add table inet labyard\n");
     s.push_str("nft 'add chain inet labyard forward { type filter hook forward priority 0; policy accept; }'\n");
     s.push_str("nft 'add chain inet labyard postrouting { type nat hook postrouting priority 100; }'\n");
-    if nat44 {
+    if nat {
         s.push_str(&format!(
             "nft add rule inet labyard postrouting ip saddr {v4_cidr} oifname \"{uplink}\" masquerade\n"
         ));
     }
-    if let Some(p) = v6_prefix {
+    if let (true, Some(p)) = (nat, v6_prefix) {
         let base = p.trim_end_matches("/64").trim_end_matches(':');
         s.push_str(&format!(
             "nft add rule inet labyard postrouting ip6 saddr {base}::/64 oifname \"{uplink}\" masquerade\n"
@@ -99,30 +101,6 @@ pub fn host_script(ipv4: &str, gateway: Option<&str>, v6_prefix: Option<&str>, d
     s
 }
 
-/// 把 `Net` 步骤渲染成脚本。
-pub fn for_step(kind: &StepKind, v4_cidr: &str, uplink_iface: &str, nat44: bool) -> Option<String> {
-    match kind {
-        StepKind::Net {
-            ipv4,
-            gateway,
-            ipv6_prefix,
-            default_route,
-            ..
-        } => Some(host_script(
-            ipv4,
-            gateway.as_deref(),
-            ipv6_prefix.as_deref(),
-            *default_route,
-        )),
-        StepKind::Container { .. } => {
-            // 网关在建机阶段还没配地址，这里只返回需要的信息占位
-            let _ = (v4_cidr, uplink_iface, nat44);
-            None
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,10 +128,21 @@ mod tests {
 
     #[test]
     fn gateway_nat66_present_when_v6_on() {
-        let s = gateway_script("10.10.1.0/24", Some("fd00:1::/64"), "eth1", false);
+        // nat=false 但 v6 开着：只做 v6 NAT，不做 v4 NAT
+        let s = gateway_script("10.10.1.0/24", Some("fd00:1::/64"), "eth1", true);
         assert!(s.contains("masquerade"));
         assert!(s.contains("ip6 saddr fd00:1::/64"));
-        assert!(!s.contains("ip saddr 10.10.1.0/24 oifname"));
+        assert!(s.contains("ip saddr 10.10.1.0/24 oifname"));
+    }
+
+    #[test]
+    fn gateway_with_nat_off_does_not_masquerade() {
+        // 上游已经路由了整个网段时，网关只转发。这条如果退化成"永远 NAT"，
+        // 用户设的 `nat: false` 就变成了一个没有任何效果的字段。
+        let s = gateway_script("10.10.1.0/24", Some("fd00:1::/64"), "eth1", false);
+        assert!(!s.contains("masquerade"), "nat=false 不应有任何 masquerade");
+        assert!(s.contains("ip_forward=1"), "但转发必须打开");
+        assert!(s.contains("ip -6 addr replace fd00:1::1/64"));
     }
 
     #[test]

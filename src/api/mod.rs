@@ -22,7 +22,7 @@ use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::core::plan::{Phase, Plan};
+use crate::core::plan::Plan;
 use crate::core::runner::{Event, Runner};
 use crate::core::spec::Spec;
 use crate::db::Db;
@@ -59,7 +59,6 @@ pub struct AppState {
 pub struct RunHandle {
     pub tx: broadcast::Sender<Event>,
     pub cancel: CancellationToken,
-    pub status: Arc<Mutex<String>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -69,6 +68,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
         .route("/api/state", get(state_of_world))
+        .route("/api/spec", get(get_spec).put(put_spec))
         .route("/api/preview", post(preview))
         .route("/api/apply", post(apply))
         .route("/api/runs/{id}/events", get(run_events))
@@ -224,6 +224,82 @@ fn phase_of_key(key: &str) -> String {
     key.split(':').next().unwrap_or("unknown").to_string()
 }
 
+// ───────────────────────── 规格持久化 ─────────────────────────
+
+/// 为什么不放 SQLite：规格是一份人可读的 YAML，运维要能 `cat` 出来、能用 git 管、
+/// 能在出问题时手工改回去。放文件里这些全都免费，放 DB 里就要多写一套导入导出。
+/// `paths.specs` 在配置里本来就有，之前只建了目录没用上。
+const SPEC_MAX_BYTES: usize = 512 * 1024;
+
+fn spec_file(cfg: &Config) -> std::path::PathBuf {
+    cfg.paths.specs.join("lab.yaml")
+}
+
+#[derive(Deserialize)]
+struct SpecBody {
+    yaml: String,
+}
+
+async fn get_spec(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    match tokio::fs::read_to_string(spec_file(&state.cfg)).await {
+        // 原样返回，不在这里解析：文件可能被手工改坏，让前端拿到它自己报错，
+        // 比返回一个空规格让用户以为"东西没了"要好。
+        Ok(yaml) => Json(serde_json::json!({ "yaml": yaml, "exists": true })).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Json(serde_json::json!({ "yaml": null, "exists": false })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("读取规格失败: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn put_spec(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SpecBody>,
+) -> Response {
+    require_auth!(state, headers);
+    // 先卡大小再解析：Spec::parse 会为整份文本建对象，超大输入不该进解析器
+    if body.yaml.len() > SPEC_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!("规格超过 {} KB 上限", SPEC_MAX_BYTES / 1024)
+            })),
+        )
+            .into_response();
+    }
+    // 存进去的必须是能 resolve 的：语法错、字段拼错、uplink 指向不存在的 zone，
+    // 都在这里挡住，而不是等 apply 时才发现。
+    if let Err(e) = Spec::parse(&body.yaml).and_then(|s| s.resolve(&state.cfg.pve.wan_bridge)) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() })))
+            .into_response();
+    }
+    let p = spec_file(&state.cfg);
+    // 原子写：同目录 tmp + rename。直接写会在掉电/被杀时留下半份 YAML，
+    // 而半份 YAML 比"没有 YAML"更糟——它解析失败，但看起来像用户自己写错了。
+    let tmp = p.with_extension("yaml.tmp");
+    if let Err(e) = tokio::fs::write(&tmp, body.yaml.as_bytes()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("写临时文件失败: {e}") })),
+        )
+            .into_response();
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &p).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("替换规格失败: {e}") })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
 // ───────────────────────── 预览 / 执行 ─────────────────────────
 
 #[derive(Deserialize)]
@@ -311,6 +387,20 @@ struct ApplyResp {
 async fn apply(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<SpecReq>) -> Response {
     require_auth!(state, headers);
 
+    // 先卡版本再规划：设计里写的是"不做 8.x 兼容层"，那就必须在动手之前拒绝，
+    // 而不是让用户在 PVE 8 上跑到一半才撞见字段不认识。
+    // `doctor` 也会报这一条，但 doctor 是给人看的，这里才是真正的闸。
+    {
+        let cancel = CancellationToken::new();
+        if let Err(e) = state.pve.require_pve9(&cancel).await {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
     let (zones, plan) = match build_plan(&state, &req.yaml, req.snapshot) {
         Ok(v) => v,
         Err(e) => {
@@ -327,13 +417,11 @@ async fn apply(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req)
 
     let (btx, _) = broadcast::channel::<Event>(1024);
     let cancel = CancellationToken::new();
-    let status = Arc::new(Mutex::new("running".to_string()));
     state.runs.lock().await.insert(
         run_id.clone(),
         RunHandle {
             tx: btx.clone(),
             cancel: cancel.clone(),
-            status: status.clone(),
         },
     );
 
@@ -366,7 +454,6 @@ async fn apply(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req)
             "failed"
         };
         db.finish_run(&rid, final_status);
-        *status.lock().await = final_status.to_string();
         let _ = btx.send(Event::Finished {
             key: format!("run:{rid}"),
             code: Some(if summary.ok() { 0 } else { 1 }),
@@ -465,8 +552,22 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         }),
     }
 
-    match state.pve.bridges(&cancel).await {
-        Ok(bs) => {
+    // 节点名写错是最难自查的一类失败：所有 `pct` 命令都还"能跑"，
+    // 但会拿不到任何资源。这里直接对着 `/nodes` 核对，把名字列出来。
+    match state.pve.nodes(&cancel).await {
+        Ok(ns) => items.push(DoctorItem {
+            name: "节点名".into(),
+            ok: ns.iter().any(|n| n == &state.cfg.pve.node),
+            detail: format!("配置 `{}`；现有: {}", state.cfg.pve.node, ns.join(", ")),
+        }),
+        Err(e) => items.push(DoctorItem {
+            name: "节点名".into(),
+            ok: false,
+            detail: format!("无法读取: {e}"),
+        }),
+    }
+
+    match state.pve.bridges(&cancel).await {        Ok(bs) => {
             let names: Vec<&str> = bs.iter().map(|b| b.iface.as_str()).collect();
             items.push(DoctorItem {
                 name: "网桥".into(),
@@ -500,6 +601,37 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         }
         Err(e) => items.push(DoctorItem {
             name: "存储".into(),
+            ok: false,
+            detail: e.to_string(),
+        }),
+    }
+
+    // 快照能力单独列一条：厚 LVM 的 `pct snapshot` 会失败，而"执行时打快照"
+    // 是可选开关——用户勾了才发现不行，比事先知道要糟得多。
+    match state.pve.storages(&cancel).await {
+        Ok(ss) => {
+            let yes: Vec<&str> = ss
+                .iter()
+                .filter(|s| s.supports_snapshot())
+                .map(|s| s.storage.as_str())
+                .collect();
+            let no: Vec<&str> = ss
+                .iter()
+                .filter(|s| !s.supports_snapshot())
+                .map(|s| s.storage.as_str())
+                .collect();
+            items.push(DoctorItem {
+                name: "快照能力".into(),
+                ok: !yes.is_empty(),
+                detail: format!(
+                    "可快照: {}；不支持: {}",
+                    if yes.is_empty() { "无".into() } else { yes.join(", ") },
+                    if no.is_empty() { "无".into() } else { no.join(", ") }
+                ),
+            });
+        }
+        Err(e) => items.push(DoctorItem {
+            name: "快照能力".into(),
             ok: false,
             detail: e.to_string(),
         }),
@@ -540,6 +672,10 @@ async fn openapi() -> Json<serde_json::Value> {
             "/api/health": {"get": {"summary": "健康检查"}},
             "/api/auth/login": {"post": {"summary": "登录"}},
             "/api/state": {"get": {"summary": "已登记步骤的状态"}},
+            "/api/spec": {
+                "get": {"summary": "读取已保存的规格"},
+                "put": {"summary": "保存规格（先校验，原子写）"}
+            },
             "/api/preview": {"post": {"summary": "解析 spec 并返回计划"}},
             "/api/apply": {"post": {"summary": "执行（返回 run_id）"}},
             "/api/runs/{id}/events": {"get": {"summary": "SSE 日志流"}},

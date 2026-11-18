@@ -10,7 +10,7 @@
 //! **读的纪律**：状态一律走 `GET /cluster/resources?type=vm` 一次取全，
 //! 绝不在循环里 `pct config` —— `/etc/pve` 是单线程 FUSE，N+1 次读会把整个节点拖慢。
 
-use crate::core::runner::{CommandSpec, Output, Runner};
+use crate::core::runner::{CommandSpec, Output, RunError, Runner};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +19,6 @@ use tokio_util::sync::CancellationToken;
 pub struct Pve {
     runner: Arc<dyn Runner>,
     pub node: String,
-    /// 外部网桥（wan 的落点），来自 config.toml
-    pub wan_bridge: String,
 }
 
 /// `pvesh get /version`
@@ -145,16 +143,14 @@ pub enum PveError {
     },
     #[error("PVE 版本 {0} 低于要求（9.0），拒绝继续")]
     TooOld(String),
-    #[error("{0}")]
-    Other(String),
 }
 
 impl Pve {
-    pub fn new(runner: Arc<dyn Runner>, node: impl Into<String>, wan_bridge: impl Into<String>) -> Self {
+    /// `wan_bridge` 不在这里存一份：它只属于 `config.pve`，两处并存就是两个真相源。
+    pub fn new(runner: Arc<dyn Runner>, node: impl Into<String>) -> Self {
         Self {
             runner,
             node: node.into(),
-            wan_bridge: wan_bridge.into(),
         }
     }
 
@@ -181,14 +177,38 @@ impl Pve {
         })
     }
 
-    /// 跑一条写命令，返回完整输出（调用方自己判断退出码）。
+    /// 跑一条会改变状态的命令。**非零退出码一律当失败。**
+    ///
+    /// 这是整个命令层唯一一处能保证"命令真的成功了"的地方。之前这里把
+    /// `Output` 原样返回、指望调用方自己看 `code`，但实际上没有一个调用方看——
+    /// 结果 `pct create` 因存储满失败时会被记成成功，run 报"全部完成"，
+    /// 而容器根本不存在。这类错误在真机上极难排查，所以必须在这里拦死。
+    ///
+    /// 需要容忍非零的调用（探测类）留在 `get_json` 和上面的只读方法里，
+    /// 它们本来就有各自的语义。
     async fn cmd(
         &self,
         key: &str,
         spec: CommandSpec,
         cancel: &CancellationToken,
     ) -> Result<Output, PveError> {
-        Ok(self.runner.run(key, &spec, None, cancel, true).await?)
+        let display = spec.display();
+        let out = self.runner.run(key, &spec, None, cancel, true).await?;
+        match out.code {
+            Some(0) => Ok(out),
+            Some(code) => Err(RunError::NonZero {
+                cmd: display,
+                code: Some(code),
+            }
+            .into()),
+            // 没有退出码 = 被信号杀掉。runner 里的超时/取消已经转成错误了，
+            // 走到这里说明是别的信号，同样不能当成功。
+            None => Err(RunError::NonZero {
+                cmd: display,
+                code: None,
+            }
+            .into()),
+        }
     }
 
     // ───────────────────────── 只读探测 ─────────────────────────
@@ -271,15 +291,6 @@ impl Pve {
     }
 
     /// 单个 CT 的配置。**只在需要细节时调用，且结果应缓存 10 秒**。
-    pub async fn ct_config(
-        &self,
-        vmid: u32,
-        cancel: &CancellationToken,
-    ) -> Result<serde_json::Value, PveError> {
-        self.get_json(&format!("/nodes/{}/lxc/{vmid}/config", self.node), &[], cancel)
-            .await
-    }
-
     // ───────────────────────── 写操作 ─────────────────────────
 
     /// 建桥：`ip link add ... type bridge` + 持久化到 `/etc/network/interfaces`。
@@ -353,6 +364,13 @@ fi
     }
 
     /// 建 CT。已存在则改为 `pct set` 更新配置（幂等的关键）。
+    ///
+    /// 三件事必须在这里做掉，否则后面的步骤全是空转：
+    /// 1. `--start 1`——`pct create` 默认建出来是**停的**，而下一步就是 `pct exec`
+    /// 2. 网关要有第二块网卡 `eth1` 上联，否则网关脚本里的 `ip link set eth1 up` 直接失败
+    /// 3. 内网口用 `ip=manual`——内网桥上没有 DHCP 服务，写 `ip=dhcp` 只会白白等超时，
+    ///    地址由后面的 net 步骤静态配
+    #[allow(clippy::too_many_arguments)]
     pub async fn ensure_ct(
         &self,
         vmid: u32,
@@ -363,62 +381,86 @@ fi
         storage: &str,
         template_vol: &str,
         bridge: &str,
+        uplink_bridge: Option<&str>,
         password: Option<&str>,
         ssh_keys: &[String],
         cancel: &CancellationToken,
     ) -> Result<(), PveError> {
-        let exists = self.cluster_vms(cancel).await?.iter().any(|r| {
-            r.is_lxc() && r.vmid_parsed() == Some(vmid)
-        });
+        let existing = self
+            .cluster_vms(cancel)
+            .await?
+            .into_iter()
+            .find(|r| r.is_lxc() && r.vmid_parsed() == Some(vmid));
 
-        if !exists {
-            let mut args: Vec<String> = vec![
-                "create".into(),
-                vmid.to_string(),
-                template_vol.into(),
-                "--hostname".into(),
-                hostname.into(),
-                "--cores".into(),
-                cores.to_string(),
-                "--memory".into(),
-                memory.to_string(),
-                "--rootfs".into(),
-                format!("{storage}:{disk}"),
-                "--net0".into(),
-                format!("name=eth0,bridge={bridge},ip=dhcp,type=veth"),
-                "--unprivileged".into(),
-                "1".into(),
-                "--features".into(),
-                "nesting=1".into(),
-                "--onboot".into(),
-                "1".into(),
-            ];
-            if let Some(p) = password {
-                args.push("--password".into());
-                args.push(p.into());
+        match existing {
+            None => {
+                let mut args: Vec<String> = vec![
+                    "create".into(),
+                    vmid.to_string(),
+                    template_vol.into(),
+                    "--hostname".into(),
+                    hostname.into(),
+                    "--cores".into(),
+                    cores.to_string(),
+                    "--memory".into(),
+                    memory.to_string(),
+                    "--rootfs".into(),
+                    format!("{storage}:{disk}"),
+                    "--net0".into(),
+                    format!("name=eth0,bridge={bridge},ip=manual,type=veth"),
+                    "--unprivileged".into(),
+                    "1".into(),
+                    "--features".into(),
+                    "nesting=1".into(),
+                    "--onboot".into(),
+                    "1".into(),
+                    "--start".into(),
+                    "1".into(),
+                ];
+                if let Some(up) = uplink_bridge {
+                    args.push("--net1".into());
+                    // 上联网卡走 DHCP：wan 桥通常有 DHCP，或用户自己配好再改
+                    args.push(format!("name=eth1,bridge={up},ip=dhcp,type=veth"));
+                }
+                if let Some(p) = password {
+                    args.push("--password".into());
+                    args.push(p.into());
+                }
+                if !ssh_keys.is_empty() {
+                    args.push("--ssh-public-keys".into());
+                    args.push(ssh_keys.join("\n"));
+                }
+                self.cmd(
+                    "ct-create",
+                    CommandSpec::new("pct", args).with_timeout(Duration::from_secs(600)),
+                    cancel,
+                )
+                .await?;
             }
-            if !ssh_keys.is_empty() {
-                args.push("--ssh-public-keys".into());
-                args.push(ssh_keys.join("\n"));
+            Some(row) => {
+                // 已存在：只更新会漂移的字段，一条命令合并，避免 N 次 pct set 打 pmxcfs
+                let mut args: Vec<String> = vec!["set".into(), vmid.to_string()];
+                args.extend(["--cores".into(), cores.to_string()]);
+                args.extend(["--memory".into(), memory.to_string()]);
+                args.extend(["--hostname".into(), hostname.into()]);
+                if let Some(up) = uplink_bridge {
+                    // 老容器可能是上一版建的，只有一块网卡——补上而不是重建
+                    args.push("--net1".into());
+                    args.push(format!("name=eth1,bridge={up},ip=dhcp,type=veth"));
+                }
+                self.cmd(
+                    "ct-update",
+                    CommandSpec::new("pct", args).with_timeout(Duration::from_secs(120)),
+                    cancel,
+                )
+                .await?;
+
+                // 停着的容器必须拉起来。`--start` 只对新建生效，
+                // 手工 `pct stop` 过的容器如果这里不管，后面 `pct exec` 会全部失败。
+                if row.status.as_deref() != Some("running") {
+                    self.ct_action(vmid, "start", cancel).await?;
+                }
             }
-            self.cmd(
-                "ct-create",
-                CommandSpec::new("pct", args).with_timeout(Duration::from_secs(600)),
-                cancel,
-            )
-            .await?;
-        } else {
-            // 已存在：只更新会漂移的字段，一条命令合并，避免 N 次 pct set 打 pmxcfs
-            let mut args: Vec<String> = vec!["set".into(), vmid.to_string()];
-            args.extend(["--cores".into(), cores.to_string()]);
-            args.extend(["--memory".into(), memory.to_string()]);
-            args.extend(["--hostname".into(), hostname.into()]);
-            self.cmd(
-                "ct-update",
-                CommandSpec::new("pct", args).with_timeout(Duration::from_secs(120)),
-                cancel,
-            )
-            .await?;
         }
         Ok(())
     }

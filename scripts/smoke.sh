@@ -102,6 +102,38 @@ r=$(curl -s --noproxy '*' -X POST "http://127.0.0.1:$PORT/api/preview" \
   -H 'Content-Type: application/json' -d '{"yaml":"zones: [ }"}')
 check "YAML 语法错误报错" 'error' "$r"
 
+echo "== 规格持久化 =="
+r=$(curl -s --noproxy '*' "http://127.0.0.1:$PORT/api/spec")
+check "首次读取：没有规格" '"exists":false' "$r"
+
+r=$(curl -s --noproxy '*' -X PUT "http://127.0.0.1:$PORT/api/spec" \
+  -H 'Content-Type: application/json' -d "{\"yaml\":$YAML2}")
+check "保存合法规格成功" '"ok":true' "$r"
+
+same=$(curl -s --noproxy '*' "http://127.0.0.1:$PORT/api/spec" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("SAME" if d.get("yaml")==open("examples/nested.yaml").read() else "DIFF")' 2>&1)
+check "读回的内容与写入完全一致" 'SAME' "$same"
+
+# 校验必须在落盘之前：非法规格被拒后，磁盘上旧的合法规格不能被破坏
+code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$PORT/api/spec" \
+  -H 'Content-Type: application/json' \
+  -d '{"yaml":"zones: {a: {uplink: nope, v4: 10.1.0.0/24, hosts: {g: {role: gateway}}}}"}')
+check "非法规格返回 400" '400' "$code"
+
+still=$(curl -s --noproxy '*' "http://127.0.0.1:$PORT/api/spec" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("SAME" if d.get("yaml")==open("examples/nested.yaml").read() else "DIFF")' 2>&1)
+check "被拒的写入没有覆盖旧规格" 'SAME' "$still"
+
+echo "== 执行前置：没有 PVE 必须拒绝，而不是跑到一半 ==="
+apply_body=$(curl -s -o /tmp/lab-apply.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/apply" \
+  -H 'Content-Type: application/json' -d "{\"yaml\":$YAML}")
+check "apply 返回 412" '412' "$apply_body"
+check "错误里说明了原因" '命令失败\|PVE\|版本' "$(cat /tmp/lab-apply.json)"
+
 echo "== 状态 =="
 r=$(curl -s --noproxy '*' "http://127.0.0.1:$PORT/api/state")
 check "state 返回 steps 数组" '"steps"' "$r"

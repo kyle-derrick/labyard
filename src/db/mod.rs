@@ -144,6 +144,11 @@ impl Db {
     }
 
     /// 清掉某个 key 的记录（销毁资源后调用，否则下次 apply 会以为已完成）。
+    ///
+    /// 只有测试在用：真正的 destroy 路径还没实现（README「未实现」里有列）。
+    /// 标 `cfg(test)` 是为了让"没有调用方"这件事在编译期就说清楚，
+    /// 而不是靠一个 `#[allow(dead_code)]` 掩盖过去。
+    #[cfg(test)]
     pub fn forget_step(&self, key: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM step_state WHERE key = ?1", [key]);
@@ -184,7 +189,8 @@ impl Db {
         candidate
     }
 
-    /// 删除资源时一并释放 vmid（destroy 才调）。
+    /// 删除资源时一并释放 vmid（destroy 才调）。同 `forget_step`，仅测试使用。
+    #[cfg(test)]
     pub fn release_vmid(&self, zone: &str, host: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
@@ -220,6 +226,8 @@ impl Db {
         );
     }
 
+    /// 仅测试使用（用于断言 `mark_interrupted` 的效果）。
+    #[cfg(test)]
     pub fn run_status(&self, id: &str) -> Option<String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT status FROM runs WHERE id = ?1", [id], |r| r.get(0))

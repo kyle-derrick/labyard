@@ -459,6 +459,17 @@ audit(id, ts, user, action, target, detail_json)
 
 **`enabled: false` 必须显式 drop，不能只是"不配地址"。** 不配的话，主机一条 link-local、或者自己 `ip -6 addr add` 一个 ULA，就能绕开 v4 防火墙直连——这是实验室里最常见的"我明明封了但它通了"。`inet` 表同时管 v4 和 v6，漏掉一边等于没封。
 
+#### 5.8.1 `nat` 开关（每个 zone 一个）
+
+`nat: true`（默认）时网关对本站内网做地址转换，v4 与 v6 一起开：`ip saddr $LAB4 oifname $WAN masquerade` + `ip6 saddr $LAB6 oifname $WAN masquerade`。
+
+`nat: false` 只做转发、不做转换——用于上游已经把整个网段路由过来的情形（宿主加了静态路由，或 v6 拿到的是真正可分发的前缀）。这时内网地址在外部可见，靶机可以直接从实验网外部被访问，这是"要抓外部回连"的实验必需的。
+
+**默认值必须是 `true`。** 第一版实现里这个字段被解析、被展示在预览里，却从来没传到执行器——`gateway_script` 的 `nat44` 参数是硬编码的 `true`。也就是说 `nat: false` 是一个纯装饰字段，写了没反应。现在的做法是：`ResolvedZone.nat` → `StepKind::Net { nat }` → `gateway_script(..., nat)`，三步都带值，并且有回归测试盯着"`nat: false` 时脚本里不能出现任何 `masquerade`"。
+
+同时改掉的默认值：`nat` 原先 serde 默认 `false`，与"靶机要靠网关出网装包"直接矛盾（不写 `nat` 的实验网会全部断网）。现在默认 `true`。
+
+
 地址规划：
 
 - `ula_prefix` 安装时随机生成（`fd` + 40 bit 随机），不用固定的 `fd00::/8` 子段，避免两个 lab 撞车
@@ -931,6 +942,22 @@ Rust 默认使用系统 malloc（Linux 上是 glibc 的 ptmalloc2）。它在**�
 
 **如果哪天要换**（比如常驻集合涨到几百 MB，或多节点 agent 铺开），判断依据不是"jemalloc 更有名"，而是重跑 `bench/alloc/` 看 churn③是否还平。**换分配器是一行 `#[global_allocator]`，但要不要换必须由数字决定。**
 
+#### 7.5.3 实现期查出来的真实缺陷（记录，不删）
+
+这些都**不是设计问题，是接线问题**——字段写了、解析了、展示了，但没接到执行路径上。它们有一个共同特征：**单测全绿、预览正常、真机必炸**。之所以能被查出来，是因为把编译器的 dead-code 警告当成了必读项，而不是噪音。
+
+| 缺陷 | 表现 | 根因 | 现在 |
+|---|---|---|---|
+| **退出码没人看** | `pct create` 因存储满失败，run 报"全部完成"，容器不存在 | `Pve::cmd` 原样返回 `Output`，注释写"调用方自己判断"，但**没有任何调用方判断** | `cmd` 在非零/被信号杀时直接返回 `RunError::NonZero`；这是命令层唯一能保证"真的成功了"的位置 |
+| **容器建完是停着的** | 下一步 `pct exec` 全部失败 | `pct create` 不带 `--start` | 带 `--start 1`；已存在但停着的容器补一次 `pct start` |
+| **网关只有一块网卡** | 网关脚本 `ip link set eth1 up` 直接失败 | `ensure_ct` 从不建 `net1`，而脚本通篇配 `eth1` | `Container` 步骤带 `uplink_bridge`（仅网关），建机时加 `--net1`；老容器用 `pct set --net1` 补 |
+| **`nat` 字段是装饰品** | 设 `nat: false` 仍然全程 NAT | 参数没传到 `gateway_script`，`nat44` 硬编码 `true` | 见 §5.8.1，默认值同时改成 `true` |
+| **`password` 字段是装饰品** | 设了密码，容器里登不进去 | `ensure_ct(..., None, ...)` 写死 | 进 `Container` 步骤并透传 |
+| **同角色主机撞 IP** | 一个 zone 里两台 `server` 都是 `.20`，后建的覆盖前面的 | 直接用角色的默认主机位，没有占用表 | 按角色默认位往后找第一个空位；显式重复直接报 `DuplicateIp` |
+| **`specs` 目录建了从没用** | 刷新页面 YAML 全丢 | 前端只存在 `useState` 里 | `GET/PUT /api/spec`，原子写，校验后才落盘 |
+
+教训只有一条：**"字段存在"和"字段生效"是两件不同的事**，而类型系统不区分它们。所以 `deny_unknown_fields` 拦住的只是拼写错误，拦不住"写了但没人读"。
+
 ### 7.6 资源峰值与限流
 
 §7.5 说的是"常驻别浪费"，真正会出事故的是**峰值**。这一节只谈峰值。
@@ -1142,6 +1169,16 @@ POST   /api/zones/{z}/snapshot            {name}
 ```
 
 `/api/topology` 是前端画图的唯一数据源，返回的是**已解析的图**（节点 + 边），不是原始 YAML。这样前端不需要懂 `uplink: main` 是什么语义——它只负责画。解析逻辑留在 core 一处。
+
+> **实现状态（2026-11）——这张表是设计稿，不是交付清单。** 上面这份 API 面里，当前版本只实现了核心闭环：
+>
+> | 已实现 | `GET /api/health`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me`、`GET /api/state`、`GET/PUT /api/spec`（规格持久化）、`POST /api/preview`、`POST /api/apply`、`GET /api/runs/{id}/events`（SSE）、`POST /api/runs/{id}/cancel`、`GET /api/doctor`、`GET /api/openapi.json` |
+> |---|---|
+> | **未实现** | zone 的多份管理与 CRUD（当前只有一份 `lab.yaml`）、`/api/topology`、`/api/runs` 列表与 `retry`、`/hosts` 与 `power`、`gateway/egress`、`gateway/pub`、`gateway/vpn`、`/mirrors` 的 CRUD、`/snapshot`、destroy |
+>
+> 未实现的这些**不是遗漏，是刻意的边界**：它们全部依赖真机行为（`pct exec` 进容器调 `labgw` 的输出格式、ttyd 的 header 信任、VPN 的密钥分发），在没有 PVE 9 可测的条件下写出来只能是猜。核心闭环（写 YAML → 看计划 → 幂等执行 → 实时日志）是唯一能自证的部分，所以先把它做扎实。
+>
+> **规格持久化**落在 `paths.specs/lab.yaml`，不是 SQLite：运维要能 `cat`、能进 git、能手工改回去。写入走"先 parse + resolve 校验，再 tmp + rename 原子替换"——非法 YAML 一律 400 且不碰旧文件。刷新页面从服务端读回，改过未保存时标题旁有 `未保存` 标签。
 
 ### 8.4 认证与暴露面
 

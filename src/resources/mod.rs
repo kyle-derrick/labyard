@@ -376,7 +376,9 @@ async fn apply_step(
             template,
             storage,
             bridge,
+            uplink_bridge,
             ssh_keys,
+            password,
             ..
         } => {
             // 模板的完整 volid 从快照里取（probe 阶段已经查过）
@@ -394,7 +396,8 @@ async fn apply_step(
                 storage,
                 vol,
                 bridge,
-                None,
+                uplink_bridge.as_deref(),
+                password.as_deref(),
                 ssh_keys,
                 cancel,
             )
@@ -409,10 +412,11 @@ async fn apply_step(
             ipv6_prefix,
             is_gateway,
             default_route,
+            nat,
             ..
         } => {
             let script = if *is_gateway {
-                net::gateway_script(&zone_cidr_from(ipv4), ipv6_prefix.as_deref(), "eth1", true)
+                net::gateway_script(&zone_cidr_from(ipv4), ipv6_prefix.as_deref(), "eth1", *nat)
             } else {
                 net::host_script(ipv4, gateway.as_deref(), ipv6_prefix.as_deref(), *default_route)
             };

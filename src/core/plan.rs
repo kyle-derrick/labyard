@@ -25,19 +25,6 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// 并发闸用的权重：建容器最重，建桥最轻。
-    pub fn weight(self) -> u8 {
-        match self {
-            Phase::Bridge => 1,
-            Phase::Template => 3,
-            Phase::Container => 3,
-            Phase::Net => 1,
-            Phase::Bootstrap => 2,
-            Phase::Mirror => 1,
-            Phase::Snapshot => 2,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Phase::Bridge => "bridge",
@@ -77,10 +64,14 @@ pub enum StepKind {
         node: Option<String>,
         /// 接入桥（建机时就绑，避免先建后改）
         bridge: String,
+        /// 只有网关有第二块网卡（上联）。没有它，网关脚本配 eth1 会直接失败。
+        uplink_bridge: Option<String>,
         ipv4: String,
         gateway: Option<String>,
         dns: Vec<String>,
         ssh_keys: Vec<String>,
+        /// 建机时的 root 密码；不写就用 PVE 默认（无密码 + SSH key）
+        password: Option<String>,
         hostname: String,
     },
     Net {
@@ -94,6 +85,9 @@ pub enum StepKind {
         is_gateway: bool,
         /// 是否需要默认路由。网关与分析机需要（要出网装包），靶机不要
         default_route: bool,
+        /// 网关是否做地址转换（来自 zone 的 `nat`）。只对网关有意义，
+        /// 非网关恒为 false——写在步骤里是为了让执行器不必回头查 spec。
+        nat: bool,
     },
     Bootstrap {
         zone: String,
@@ -215,10 +209,16 @@ impl Plan {
                     storage: h.storage.clone(),
                     node: h.node.clone(),
                     bridge: z.bridge.clone(),
+                    uplink_bridge: if h.role == crate::core::spec::Role::Gateway {
+                        z.uplink_bridge.clone()
+                    } else {
+                        None
+                    },
                     ipv4: h.ipv4.clone(),
                     gateway,
                     dns: h.dns.clone(),
                     ssh_keys: h.ssh_keys.clone(),
+                    password: h.password.clone(),
                     hostname: format!("{}-{}", sanitize(&z.name), sanitize(&h.name)),
                 };
                 steps.push(Step {
@@ -259,6 +259,7 @@ impl Plan {
                     ipv6_prefix: h.ipv6_prefix.clone(),
                     is_gateway: is_gw,
                     default_route: wants_route,
+                    nat: is_gw && z.nat,
                 };
                 steps.push(Step {
                     key: format!("net:{}:{}", z.name, h.name),
@@ -493,6 +494,28 @@ zones:
         assert_eq!(get("analysis"), (false, true), "分析机不是网关，但要装包");
         assert_eq!(get("server1"), (false, false), "靶机不要默认路由");
         assert_eq!(get("client1"), (false, false), "靶机不要默认路由");
+    }
+
+    #[test]
+    fn nat_flag_reaches_the_net_step() {
+        // 只有网关会带 nat；非网关即使 zone 写了 nat 也不该做地址转换。
+        // 早先这个字段根本没传到执行器，`nat: false` 是个纯装饰字段。
+        let p = build(Y);
+        for s in &p.steps {
+            if let StepKind::Net {
+                host,
+                is_gateway,
+                nat,
+                ..
+            } = &s.kind
+            {
+                if *is_gateway {
+                    assert!(*nat, "网关 `{host}` 应带 nat（Y 里没关）");
+                } else {
+                    assert!(!*nat, "非网关 `{host}` 不该带 nat");
+                }
+            }
+        }
     }
 
     #[test]
