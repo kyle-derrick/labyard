@@ -12,19 +12,21 @@
 
 四句话：
 
-1. **Web 是唯一的产品界面**。所有需要"选"的东西（存储、模板、网段、凭据、网卡）都在网页上用下拉和表单完成，没有等价 CLI。理由很实际：PVE 里可选的存储、模板、网卡是**运行时才知道的**，写进命令行就是一堆 `--storage local-lvm --template debian-13-standard_13.2-1_amd64.tar.zst`，还容易写错版本号。
+1. **Web 是主界面，YAML 是真相源**。规格文件（`paths.specs/*.yaml`）是唯一权威状态，网页提供的是"编辑 YAML → 预览计划 → 应用 → 看拓扑/主机/日志"，而不是一层把 YAML 藏起来的下拉表单。理由：写进命令行的东西是一堆 `--storage local-lvm --template debian-13-standard_13.2-1_amd64.tar.zst`，容易写错版本号；而把同样的参数做成一堆下拉框，只会让"网页能表达什么"和"YAML 能表达什么"永久性地不一致。文件能 `cat`、能进 git、能手改回去，这是运维真正需要的东西。
 2. **但核心必须是库，不是网页的一部分**。`src/core` 不 import `axum`，Web 只是它的一个调用者。这样 E2E 测试可以驱动引擎（`labyard apply -f x.yaml --yes`），却不需要维护第二套用户界面。
-3. **全新实现，但继承经验**。旧目录（`lab-net/` 等）全部废弃，不进依赖链；`assets/gateway/` 按旧实现的行为清单重写。旧代码里踩过的六个坑（空 set、0 字节密钥、`enabled-runtime`、tun 必须 bind mount、veth 名漂移、reset 清状态）直接变成回归测试项——这些比代码值钱。
+3. **全新实现，但继承经验**。旧目录（`lab-net/` 等）全部废弃，不进依赖链。旧实现里踩过的六个坑（空 set、0 字节密钥、`enabled-runtime`、tun 必须 bind mount、veth 名漂移、reset 清状态）直接变成回归测试项——这些比代码值钱。新实现连"搬运旧脚本"这一步都省了：网关策略与 VPN 是由 Rust 按规格**生成** nft 规则与 shell 脚本，再作为开机单元落进容器（§8.6.1、§8.6.6），仓库里不再有 `assets/gateway/` 这种待搬运的脚本目录。
 4. **幂等的单位是"步骤 + 输入哈希"，不是"跑没跑过"**。每次都先 probe 实际状态、再 diff、再 apply；配置没变就 skip，脚本改了哈希变了就重跑。这是"更新"和"重复执行"能同时成立的唯一办法。
 
-**关于"要不要 CLI"**，我的取舍是：**不做操作型 CLI，只留三条运维命令**——
+**关于"要不要 CLI"**，我的取舍是：**不做操作型 CLI，只留四条运维命令**——
 
 | 命令 | 用途 | 为什么不能砍 |
 |---|---|---|
 | `labyard serve` | 起服务（systemd 调它） | 服务入口 |
 | `labyard doctor` | 打印环境探测结果（PVE 版本/存储能力/tun/桥/依赖） | 出问题时唯一能贴给别人的东西；Web 挂了它还活着 |
 | `labyard apply -f <file> --yes` | 非交互执行一份 spec | **给自动化测试用**，不是给用户用 |
+| `labyard destroy -f <file> --zone <z>` | 删掉一个 zone 的全部资源，不可逆 | 拆环境的最后手段；要求显式传 zone 名，和 Web 端的二次确认同源 |
 
+`serve` 另有 `--port` / `--concurrency`，`apply` 另有 `--dry-run` / `--snapshot` / `--concurrency`。
 除此之外没有任何 `labyard zone create` / `host add` 之类的子命令。两套界面维护同一套语义，成本远大于收益，而且必然有一天会不一致。
 
 ---
@@ -37,12 +39,12 @@
 
 | 旧实现 | 教训 | 在 labyard 里的位置 |
 |---|---|---|
-| `labgw` 的 named set 端口闸 | 空 set 让规则永不匹配，端口"看起来是关的"，排查方向全错 | 端口开关仍用 set；`doctor` 校验 set 非空 |
-| `labvpn` 的 0 字节 `server.key` | `wg genkey > f` 在 `wg` 缺失时留下空文件，之后 `[ -f ]` 判定存在、跳过重建 | 所有密钥生成走 `mktemp` → `mv` → `[ -s ]` |
-| `openvpn@server` 模板单元 | `is-enabled` 返回 `enabled-runtime` 且 exit 0，"据此判断已启用"是错的 | 只认持久化 wants 链接或运行态，不认 `is-enabled` 退出码 |
-| 无特权 LXC 的 tun | 容器内 `mknod` 必然 EPERM；必须 bind mount + `cgroup2.devices.allow`，且 Stop→Start 才重新读 config | 建网关时直接写 `/etc/pve/lxc/<id>.conf` 两行 |
-| `labmirror` 硬编码 DST veth | analysis 重建后 veth 名变，规则静默失效 | 每次 apply 重算，且按 mirr 桥探测 |
-| `labgw reset` 清空 set | 重置后出网/映射全丢，需要手工恢复 | 状态恢复做成独立步骤，reset 后自动 replay |
+| `labgw` 的 named set 端口闸 | 空 set 让规则永不匹配，端口"看起来是关的"，排查方向全错 | 新实现**不用 named set**：端口映射直接展开成 `tcp dport { 8080, 9090 }`，一条映射都没有时整行不生成。没有空集合，也就没有空集合的坑 |
+| `labvpn` 的 0 字节 `server.key` | `wg genkey > f` 在 `wg` 缺失时留下空文件，之后 `[ -f ]` 判定存在、跳过重建 | 所有密钥判断改成 `[ -s f ]`（非空才算存在）；现存的坑做成回归测试（`gateway.rs` 里断言生成脚本含 `[ -s ... ]`） |
+| `openvpn@server` 模板单元 | `is-enabled` 返回 `enabled-runtime` 且 exit 0，"据此判断已启用"是错的 | 不再借 systemd 模板单元的语义判断状态：VPN 的开关由生成脚本自己落地（`enable --now` / `disable --now` + 删设备），平台只信容器里的实际运行态 |
+| 无特权 LXC 的 tun | 容器内 `mknod` 必然 EPERM；必须让宿主把设备交给容器，且 Stop→Start 才重新读 config | `pct set <vmid> --dev0 /dev/net/tun` 后重启容器（`pct set` 对已运行容器不会生效）；不去手写 `/etc/pve/lxc/<id>.conf`，也不依赖 PVE 的重启编排 |
+| `labmirror` 硬编码 DST veth | analysis 重建后 veth 名变，规则静默失效 | 镜像单元名是 `{zone}-{源vmid}-{目标vmid}`，每次 mirror 步骤按**当前** vmid 重算；停单元时按前缀（源端）+ 后缀（目标端）双向 glob，见 `mirror_unit_globs` |
+| `labgw reset` 清空 set | 重置后出网/映射全丢，需要手工恢复 | 不再有 `reset` 子命令。每次网关步骤**整表重建** `inet labyard`（§8.6.1），规则与规格永远一致，没有"重置后忘了恢复"这个状态 |
 
 边界说清楚：**旧目录不进新仓库的依赖链**；其中的实现可以按需搬运（同一作者、同样 Apache-2.0），但搬运前必须补齐上面的测试项，否则宁可重写。
 
@@ -54,8 +56,8 @@
 
 ### 2.1 做
 
-- 在网页上一次性建出：桥（内网 / 镜像网）、LXC（网关 / 分析 / 服务端 / 客户端）、容器内网络、基础系统配置、镜像接线
-- zone 列表、全局拓扑图、创建向导（表单驱动 + YAML 预览）、任务日志、运行时操作（出网 / 端口映射 / VPN / 镜像开关）
+- 一份 YAML 一次性建出：桥（内网 / 镜像网）、LXC（网关 / 分析 / 服务端 / 客户端）、容器内网络、基础系统配置、镜像接线
+- 多规格管理、全局拓扑图、YAML 编辑 + 计划预览、任务日志、运行时操作（出网 / 端口映射 / VPN / retire）
 - 重跑安全：已完成的跳过，改过的更新，失败的中断点续跑
 - 自由组合：`main` 上挂 `suba`、`subc`，`subb` 再挂 `suba`；每个 zone 的网关 WAN 接上一级的内网桥
 - 统一命名与地址分配（v4 + v6），分配结果持久化，重跑不重排
@@ -64,8 +66,9 @@
 
 - **不做 VM（qemu）**。只建 LXC；要 Windows / 带内核的靶机，你自己用 PVE 建，平台负责把它接进哪张桥。责任分开
 - **不装业务软件**。server 上跑 nginx、client 上装 nmap、analysis 上装 ELK，都不管（见 §6.2）
-- **不做操作型 CLI**。只有 `serve` / `doctor` / `apply` 三条命令（§0）
+- **不做操作型 CLI**。只有 `serve` / `doctor` / `apply` / `destroy` 四条命令（§0）
 - 不做多租户 SaaS、不做计费、不做镜像仓库
+- **不做自动发现**。桥上出现但规格里没声明的机器，平台不列、不管、不镜像（早期设计里的 `observed` / `unknown` 两级没有实现，见 §5.9）
 - **不做多节点编排**（首版）。集群环境只警告不阻止，但 zone 强制绑当前节点
 - 不替代 PVE 的备份 / 快照底层（只调用它）
 - 不自己实现流量镜像、VPN、防火墙（用内核 tc/nft 和 wireguard/openvpn）
@@ -83,7 +86,7 @@
                                     │ 同一进程，同一 core
                     ┌───────────────▼──────────────────────────┐
                     │ core: schema → planner → runner          │
-                    │  · SQLite: desired / observed / runs     │
+                    │  · specs/*.yaml: 期望    SQLite: 哈希/run │
                     │  · 每步 probe → diff → apply             │
                     └───┬───────────────┬──────────────┬───────┘
                         │               │              │
@@ -141,9 +144,9 @@
 
 | 层 | 存什么 | 存哪 |
 |---|---|---|
-| desired | 用户写的 `lab.yaml`（原样 + 解析后模型） | SQLite `zones.spec` + 文件 |
-| observed | 每次 probe 拿到的实际状态（CT 配置、桥成员、CT 内版本） | 内存 + `resources.last_seen` |
-| applied | 每个步骤最后一次成功时的输入哈希 | SQLite `steps` |
+| desired | 用户写的 YAML（原样，不解析后另存一份） | `paths.specs/*.yaml` |
+| observed | 每次 probe 现查的实际状态（CT 配置、桥、容器内版本） | **只在内存里**，一次 run 结束即丢——跨 run 缓存"我以为的实际状态"是 bug 温床 |
+| applied | 每个步骤最后一次成功时的输入哈希 | SQLite `step_state.input_hash` |
 
 `apply` 的流程固定四段：
 
@@ -375,12 +378,12 @@ mirrors:
 | 网关上联地址 | 从 uplink zone 的 CIDR 分配，从 `.10` 起 |
 | 其他主机 | 从 `.10` 起顺序分配（`.2`–`.9` 留给基础设施） |
 | 保留 | `.0` 网络号、`.255` 广播（/24）、`.1`（网关） |
-| 唯一性 | 按 network 唯一；不同 zone 不同网段，天然隔离 |
-| CIDR 重叠 | **全局检测**：任意两个 `inner.cidr` 不得重叠（`ipaddress.overlaps`，标准库） |
+| 唯一性 | 同一 zone 内按最后一段查重（`DuplicateIp`：两台机都占 `.20` 直接报错）；跨 zone 靠网段不同，天然隔离 |
+| CIDR 重叠 | **不检测**。两个 zone 写同一个 `10.77.0.0/24` 不会被拦——桥名不同（`lab` + zone 名），但两边路由会互相打架。这是留给人看的：网段规划错了，症状是"能 ping 通但连错机器"，比直接报错难查，所以规划时别偷懒 |
 | `mirr` / `wan` | 不参与分配（前者无 IP，后者由 DHCP 或你指定） |
-| 持久化 | `ip_allocations(network, host, ip)`，**只增不重排** |
+| 持久化 | **不持久化**。地址由 YAML 决定（写了 `ip:` 就用，没写就从 `.10` 起顺序分配），"只增不重排"是文件的性质而不是表的性质——你不动 YAML，地址就不会变 |
 
-vmid 同理：`vmid_range` 内取最小空闲，写 `vmid_allocations`。**不用 PVE 的自动分配**——它会在你删掉 1001 后把 1001 给别人，快照名、镜像口、你的笔记就全对不上了。
+vmid 同理但要落库：`vmid_base` 之上取最小空闲，写进 `vmids` 表，下次重跑优先复用。**不用 PVE 的自动分配**——它会在你删掉 1001 后把 1001 给别人，快照名、镜像口、你的笔记就全对不上了。
 
 ### 5.6 镜像接线
 
@@ -417,25 +420,35 @@ DST_IF=veth1002i1            # 落点：analysis 在 mirr 桥上的宿主侧口
 
 ### 5.7 数据库表
 
+只有六张表，而且**没有一张存"期望状态"**：
+
 ```sql
-zones(id, name UK, uplink, inner_bridge UK, inner_cidr, spec_json, created_at)
-networks(id, name UK, bridge UK, cidr, kind)            -- kind: inner | mirr | wan
-hosts(id, zone_id NULL, name UK, role, vmid UK, state)  -- analysis 的 zone_id 为 NULL
-ports(id, host_id, iface, network_id, ip, gw, ord)      -- ord 直接映射 PVE 的 net0/net1
-ip_allocations(network_id, host, ip, UK(network_id, ip))
-vmid_allocations(vmid UK, zone, host)
-mirrors(id, src_network_id, dst_host_id, instance UK, enabled)
-runs(id, zone_id NULL, status, started_at, ended_at, trigger, summary_json)
-steps(run_id, step_key, status, input_hash, exit_code, log_path, detail_json)
-users(id, name UK, pass_hash, totp_secret)
-audit(id, ts, user, action, target, detail_json)
+schema_version(version)                                   -- 迁移游标，只前进
+
+step_state(key PK, input_hash, state, message, updated_at) -- 幂等判定的全部依据
+vmids(vmid PK, zone, host, UK(zone, host))                 -- vmid 分配，重跑不重排
+runs(id PK, status, spec_name, started_at, finished_at)
+run_steps(run_id, step_key, state, message, started_at, finished_at,
+          PRIMARY KEY (run_id, step_key))
+retired(zone, host, note, retired_at, PRIMARY KEY (zone, host))  -- host='*' 表示整个 zone
 ```
 
-三个设计说明：
+三条设计说明：
 
-- **`spec_json` 是输入，`networks/hosts/ports` 是展开后的执行视图**。前者是你写的 YAML，后者的作用是"能查询、能分配、能给前端画图"。两者由 apply 同步，类似 Terraform 的 config 与 state。不要指望只留一份——只留 YAML 就没法高效查"10.3.3.11 是谁"。
-- **`ports` 表必须有 `ord`**。`eth0` 是 WAN 还是 LAN，决定了 `nftables.conf` 里的 `define WAN/LAN` 对不对。这个顺序不能靠"创建时碰巧对"，要显式存、显式校验。
-- **`hosts.zone_id` 允许为 NULL**，专门给共享 `analysis` 用。这样它不会被 zone 的级联删除带走（§4.6 的引用计数就查这张表）。
+- **期望状态不进库。** 早期设计有一整套 `zones / networks / hosts / ports / ip_allocations /
+  mirrors` 表，把 YAML 展开后存一份。做下来发现它只是 YAML 的**冗余投影**：每次 apply
+  都要重新解析 YAML，那份投影没有一次被当成真相用过，反而制造了"库和文件不一致时信谁"
+  的问题。现在要查"10.77.0.20 是谁"，答案在 YAML 里，`/api/hosts` 会把它和
+  `pct list` 对账后合并成一张表——数据量在几十台这个量级，扫一遍比维护一份副本便宜。
+- **`vmids` 必须持久化**：它是"重跑不重排"的唯一保证。YAML 里写了 `vmid` 就用写的，
+  没写就查这张表，查不到才按 `vmid_base` 往上找空号。删了这张表 = 下次 apply 可能把
+  容器编号重排（旧容器变孤儿）。这是唯一"看起来能推导、实际不能"的东西。
+- **`retired` 是运行态，不是配置**：它记录"这一轮做完先收起来"，必须跨 apply 存活——
+  否则一次 apply 就把它复活了（§8.6.3）。`host='*'` 表示整个 zone 被废弃。
+
+`step_state.input_hash` 是引擎的心脏：`probe → decide → apply` 之后如果哈希没变，
+下一轮直接 skip。哈希的输入是**步骤的规格参数 + `RULESET_VERSION`**（§8.6.6），
+不是"跑没跑过"这样一个布尔值——这正是"更新"和"重复执行"能同时成立的原因。
 
 ### 5.8 IPv6（默认开，ULA + NAT66，不给 GUA）
 
@@ -488,39 +501,39 @@ audit(id, ts, user, action, target, detail_json)
 
 ### 5.9 外来成员：你手动建的机器怎么进来
 
-**只认自己建的是对的，但"不认"不等于"看不见"。** 你在 PVE 网页上手动建一台 VM，把网卡挂到 `main-inner` 上——这台机器的流量会立刻出现在桥上，镜像如果漏掉它，你就得到一份缺了主角的抓包。所以平台必须**看见**它，只是不去**管**它。
+平台只认**规格里声明过**的主机。你在 PVE 网页上手动建的 VM 要接进 zone，
+做法是在 `hosts` 里加一行并写上它的 `vmid`（或让平台按名字找到它）：
 
-三个层次，别混：
-
-| 层次 | 含义 | 平台行为 |
-|---|---|---|
-| **managed** | 平台建的（`hosts` 表里有记录，PVE tag 为 `labyard:zone=<z>`） | 全生命周期：建、改、启停、退役、删除 |
-| **observed** | 桥上能看见、但不在 `hosts` 表里 | **只读**：拓扑里显示、镜像自动覆盖、可加进网关封禁列表；不能改配置、不能删 |
-| **unknown** | 桥上看见的成员口，PVE 里也没有对应 vmid（手工 `ip link add` 之类） | 只在一个"未识别成员"清单里列出 ifname + MAC，供你判断 |
-
-发现机制（每 30 秒或拓扑刷新时跑一次，只在宿主本机执行两条命令）：
-
-```bash
-ip -o link show master main-inner          # 成员口 ifname + MAC + 状态
-# 对照 PVE：pct list（LXC）+ qm list（QEMU）
-# 命名规则推断归属：veth<vmid>i<idx> → LXC，tap<vmid>i<idx> → QEMU
+```yaml
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      analysis: { role: analysis }
+      my-win10: { role: server, vmid: 205 }   # 你手动建的，声明 vmid 就接管
 ```
 
-命名规则在 PVE 里是稳定的（LXC 用 `veth`，QEMU 用 `tap`，后缀 `i<序号>` 对应 `net<序号>`），所以能准确反推出"这个口属于 vmid 105"。反推不出来、或者 vmid 在 PVE 里根本不存在，才归为 `unknown`。**这个推断只用于展示，不作为任何写操作的依据**——写之前一定重新查一次。
+声明之后它和平台建的主机**没有区别**：地址、路由、镜像都一样覆盖。
+唯一的区别是平台不会重建它——`vmid` 已存在时 `provision` / `create` 步骤会跳过，
+只做"接入"（写网络、写路由），不碰磁盘。
 
-镜像为什么天然覆盖：`labmirror` 抓的是**桥上每个成员口的 ingress**，不看 vmid。所以外来 VM 一挂上去就被抓到了，不需要额外配置。这也解释了为什么 `DST_IF` 必须自动探测而不是写死 vmid 前缀——同一个机制同时解决了"analysis 重建"和"外来成员"两个问题。
+> **早期设计里的自动发现没有实现。** 那份设计描述了 `observed`（桥上看见但没声明）
+> 与 `unknown`（连 vmid 都推不出来）两级、30 秒扫一次 `ip -o link show master <桥>`、
+> 以及"封禁列表 / 起别名 / 一键纳入管理"。实际实现只做了"声明即接管"：
+> 没有扫描、没有只读成员清单、也没有封禁列表。理由很直接——**声明式系统的价值在于
+> 磁盘上的文件就是全部真相**，再引入一份"运行时发现但不入档"的影子名单，
+> 会让"为什么这台机器在拓扑里但不在规格里"变成一个没有答案的问题。
+> 代价是：漏配一台不会被提醒，抓包会缺主角。这个代价是显式选择的。
 
-能对它做什么：
+镜像为什么天然覆盖声明的成员：镜像抓的是**桥上成员口的 ingress**，按 vmid 定位口
+（`veth<vmid>i<idx>` / `tap<vmid>i<idx>`），不看角色。所以只要 `vmid` 对，
+一台手动建的 VM 声明进来就立刻被抓到，不需要额外配置。
 
-- **封**：把它加进网关的封禁列表（按 IP 或 MAC），这在演练里很实用——"这台机器是谁的？先封了再说"
-- **标记**：给它起个别名（"同事的 win10"）、涂个颜色，只存在本地 DB，不碰 PVE
-- **接管**（可选，后续）：点一下"纳入管理"，平台读它的现有配置、补上 IP 记录，从此当 managed 对待。**但不重建、不格式化**——这条必须写死，否则一次误点就是数据丢失
-
-不能对它做什么：不改网卡、不改 IP、不开机、不删除。它不在 `hosts` 表里，所有写操作路径天然够不到它——这是**结构性保证**，不是靠"记得判断一下"。
-
-一个必须承认的限制：如果外来的是一台 **QEMU VM 且开了 PVE 防火墙**，桥上的成员口会是 `fwln<vmid>i<idx>` + `fwpr<vmid>i<idx>` 一对，`tap` 口本身不在桥上。这时的识别规则要额外匹配这两个前缀，且镜像抓的是 `fwln`（靠内那侧）。`doctor` 会检查是否存在这类口并打印说明。
-
----
+一个已知限制：**QEMU 开了 PVE 防火墙**时，桥上的成员口会变成
+`fwln<vmid>i<idx>` + `fwpr<vmid>i<idx>` 一对，`tap` 口本身不在桥上，
+按 `tap` 前缀找不到 → 镜像挂不上。这种情况请在该 zone 里关掉 PVE 防火墙。
 
 ## 6. 资源与角色的执行细节
 
@@ -680,7 +693,7 @@ CLI 侧没有变化：`pct`/`qm`/`pvesh` 的参数在 9.x 内稳定。**但"命�
 
 本地 root 调 `pct`/`pvesh` **不过 ACL**，权限是全有或全无。这是明确接受的代价：平台本来就要写 `/etc/pve/lxc/*.conf`、改 `/etc/network/interfaces`、调 `systemctl`，这几件事任何 ACL 都给不了。审计仍然有——`/var/log/pve/tasks` 记录每次 CLI 调用的任务。
 
-**为什么不用"最小权限 API Token"**：它看着更安全，实际是反的。token 落在 `/etc/labyard/config.toml`（0600），root 可读；一旦 labyard 进程被拿（它有 Web 界面和上传功能），token 是**可移植**的凭据——能拿到别的机器上直接打 8006，而"本机 root"给不出这个能力。所以引入 token 只增加复杂度（凭证轮换、ACL 漏授诊断、`verify_tls=false`），换不来安全收益。真想收紧，正确做法是收紧 §8.4 的暴露面，不是给本地进程发令牌。
+**为什么不用"最小权限 API Token"**：它看着更安全，实际是反的。token 落在 `/etc/labyard/config.toml`（0600），root 可读；一旦 labyard 进程被拿（它有 Web 界面），token 是**可移植**的凭据——能拿到别的机器上直接打 8006，而"本机 root"给不出这个能力。所以引入 token 只增加复杂度（凭证轮换、ACL 漏授诊断、`verify_tls=false`），换不来安全收益。真想收紧，正确做法是收紧 §8.4 的暴露面，不是给本地进程发令牌。
 
 反过来说，**这也是"必须装在 PVE 宿主本机"的第二个理由**（第一个是 §6.8 二的直接写文件）：装到别的机器上，就必须 ssh 或 API，两层失败模式全回来了。
 
@@ -704,35 +717,35 @@ PVE 的 `PUT /nodes/{n}/lxc/{id}/config` 只接受它认识的那些 key（`net0
 
 | 关注点 | 选择 | 版本 | 理由 | 否决与原因 |
 |---|---|---|---|---|
-| 语言 | **Rust** | 1.100 / edition 2021 | 用户选定（Python → Go → Rust，决策记录见 §7.5.1）。**实测空闲 4.7 MB / 峰值 6.5 MB**；单二进制 2.6 MB；无 GC，长期内存曲线平坦 | Go（峰值 18.3 MB、9.9 MB 二进制、编译 1–2 s，但 GC 让 RSS 停在峰值水位）、Python（初版方案，对比数据保留） |
-| 命令入口 | **clap 4** | 4.5 | **只有 3 条命令**（`serve`/`doctor`/`apply`），不做操作型 CLI；derive 宏生成 help 与补全 | 手写 `std::env::args` 匹配（3 条命令够用，但补全要自己写） |
-| HTTP + 路由 | **axum 0.8** | 0.8 | `Router` 原生支持 `/runs/{id}` 路径参数与 extractor，与 tokio 同一 runtime。**OpenAPI：当前手写 `openapi.json`**（端点只有 10 个，手写 20 行且不会漂移）；端点增长到 30+ 时再换 utoipa | actix-web（actor 模型自成一套）、上 utoipa 再手写一遍（当前规模不划算） |
+| 语言 | **Rust** | 1.100 / edition 2021 | 用户选定（Python → Go → Rust，决策记录见 §7.5.1）。**实测常驻 12.0 MB / 峰值 44.9 MB**（峰值几乎全是 `scrypt` 的 32 MB 工作区）；单二进制 12.7 MB（含前端）；无 GC，长期内存曲线平坦 | Go（峰值 18.3 MB、9.9 MB 二进制、编译 1–2 s，但 GC 让 RSS 停在峰值水位）、Python（初版方案，对比数据保留） |
+| 命令入口 | **clap 4** | 4.5 | **只有 4 条命令**（`serve`/`doctor`/`apply`/`destroy`），不做操作型 CLI；derive 宏生成 help 与补全 | 手写 `std::env::args` 匹配（3 条命令够用，但补全要自己写） |
+| HTTP + 路由 | **axum 0.8** | 0.8 | `Router` 原生支持 `/runs/{id}` 路径参数与 extractor，与 tokio 同一 runtime。**OpenAPI：手写数据表 `API_DOCS`**（36 条路径）——不引 utoipa，而用一个契约测试 `every_api_route_is_documented` 反向扫源码里的 `.route(...)` 与它双向比对，漏一条就测试失败。手写不会漂移，前提是有一把会响的锁 | actix-web（actor 模型自成一套）、上 utoipa 再手写一遍（当前规模不划算） |
 | PVE 通道 | **原生 CLI**：`pct` / `qm` / `pvesh` | PVE 自带 | 本地 root 直连，无凭证、无 TLS、无 task 轮询（§6.3） | 任何 API 客户端（`proxmoxer` / `go-proxmox` 等）——要建 token + ACL，换不来安全，见 §6.8 一 |
 | 校验 | **serde** + 手写语义检查 | — | serde 反序列化即完成类型校验（缺字段/类型错直接拒绝，`deny_unknown_fields` 拦住拼错的字段）；跨字段规则（IP 在网段内、vmid 不重复）在 `resolve()` 里手写并单测 | `validator` crate（derive 表达不了"IP 属于网段"这类规则） |
-| DB | **rusqlite**（`bundled`） | 0.32 | 10 张表、查询几乎只有"按 id 取一行"；同步 API 用 `spawn_blocking` 包一层即可，不必上 async SQL 的复杂度。`bundled` 编 C 源码，交叉编译靠 `cross` | sqlx（编译期要连库、依赖面大）、Diesel（ORM 黑盒）、纯 Rust 嵌入式 KV（丢掉 SQL 与事务） |
+| DB | **rusqlite**（`bundled`） | 0.32 | 6 张表、查询几乎只有"按 id 取一行"；同步 API 用 `spawn_blocking` 包一层即可，不必上 async SQL 的复杂度。`bundled` 编 C 源码，交叉编译靠 `cross` | sqlx（编译期要连库、依赖面大）、Diesel（ORM 黑盒）、纯 Rust 嵌入式 KV（丢掉 SQL 与事务） |
 | 配置 | **serde_yaml_ng** | 0.10 | YAML 是 IaC 惯例；`serde_yaml` 已于 2024 归档，`serde_yaml_ng` 是活跃的继任 fork（API 兼容、已修补原始缺陷） | `config` crate（为读 5 个字段引一整套）、`saphyr`（更底层，要自己搭反序列化层） |
 | 任务 | 自建薄 runner（tokio task + `CancellationToken` + `runs`/`steps` 表） | — | 无 broker、可断点续跑、状态可查；**`CancellationToken` 树把取消传到子进程** | 需要 Redis 的任务队列、定时器库（不是执行器） |
 | 锁 | **fs2** | 0.4 | 跨进程 `flock`，异常路径由库处理 | 手写 `libc::flock`（要处理 EINTR 与异常路径） |
 | 拓扑排序 | 手写 **Kahn**（约 30 行） | — | 步骤依赖是小图，40 年前的标准算法；不引数值库 | gonum/graph（为 40 行逻辑引一个大库） |
-| 日志流 | **SSE**（`http.Flusher`） | 标准库 | 单向、浏览器自带重连、`Last-Event-ID` 续传；`Flush()` 逐条推 | WebSocket（双向不需要，还要处理心跳） |
+| 日志流 | **SSE**（`axum::response::sse`） | 内置 | 单向、浏览器自带重连；实现是 `broadcast` → `BroadcastStream`，落后时发注释行不断流。**没有做 `Last-Event-ID` 续传**（断开后靠 `/steps` 补齐） | WebSocket（双向不需要，还要处理心跳） |
 | 认证 | **`scrypt`**（RustCrypto）+ `hmac`/`sha2` 签名 cookie | 0.11 | scrypt 是合格 KDF；cookie 签名 40 行、无第三方 | JWT（前端存 token 是 XSS 放大器）、`cookie` crate 的 private jar（多一层抽象换 40 行） |
 | TLS | **`openssl req`** 生成自签 + **`axum-server` 的 rustls** | — | openssl 本就在系统里；rustls 是纯 Rust 实现，不链接 OpenSSL，没有版本与 CVE 牵连 | 内嵌证书生成（要给二进制塞密钥生成逻辑）、`native-tls`（又回到 OpenSSL 依赖） |
 | 结构化日志 | **tracing** + **tracing-subscriber** | 0.1 / 0.3 | JSON layer 输出结构化行；span 能自动带上 `run_id` 与 `step_key`，这正是 run 日志要的东西 | `log` + `env_logger`（没有 span，手写上下文） |
 | ttyd 反代 | **axum 的 WebSocket**（`ws` feature） | 内置 | 下游用 `WebSocketUpgrade`，上游用 `tokio-tungstenite` 连，双向搬运。**已实现**：真机验证页面 200、WS 握手 `101 Switching Protocols`（见 §7.4） | 手写 ws 帧解析（没必要） |
-| 测试 | 标准库 **`testing`** + `testdata/` 回放 | — | 所有 PVE 交互走一个可替换的 `Runner` 接口；注入"回放 fixture 的假 `pct`/`pvesh`"，不碰真机也能测引擎 | testify（表驱动断言够用）、ginkgo（BDD 不降低本项目风险） |
+| 测试 | `#[cfg(test)]` + 真机回归 | — | 纯函数（脚本生成、哈希、YAML 编辑、拓扑）在同模块里单测，不需要 PVE；需要 PVE 的一律上真机（`scripts/api-regress.py` 逐接口跑）。**没有**"录制回放假 `pct`"这一层：fixture 不保真、会腐烂 | cargo-nextest（当前 98 项不值得多一层工具）、proptest（脚本生成的输入空间不大） |
 
 ### 7.2 前端
 
 | 关注点 | 选择 | 理由 | 否决 |
 |---|---|---|---|
-| 框架 | **React 19 + TypeScript + Vite** | 用户指定；Vite 启动秒级 | Next.js（不需要 SSR） |
+| 框架 | **React 18 + TypeScript + Vite** | 用户指定；Vite 启动秒级 | Next.js（不需要 SSR） |
 | UI | **Ant Design 5** | 管理后台事实标准，Table/Form/Descriptions/Tag 全都现成 | MUI（偏 C 端视觉）、shadcn（要自己拼装） |
 | 数据层 | **TanStack Query** | 缓存、重试、失效重取、乐观更新 | 手写 `useEffect` + fetch |
-| 路由 | **React Router 7** | 成熟 | 手写 hash 路由 |
+| 路由 | **不引路由** | 六个入口切一个 `page` 状态就够；引路由要配套深链、面包屑、返回栈，纯成本 | React Router（早期引过，一次都没 import，已从依赖里删掉） |
 | 拓扑图 | **@xyflow/react (React Flow)** | 节点/连线/缩放/拖拽全有，正是"网络-主机"图要的 | d3 手绘（两天起步）、Cytoscape（偏图论） |
-| 图表 | **Recharts** | 流量曲线、资源占用 | Chart.js（要自己包 React） |
-| 日志终端 | **xterm.js** | 真实终端观感、支持 ANSI 色 | `<pre>`（44 项断言全是彩色的） |
-| 表单 | AntD Form + 手写 TS 类型（`web/src/api.ts`） | 类型与后端 struct 一一对应，改动时两侧一起改 | 引入代码生成（当前 10 个端点不值得） |
+| 图表 | **不引图表库** | 现在没有需要画曲线的页面；概览页用 AntD 的 `Statistic` 就够 | Recharts / Chart.js（为一个不存在的需求引包） |
+| 日志终端 | **ttyd 自带 xterm.js** | 终端由 ttyd 在容器里渲染，前端只在 iframe 里嵌；我们不再单独引 xterm.js | 自己引 xterm.js 接 WS（等于把 ttyd 重写一遍） |
+| 类型 | 手写 TS 类型（`web/src/api.ts`） | 与后端 struct 一一对应，改动时两侧一起改；有 `tsc -b` 兜底 | 引入代码生成（36 个端点仍不值得，且有 schema 漂移风险） |
 | 状态 | TanStack Query 足够，**不引 Redux/Zustand** | 服务端状态为主，本地状态极少 | Redux（模板代码多） |
 
 ### 7.3 打包与部署
@@ -779,56 +792,57 @@ WantedBy=sockets.target
 
 ### 7.4 Web 终端与文件传输
 
-需求是"单独窗口打开、能同时开好几个、要能传文件"。这三条直接排除"在页面里塞一个 xterm 组件"——嵌入式终端在切换标签页时会断线、多开会抢焦点，而独立标签页天然隔离。
+需求是"点一台机器就能进它的 shell，顺手能传个文件"。落地方案：容器里跑 ttyd，
+labyard 做一层带认证的反代，前端用 iframe 嵌在主机页的抽屉里。
 
-| 层 | 选择 | 版本/形态 | 关键理由 |
+| 层 | 选择 | 形态 | 关键理由 |
 |---|---|---|---|
-| 终端服务 | **ttyd** | 1.7.7 **静态二进制**（1.3 MB） | C 写的，libuv + libwebsockets，前端 xterm.js + WebGL2；**CJK/输入法完整支持**（GoTTY 在这块不行，中文输入会乱）；自带 ZMODEM/trzsz；一个进程多会话 |
-| 终端接入 | **反代 + 一次性校验** | labyard 内 `~90 行` WebSocket 转发 | 见下，这是唯一自写的部分 |
-| 终端内传文件 | **ZMODEM（lrzsz）** | 容器内 `apt install lrzsz`（约 300 KB） | ttyd 前端自带 zmodem 解码，容器侧只需要标准的 `rz`/`sz`，不装任何自研客户端 |
-| 大文件 / 目录 | **`pct push` / `pct pull`** | PVE 自带命令 | 走 HTTP 面板而非终端，不受终端窗口和 zmodem 吞吐限制；目录用 tar 流 |
+| 终端服务 | **ttyd** | 1.7.7 静态二进制（1.3 MB） | C 写的，libuv + libwebsockets，前端 xterm.js；**CJK/输入法完整支持**（GoTTY 这块不行）；自带 ZMODEM/trzsz；一个进程多会话 |
+| 分发方式 | `pct push` 进容器 + systemd 单元 | 每个容器一份 | 宿主只留 `/usr/local/bin/ttyd` 这一个文件；容器里没有才推（1.3 MB，每次 bootstrap 都推是浪费） |
+| 终端接入 | labyard 反代 | `api/mod.rs` 里的 HTTP + WebSocket 双向转发 | 见下，这是唯一自写的一段 |
+| 终端内传文件 | **ZMODEM（lrzsz）** | 容器内 `apt install lrzsz`（约 300 KB） | ttyd 前端自带 zmodem 解码，容器侧只要标准的 `rz`/`sz`，不装任何自研客户端 |
 
-> **实现状态（2026-11）**：ttyd 反代**已实现并在真机验证**。真机撞出来的两件事：
-> 一是 axum 的 `{*path}` 不匹配空段（裸路径要单独一条路由补斜杠），二是 ttyd 按 `Host`
-> 头做 DNS-rebinding 校验，反代必须转发**容器视角**的 Host 头。现在页面 200、
-> WS 握手 101、token 接口 200，静态资源与 xterm.js 全部走同一条反代。
-> 文件面板（`pct push`/`pull`）未做——ZMODEM 已经覆盖了"在终端里传个文件"的主场景，
-> 再做一个文件管理器属于可选增强，不属于缺口。
-
-**ttyd 不在 Debian 13 的仓库里**（Debian 只从 forky/sid 才开始打包），所以 `install.sh` 从 GitHub Release 下 `ttyd.<arch>` 静态二进制装到 `/usr/local/bin`。这和"少一层依赖"一致：一个 1.3 MB 的静态文件，没有 apt 源、没有 .so 依赖、没有版本冲突。
-
-启动方式（单个实例，`-p 0` 不要）：
+ttyd 的实际启动命令（`Pve::ensure_terminal` 生成的单元）：
 
 ```bash
-ttyd -i 127.0.0.1 -p 7681 -b /tty \
-     -H X-Labyard-User \        # 认证交给反代，ttyd 只认这个头
-     -O \                       # 校验 Origin，防跨站 WebSocket 劫持
-     -W \                       # 可写（不然只能看）
-     -a \                       # 允许 URL 参数 ?arg=<vmid>
-     -t fontSize=14 -t 'theme={"background":"#1e1e1e"}' \
-     /usr/local/lib/labyard/tty-attach
+/usr/local/bin/ttyd -p 7681 -i <容器内网 IP> -b /terminal/<zone>/<host> \
+     -W -t fontSize=14 /bin/bash -l
 ```
 
-`tty-attach` 是一个 20 行的 shell：从 `$1` 取 vmid，**只接受纯数字且必须是 hosts 表里的 managed 主机**（防止有人拿 `?arg=../..` 或任意 vmid 进别人的容器），然后 `exec pct exec "$vmid" -- login -f root`。
+四个决定都在这一行里：
 
-反代路径：`/tty/*` → `127.0.0.1:7681/*`，HTTP 与 WebSocket 都转。认证在**反代这一层**做：校验 labyard 的 session cookie，通过后注入 `X-Labyard-User: admin` 再转发。ttyd 绑 `127.0.0.1`，外部伪造不了这个头。
+- **`-i <内网 IP>` 而不是 `0.0.0.0`**：网关的 eth1 接 WAN，监听全网卡等于把终端
+  暴露给外部网段。绑内网地址后，能连到它的人本来就已经在 zone 里了。
+- **`-b /terminal/<zone>/<host>`**：ttyd 自带的前缀，和 axum 的反代路径一致，
+  于是容器里的 ttyd 不需要知道自己在哪个子路径后面。
+- **`-W` 可写**：默认只读，"能看不能敲"的终端没有意义。
+- **`/bin/bash -l`**：登录 shell，`/etc/profile` 里的 locale、PATH 才会生效——
+  少了 `-l`，中文目录名和 `apt` 的 PATH 都会怪。
 
-为什么自己写这 90 行而不用 nginx/Caddy：
+**认证在反代这一层**（校验 labyard 的 session cookie，未登录直接 401），
+ttyd 自己不做认证，因为它只监听内网地址——外部伪造不了对它的访问。
 
-| 方案 | 代价 |
-|---|---|
-| 引 nginx | 多一个常驻服务 + 一份要生成的 conf + 证书要共享；而且认证还得回到 labyard 做（nginx 不认识我们的 session），等于照样要写一段 |
-| 引 Caddy | 40 MB 二进制，为 90 行转发引入，不成比例 |
-| 自写 ws 转发 | 纯字节搬运，无业务逻辑，用 axum 的 `WebSocketUpgrade` + `tokio-tungstenite` 做双向桥接，出错面很小 |
+反代路径：`/terminal/{z}/{h}` / `/terminal/{z}/{h}/` / `/terminal/{z}/{h}/{*path}`
+三条路由（axum 的 `{*path}` 不匹配空段，裸路径要单独一条）。HTTP 与 WebSocket
+走同一条：`Upgrade` 头在就切成双向字节搬运。
 
-**多窗口**：ttyd 默认每个 WebSocket 连接 fork 一个独立 pty（`-Q` 共享模式我们**不开**），所以开五个标签页就是五个独立 shell，互不干扰。点"终端"时前端 `window.open('/tty/?arg=<vmid>', '_blank')`，用完关标签页即断。
+**两个真机撞出来的坑**（都写进了回归用例）：
 
-**文件传输的两条路都要，不是二选一**：
+1. **裸路径少一条路由**：`/terminal/{z}/{h}` 不带斜杠时匹配不到 `{*path}`，
+   ttyd 收到的路径缺前缀，页面白屏。
+2. **`Host` 头必须换成容器视角**：ttyd 按 `Host` 做 DNS-rebinding 校验，
+   转发时保留浏览器发来的宿主 IP 会被它拒掉。反代要把 `Host` 改写成
+   `容器内网IP:7681`。
 
-- 终端里 `rz` / `sz`：适合"顺手传个脚本"，符合肌肉记忆，但 zmodem 在 vmconsole 之外没有断点续传，几百 MB 会很难受
-- 文件面板：上传走 `r.MultipartReader()` 分块流式落 `/var/lib/labyard/tmp/` → `pct push`；下载走 `pct pull` → `http.ServeContent`（自动处理 Range）；目录打 tar 流。**必须设大小上限和临时文件清理定时器**，否则 `/var` 会被悄悄撑满
+**多窗口**：ttyd 默认每个 WebSocket 连接 fork 一个独立 pty（`-Q` 共享模式不开），
+所以开五个标签页就是五个独立 shell，互不干扰。前端是 iframe 嵌在抽屉里
+（`/terminal/{z}/{h}/`，"点哪台看哪台"的连续感比开五个标签页好）。
 
-一个坑要先说：`pct pull` 的源路径是**容器内路径**，要防目录穿越（`../../etc/shadow` 之类）。所有路径参数先 `normpath` 再校验必须以 `/` 开头且不含 `..`，然后在容器内用 `pct exec -- test -f` 确认存在——不要让 `pct pull` 自己报错，它的报错信息会泄露宿主路径。
+**文件传输只有一条路：ZMODEM。** 容器里 `rz`/`sz`，ttyd 前端解码。
+早先设计过一个"文件面板"（`pct push`/`pct pull` + tar 流 + 目录穿越校验），
+**没有实现**——ZMODEM 覆盖了"顺手传个脚本/下个报告"的主场景，而做一个文件管理器
+要处理 Range、断点、并发、临时文件清理与路径穿越，属于另一个功能的工作量。
+大文件仍然建议直接在宿主上 `pct push`，比走浏览器快一个量级。
 
 ---
 
@@ -856,6 +870,10 @@ ttyd -i 127.0.0.1 -p 7681 -b /tty \
 
 **平台实测（容器内复现，HTTP 模式无 TLS）**：空闲 RSS **6.9 MB**、二进制 **8.0 MB**（含 1.07 MB 前端）、峰值 HWM **≈38 MB**（多次实测 37.9–38.1，波动来自分配器与 ASLR）。
 
+> 这一组是**容器内 HTTP 基线**。生产形态（宿主上 HTTPS + 现在的拓扑页/规格页前端）实测是：
+> 常驻 **12.0 MB**、二进制 **12.7 MB**（前端从 1.07 MB 涨到 1.46 MB，加上 rustls）、峰值 HWM **44.9 MB**。
+> 两者差 5 MB，差在 TLS 会话缓存与更大的前端资源常驻。下面表格里的推理两者都成立。
+
 **38 MB 这个数字必须解释清楚，否则会被误读成"Rust 也不小"。** 诊断结果：`VmHWM` 在**启动完成时就已经是 38.1 MB**，之后 200 个请求（20 并发，混合 preview 与 state）一个字节都没顶上去。来源是 `scrypt`——`N=2¹⁵, r=8` 的工作内存是 `128·N·r = 32 MB`，且是瞬时的（`scripts/measure.sh` 可复现）：
 
 | 时刻 | RSS | HWM | 说明 |
@@ -878,8 +896,8 @@ ttyd -i 127.0.0.1 -p 7681 -b /tty \
 
 四条硬性纪律（前三条与语言无关，第四条是 Rust 特有）：
 
-1. **不引 ORM**。10 张表、单用户、查询几乎只有"按 id 取一行"，ORM 省下的那点代码不值得一层黑盒。迁移是编号 SQL 文件 + `schema_version` 表（约 60 行 runner），用 `include_str!` 编进二进制顺序执行。代价说清楚：没有 autogenerate、没有 downgrade；收益是每条 DDL 都看得见、可 review。
-2. **禁止无界缓冲**。`Vec<u8>` 收整个 `pct exec` 输出、把 2 GB 镜像读进内存、`read_to_end` 读上传——都和语言无关，都会炸。规则是**上传与下载一律流式 `copy`**，子进程输出逐行转 SSE 且不落内存。
+1. **不引 ORM**。6 张表、单用户、查询几乎只有"按 id 取一行"，ORM 省下的那点代码不值得一层黑盒。迁移是编号 SQL 文件 + `schema_version` 表（约 60 行 runner），用 `include_str!` 编进二进制顺序执行。代价说清楚：没有 autogenerate、没有 downgrade；收益是每条 DDL 都看得见、可 review。
+2. **禁止无界缓冲**。`Vec<u8>` 收整个 `pct exec` 输出、把镜像读进内存、`read_to_end` 读整个请求体——都和语言无关，都会炸。规则是子进程输出逐行转 SSE 且不落内存；`pct push` 用文件路径而不是把内容读进内存。
 3. **日志队列有上限**。SSE 推 `pct exec` 输出用有界 channel（`mpsc::channel(500)` 或 `broadcast` 带容量），满了丢**中间**行并插一条 `[已省略 N 行]`。这是唯一会让 RSS 随时间上涨的地方，也是"跑三天之后变卡"的典型成因。
 4. **没有 GC，但有分配器**。Rust 不回收垃圾，所以不存在 Go 那种"堆涨到峰值水位不回落"。系统 malloc（glibc ptmalloc2）在多线程下确有 arena 碎片隐患，所以做了对照实测（§7.5.2）：**结论是不要换**——glibc 的 idle 4.4 MB / churn 后 5.5 MB 全面优于 jemalloc（6.2 / 10.8）与 mimalloc（10.4 / 27.5）。真正管用的是"禁止无界缓冲"，它比换分配器重要一个量级。
 
@@ -1011,28 +1029,37 @@ Rust 默认使用系统 malloc（Linux 上是 glibc 的 ptmalloc2）。它在**�
 
 这条比"用哪个语言"重要：一个 N+1 的 probe 循环，换任何语言都会把 pmxcfs 拖慢。
 
-#### 7.6.4 三级并发闸
+#### 7.6.4 并发闸（实际实现的三道）
 
-| 层级 | 默认 | 说明 |
+| 闸门 | 默认 | 实现位置 | 为什么需要 |
+|---|---|---|---|
+| apply 里重步骤的批内并发 | 3（`--concurrency`） | `Executor::execute(.., conc)` | `pct create` 会解压模板写盘；并发 3 是"能明显变快"与"不把 IO 打满"之间的折中 |
+| 计划/预览的并发 | 4 | `AppState::preview_gate` | 每次出计划都要读集群现状，不限会一起压 pmxcfs |
+| scrypt 计算 | 1 | `AppState::hash_gate` | 一次登录哈希约 100 ms 满载一个核；并发几次就能把宿主 CPU 顶住，串行化最省事 |
+
+**没做的**：早期设想是"全局并发 run 2 / 轻步骤池 8 / 重步骤池 3"三池分离。实际实现里
+一个 run 内的步骤是**顺序**走的，重步骤只在批内受 `concurrency` 限制，轻步骤没有单独
+的池子——它们本身几毫秒，分池要引入两套队列、两套优先级和一类新的死锁，
+换不来能测出来的收益。"跨 zone 同时 apply"目前靠人：实验环境里同时点两个 apply
+本来就是误操作。
+
+#### 7.6.5 限流措施：哪些做了，哪些没做
+
+设计时列了八条。实现完之后逐条对账，**没做的照实写在这里**，免得被当成已有保障：
+
+| # | 措施 | 状态 |
 |---|---|---|
-| 全局并发 run | **2** | 跨 zone 排队；第 3 个起显示"前面还有 N 个"，不是转圈 |
-| 单 run 内**重**步骤 | **3** | `pct create`、`apt install`、`pct push` 大文件、快照 |
-| 单 run 内**轻**步骤 | **8** | `pct set`、写文件、`systemctl enable` |
+| 1 | SSE 背压：事件队列容量 500，满了丢**中间**行并插一条"已省略 N 行" | **已实现**。`mpsc::channel(500)` 满了由 runner 汇总成 `skipped` 事件；`broadcast` 落后时发一条 `lagged` 注释行，不断流。丢中间不丢尾部——报错通常在尾部 |
+| 2 | 单 step 日志落盘上限 8 MB | **不适用**。日志不落盘：实时走 SSE，落库只有每步一行 `message`（尾部若干行）。容器里的完整输出要去 `journalctl -u labyard` 或容器自身日志看 |
+| 3 | 子进程套 `ionice -c2 -n7 nice -n 10` | **未实现**。宿主的 IO 压力来自 `pct create`/`apt` 写盘，靠"批内并发 3"和"同模板串行"控制；真要限，`systemd` 的 `IOWeight=50`（installer 已写）比 `ionice` 更彻底 |
+| 4 | 上传流式 + 单文件 ≤ 2 GB | **不适用**。没有上传接口：规格是文本 YAML（JSON body），文件传输走 ttyd 的 ZMODEM，不经过本服务 |
+| 5 | 临时文件 TTL 1 小时；磁盘 < 10 GB 拒绝上传 | **部分实现**。临时文件只有 `pct pull` 的中转目录与生成脚本，任务结束即删，没有定时清理器；"磁盘不足拒绝上传"不适用（没有上传） |
+| 6 | 终端并发 ≤ 8，超出 429 | **未实现**。`/terminal/*` 是纯转发，没有连接计数；ttyd 本身按会话起进程，超了也是宿主先撑不住 |
+| 7 | 拓扑轮询 ≥ 10 秒 + 页面隐藏时暂停 | **部分实现**。轮询间隔：拓扑 15 s、运行历史 10 s、概览 10 s、主机 8 s、网关 6 s；`visibilitychange` 暂停**没做** |
+| 8 | 日志 + DB > 5 GB 自动清理 | **不适用**。没有日志文件；DB 只有 `step_state` / `vmids` / `runs` / `run_steps` / `retired` 五张小表，每步一行，增长以 KB 计 |
 
-外加一条：**同模板的 `pct create` 串行**（解压读同一份模板，并行只会互相拖慢，且放大写峰值）。
-
-轻步骤可以开到 8，因为它们几乎不碰磁盘——`pct set` 只改配置。把轻重混在一个池子里是错的，那样要么轻步骤被拖慢，要么重步骤打爆 IO。
-
-#### 7.6.5 八条限流措施
-
-1. **所有子进程包 `ionice -c2 -n7 nice -n 10`** —— 保证宿主管理面、SSH、PVE 自己不被饿死。这是成本最低、收益最大的一条
-2. SSE 背压：`chan []byte` 容量 500，满了丢**中间**行，插一条 `[已省略 N 行]`。丢中间不丢头部，因为报错通常在尾部
-3. 单 step 日志落盘上限 8 MB，超出后保留头 2 MB + 尾 2 MB（中间截断并注明）
-4. 上传必须流式：`r.MultipartReader()` 分块落临时文件，**禁止 `io.ReadAll(r.Body)`**（那会把整个文件塞进内存并直接顶到 `MemoryMax`）；单文件 ≤ 2 GB。反向同理：`pct pull` 的输出直接 `io.Copy` 到响应体，不落内存
-5. 临时文件 TTL 1 小时清理；磁盘剩余 < 10 GB 时直接拒绝上传并说明原因
-6. 终端并发 ≤ 8，超出返回 429 + "关掉不用的标签页"
-7. 拓扑轮询间隔 ≥ 10 秒；页面 `visibilitychange` 隐藏时**暂停轮询**（这条能砍掉 90% 的无谓 probe）
-8. 日志 + DB 总占用 > 5 GB 时自动清理最老的 run 日志并告警
+唯一"不依赖代码正确性"的兜底是 `systemd` 的资源上限（`MemoryMax=64M` / `CPUQuota=50%` /
+`IOWeight=50` / `TasksMax=256`），由 `installer/install.sh` 写进 unit，见 §7.6.6。
 
 #### 7.6.6 用 systemd 兜底（唯一不依赖代码正确性的措施）
 
@@ -1104,33 +1131,46 @@ TasksMax=256
 
 ### 8.1 页面结构
 
-```
-/                        总览：zone 卡片 + 全局健康（PVE 连通、模板、桥、镜像实例、外来成员数）
-/zones/{z}               zone 详情：主机表、端口表、运行态、成员列表
-/topology                全局拓扑图（React Flow）：所有 zone + 外来成员串成一张图
-/zones/{z}/new           新建 zone 向导：模板/存储/网段/上联 → YAML 预览 → Plan → Apply
-/runs                    任务列表（状态、耗时、触发者）
-/runs/{id}               任务详情：步骤树 + 实时日志（SSE + xterm）
-/zones/{z}/gateway       网关操作：出网、端口映射、VPN、封禁列表
-/zones/{z}/hosts/{h}     单机详情：配置、IP、终端、文件、快照、开机/关机
-/mirrors                 镜像：源桥 → analysis 的连线表、包计数、启停
-/observed                外来成员：桥上看见但平台没管的机器（vmid / MAC / 所在桥 / 动作）
-/settings                PVE 连接、apt 源、凭据、TLS、账号
-```
+前端**没有路由表**（也就没有 `react-router`）：顶栏六个入口切换一个 `page` 状态，
+刷新永远回到默认页。单机运维面板没有"分享某个页面链接"的需求，为它引入路由
+（以及随之而来的深链、面包屑、返回栈）是纯成本。
 
-**全局拓扑图是主视图**，不是每个 zone 一张。因为 zone 之间的关系（`suba` 挂在 `main-inner` 上）只有放到一张图里才看得出来；单看一个 zone，它和别人的连接就丢了。外来成员在图上用**虚线边框 + 灰色**区分，一眼能看出"这台不是平台建的"。
+| 入口 | 组件 | 做什么 |
+|---|---|---|
+| **编排** | `Editor.tsx` | YAML 编辑（CodeMirror 风格高亮）→「预览计划」出步骤表 →「应用」起 run；网关面板（出网 / 端口映射 / VPN）也挂在这里 |
+| **规格** | `Specs.tsx` | 多份规格的文件级 CRUD（新建 / 复制 / 改 / 删），以及文件内 zone 片段的增删改；片段编辑走 CST 就地改写，保留注释与缩进 |
+| **拓扑** | `TopologyPage.tsx` | 全局拓扑图（React Flow + dagre 自动布局），懒加载 |
+| **主机** | `Hosts.tsx` | 主机表（角色、IP、规格归属、电源、retired）+ 单机操作（开/关/重启、快照、retire/revive、终端） |
+| **运行历史** | `Runs.tsx` | run 列表 + 步骤明细 + SSE 实时日志 + retry / cancel |
+| **概览** | `Dashboard.tsx` | PVE 健康、`doctor` 结果统计、规格与主机计数 |
 
-**终端和文件不在页面内嵌，一律新标签页**：点"终端"→ `window.open('/tty/?arg=<vmid>')`；点"文件"→ 打开该主机的文件页（复用同一套认证，但独立窗口，可以同时开好几台）。原因见 §7.4。
+**全局拓扑图是主视图**，不是每个 zone 一张。因为 zone 之间的关系（`suba` 挂在 `main-inner` 上）只有放到一张图里才看得出来；单看一个 zone，它和别人的连接就丢了。`/api/topology` 已经把"谁挂谁""哪条镜像线"解析成 nodes + edges，前端只负责画。
+
+**终端内嵌在主机页的抽屉里**（`<iframe src="/terminal/{z}/{h}/">`），不是新标签页。
+选择内嵌的理由是"点哪台看哪台"的连续感——真开一堆标签页反而找不回来。
+需要独立窗口时 iframe 里的 ttyd 自带"新窗口打开"。**文件传输不做独立页面**：
+ttyd 里的 `lrzsz`（`sz`/`rz` + ZMODEM）就是文件通道，`/terminal/{z}/{h}/{*path}`
+反代已经把 ZMODEM 控制序列一并通过。原因见 §7.4。
+
+> 早期版本这里写过 `/zones/{z}`、`/observed`、`/settings`、`/mirrors` 等一整套路由，
+> 以及"表单向导"。实际实现时发现：**规格文件是唯一真相源**，再叠一层表单只会
+> 制造"表单和 YAML 谁能表达什么"的第二套语义。所以改成"直接编辑 YAML +
+> 拓扑图看效果"，`/observed`（外来成员）也并进了主机表。
 
 ### 8.2 关键交互
 
-**创建向导不是"一堆表单直接建"**，而是三步：
+**编排页是"写 YAML → 看计划 → 应用"三段式**，中间不做参数表单：
 
 ```
-① 填参数  → ② 看生成的 YAML（可下载、可回贴）→ ③ 看 Plan 表 → 确认
+① 写/贴 YAML（空文件时给一份带注释的示例）
+② 预览计划：POST /api/preview，出一张步骤表（不落库、不执行）
+③ 应用：POST /api/apply，起 run，SSE 里看每一步的实时输出
 ```
 
-第②步很重要：网页上点出来的东西随时能变成一份 YAML 存进 git 或贴进 issue。这是"网页不绑架你"的保证——**能力上不绑架，入口上仍然只有网页**。
+第①步直接落在 YAML 上，是"网页不绑架你"的保证——页面上做出来的东西随时能
+存进 git 或贴进 issue，反过来手写的 YAML 也能直接贴回来。
+规格页的 zone 片段编辑用的是 CST 就地改写（`yaml-edit` / rowan），
+**注释和缩进会原样保留**，不会因为"在网页上改了一个 IP"就把整份文件重排。
 
 **Plan 表的呈现**：
 
@@ -1148,35 +1188,85 @@ TasksMax=256
 
 ### 8.3 API 骨架
 
+下面是**实际实现的全部路由**（与 `src/api/mod.rs` 的 `router()` 逐条对应，
+`GET /api/openapi.json` 返回同一份清单；`src/api/mod.rs` 里有一个契约测试
+`every_api_route_is_documented` 双向比对两边，漏写一条就编译测试失败）。
+
 ```
-GET    /api/health                        PVE 连通、版本、能力矩阵
-GET    /api/zones
-POST   /api/zones                         上传/粘贴 YAML，只保存不执行
-GET    /api/zones/{z}
-PUT    /api/zones/{z}/spec                改 YAML
-POST   /api/zones/{z}/plan                返回动作列表（不落库）
-POST   /api/zones/{z}/apply               起 run，返回 run_id
-POST   /api/zones/{z}/destroy             需 body 带 zone 名确认
-GET    /api/topology                      全局图：zone / bridge / host / mirror 四类节点
-GET    /api/runs?zone=
-GET    /api/runs/{id}
-GET    /api/runs/{id}/events              SSE
-POST   /api/runs/{id}/cancel
-POST   /api/runs/{id}/retry
-GET    /api/zones/{z}/hosts
-POST   /api/zones/{z}/hosts/{h}/power     {action: start|stop|shutdown}
-POST   /api/zones/{z}/gateway/egress      {on: bool}
-GET    /api/zones/{z}/gateway/status
-POST   /api/zones/{z}/gateway/pub         {proto,port,to}
-POST   /api/zones/{z}/gateway/vpn         {proto, action}
-GET    /api/zones/{z}/gateway/vpn/{proto}/client   .conf / .ovpn 下载
-GET    /api/mirrors
-POST   /api/mirrors                       {from, to}
-DELETE /api/mirrors/{id}
-POST   /api/zones/{z}/snapshot            {name}
+                      —— 认证与状态 ——
+GET    /api/health                       PVE 连通、版本、能力矩阵（不需要登录）
+POST   /api/auth/login                   登录，成功返回 Set-Cookie
+POST   /api/auth/logout                  登出，清 cookie
+GET    /api/auth/me                      当前用户
+GET    /api/state                        已登记步骤的状态（幂等判定的输入）
+
+                      —— 规格：文件级 ——
+GET    /api/spec                         默认规格
+PUT    /api/spec                         保存默认规格（先校验，再原子写）
+GET    /api/specs                        列出全部规格文件
+POST   /api/specs                        新建规格（可复制自另一份）
+GET    /api/specs/{name}                 读指定规格
+PUT    /api/specs/{name}                 保存指定规格
+DELETE /api/specs/{name}                 删规格文件（不动 PVE 资源）
+
+                      —— 规格：zone 级（编辑框的种子）——
+POST   /api/specs/{name}/zones           新增一个 zone
+GET    /api/specs/{name}/zones/{z}       取 zone 片段；不存在也是 200，exists:false
+PUT    /api/specs/{name}/zones/{z}       用片段替换整个 zone
+DELETE /api/specs/{name}/zones/{z}       从规格里删掉 zone（不动 PVE 资源）
+
+                      —— 计划与执行 ——
+POST   /api/preview                      解析并返回计划（不执行）
+POST   /api/apply                        执行，返回 run_id
+GET    /api/runs                         run 历史
+GET    /api/runs/{id}/steps              run 的步骤明细
+GET    /api/runs/{id}/events             SSE 日志流
+POST   /api/runs/{id}/retry              从失败的步骤续跑
+POST   /api/runs/{id}/cancel             取消运行
+GET    /api/doctor                       环境自检
+GET    /api/topology                     全局图：zone / bridge / host / mirror 四类节点
+
+                      —— 主机运维 ——
+GET    /api/hosts                        清单（含电源状态、角色、规格归属、retired 标记）
+POST   /api/hosts/{z}/{h}/power          {action: start|stop|reboot}
+POST   /api/hosts/{z}/{h}/retire         废弃：停机并摘镜像，保留磁盘
+POST   /api/hosts/{z}/{h}/revive         从废弃状态恢复
+GET    /api/snapshots/{z}/{h}            列出快照
+POST   /api/snapshots/{z}/{h}            {action: create|rollback|delete, name}
+POST   /api/destroy                      销毁 zone（body 的 confirm 必须等于 zone 名）
+
+                      —— 网关 ——
+GET    /api/zones/{z}/gateway/status     策略 + VPN 进程实况 + retired 主机
+POST   /api/zones/{z}/gateway/egress     {on: bool}
+POST   /api/zones/{z}/gateway/pub        {proto, port, to}
+DELETE /api/zones/{z}/gateway/pub/{idx}  删第 idx 条映射
+POST   /api/zones/{z}/gateway/vpn        {proto: wireguard|openvpn, action: on|off}
+GET    /api/zones/{z}/gateway/vpn/{proto}/client   .conf / .ovpn 下载（现读现拼）
+
+                      —— 生命周期（整 zone）——
+POST   /api/zones/{z}/retire             废弃整个 zone
+POST   /api/zones/{z}/revive             恢复整个 zone
+
+                      —— 镜像与终端 ——
+GET    /api/mirrors                      镜像连线列表
+POST   /api/mirrors                      {from, to}，写完立刻装载单元
+DELETE /api/mirrors/{id}                 id 形如 `zone:host->zone:host`，需 URL 编码
+ANY    /terminal/{z}/{h}[/{*path}]       ttyd 反代（页面 + WS + 零散资源）
+
+                      —— 自描述 ——
+GET    /api/openapi.json                 上面这份清单
 ```
 
 `/api/topology` 是前端画图的唯一数据源，返回的是**已解析的图**（节点 + 边），不是原始 YAML。这样前端不需要懂 `uplink: main` 是什么语义——它只负责画。解析逻辑留在 core 一处。
+
+`DELETE /api/mirrors/{id}` 的 id 里带 `->`，而 `>` 不是合法 URI 字符（RFC 3986）：
+直接拼进 URL 会被 HTTP/1 解析器以 `400 Bad Request` 挡回来，**必须**
+`encodeURIComponent`（前端 `web/src/api.ts` 与 `scripts/api-regress.py` 都这么做）。
+
+`GET /api/runs/{id}/events` 只推**实时**事件。run 已结束时它补一条
+`{"kind":"finished"}` 就关流——前端是 `fetch` + `ReadableStream`，没有超时，
+靠这条事件收尾；不补的话打开历史 run 的日志页会一直卡在"连接中"。
+历史输出不在这个流里重放，它在 `/api/runs/{id}/steps` 每条步骤的 `message` 里。
 
 > **实现状态（2026-11）——上面这份 API 面已全部落地，并在真机 PVE 9.2.2 上逐项验证。**
 >
@@ -1203,43 +1293,61 @@ POST   /api/zones/{z}/snapshot            {name}
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| 监听 | `0.0.0.0:8443` | 不绑 `127.0.0.1`——你要用浏览器访问，绑本地等于每次都得开 SSH 隧道，实际上所有人都会去改成 `0.0.0.0`，不如一开始就正视 |
-| TLS | 自签（首次启动生成，10 年） | 内网够用；要真证书就把 `cert_file`/`key_file` 指到 Caddy 签的路径 |
-| 初始账号 | `install.sh` 生成 20 位随机密码，**打印在终端**并写入 `/etc/labyard/initial-password`（0600，首次登录后自动删除） | 不做"首次访问自己注册"——那等于谁能连上端口谁就是管理员 |
+| 监听 | `0.0.0.0:8443`（`install.sh` 写进 `config.toml`） | 不绑 `127.0.0.1`——你要用浏览器访问，绑本地等于每次都得开 SSH 隧道，实际上所有人都会去改成 `0.0.0.0`，不如一开始就正视 |
+| TLS | 默认开：`install.sh` 用 `openssl` 签一张 10 年自签证书，SAN 含宿主 IP、主机名与 `localhost`。`tls_cert` 与 `tls_key` **都存在**才启用，缺一个就退化成明文 HTTP | 内网够用；要真证书把这两个键指到 Caddy 签的路径 |
+| 初始账号 | 只有 `admin`。密码在服务**首次启动**时生成 20 位随机串，**只打进 journal 一次**；hash 落 `$STATEDIR/password.hash`（0600）。安装器刻意不把它捞出来打印——安装输出会进 shell 历史和自动化管道 | 不做"首次访问自己注册"——那等于谁能连上端口谁就是管理员；也不落明文文件 |
+| 忘记密码 | 删 `$STATEDIR/password.hash` 再 `systemctl restart labyard`，下次启动重新生成 | 宁可走"物理能登宿主就能重置"，也不加一条能被远程打的重置链路 |
 | 账号数量 | **只有 `admin` 一个**，不做多用户、不做角色 | 单机实验环境；多用户要配套权限模型、审计归属、密码重置流程，收益不成比例 |
-| 密码策略 | 登录后可改；**`scrypt`（`scrypt` crate，RustCrypto，N=2¹⁵/r=8/p=1）** 存储；最短 12 位 | 用 RustCrypto 的 scrypt 而非 argon2，少一个依赖且安全性同级 |
-| TOTP | 可选，**totp-rs** | 开了之后 `install.sh` 打印的二维码只显示一次 |
-| IP 允许列表 | `install.sh` 探测当前 SSH 客户端 IP，填入 `/32` 或 `/24` | 留空 = 不限制，UI 上用红字提示 |
-| 会话 | 标准库 `hmac`/`sha256` 签名 cookie（`HttpOnly` + `SameSite=Strict` + `Secure`），8 小时 | 前端不存 token，避免 XSS 放大 |
-| 审计 | 所有写操作进 `audit` 表：谁、何时、改了哪个 zone、run_id、结果 | 只读接口不记，否则表会爆 |
-| CSRF | 所有 `POST/PUT/DELETE` 要求 `X-Labyard: 1` 自定义头 | 简单有效；跨站表单发不出自定义头 |
+| 密码存储 | `scrypt`（RustCrypto `scrypt` crate，N=2¹⁵ / r=8 / p=1，16B salt，32B 输出），比对走 `subtle::ConstantTimeEq` | 用 RustCrypto 的 scrypt 而非 argon2，少一个依赖且安全性同级 |
+| 改密码 | **没有 Web 接口**，改密码 = 删 hash 文件重启重新生成 | 单用户环境下"改密接口"就是一条多余的远程攻击面；真要固定密码，直接改 `password.hash` |
+| 会话 | 标准库 `hmac`+`sha256` 签名的 cookie，内容只有"用户名 + 过期时间戳"；`HttpOnly` + `SameSite=Strict`，**只在 TLS 启用时加 `Secure`**；默认 8 小时 | 前端不存 token，避免 XSS 放大；明文 HTTP 部署下硬加 `Secure` 会导致 cookie 根本存不下来，登录变成"输完密码还是未登录" |
+| CSRF | 靠 `SameSite=Strict` 兜住：跨站表单/`fetch` 不会带上会话 cookie | 没有额外加自定义头校验，见下面"没做的" |
 
-一个必须承认的取舍：**没有做"两个进程、非 root 前端 + root 后端"的拆分**。那种架构更安全，但要自己写一套 IPC、权限校验、重启编排，成本大概等于整个平台的一半，而收益只在"Web 有 RCE 时"这一种场景。单机实验环境、内网、强密码 + allowlist，我选简单的那条路，并且把它写在这里，而不是假装不存在。
+**明确没做的**（早期版本这张表把它们写成了"已实现"，与代码不符，此处更正）：
+
+| 没做 | 为什么 |
+|---|---|
+| TOTP 二次验证 | 需要额外的密钥存储、恢复码、时钟漂移处理与前端二维码流程；单用户内网环境下，直接受益不如把密码长度与 scrypt 参数拉满 |
+| IP 允许列表 | 同样的效果可以交给宿主 `nftables` 或上游防火墙，在应用层再做一遍只会让人误以为"面板已经安全了" |
+| `audit` 审计表 | 有 `runs` 与 `step_state` 两张表记录了"谁在什么时候跑了什么"，足以复盘；再建一张只写不读的 `audit` 表收益很低 |
+| 自定义 CSRF 头（`X-Labyard: 1`） | `SameSite=Strict` 已经挡住跨站携带 cookie；同站子域攻击下自定义头并不构成防护（攻击者一样能设），属于"看起来安全"的措施 |
+
+一个必须承认的取舍：**没有做"两个进程、非 root 前端 + root 后端"的拆分**。那种架构更安全，但要自己写一套 IPC、权限校验、重启编排，成本大概等于整个平台的一半，而收益只在"Web 有 RCE 时"这一种场景。单机实验环境、内网、强密码，我选简单的那条路，并且把它写在这里，而不是假装不存在。
 
 ### 8.5 页面上每个选项的数据来源
 
-"选的地方多，所以更适合 Web"这句话要落地，就是把每一项都变成**运行时从 PVE 查出来**的下拉框，而不是让用户在 YAML 里手打字符串。这张表是前端表单的规格说明：
+早期设想的是一套"表单向导"：每个字段都从 PVE 查出来变成下拉框。实际做下来
+改成了**直接编辑 YAML**（理由见 §8.1 末尾的注），所以这一节描述的是"信息从哪来"，
+而不是"下拉框的选项从哪来"。原则没变：**能查到的事实不要让用户手打**，能在
+写之前发现的冲突不要留到 apply 才报。
 
-| 选项 | 出现在哪 | 数据来源 | 是否记忆上次选择 |
-|---|---|---|---|
-| 节点 | 建 zone | `pvesh get /nodes` | 单节点自动选；集群弹下拉 |
-| **存储** | 建 zone、每台主机可覆盖 | `pvesh get /nodes/{n}/storage`（前端按 `content=rootdir` 过滤） | **不记忆**（§11.4：选错代价太大，强制每次确认） |
-| 存储能力标记 | 同上，每个选项后跟标签 | 同上命令的 `type` + 版本判断 | — |
-| 模板 | 建 zone、每台主机可覆盖 | `pvesh get /nodes/{n}/aplinfo` 与 `pvesh get /nodes/{n}/storage/{s}/content`（筛 `vztmpl`）合并 | 记忆 |
-| 网卡（WAN 桥） | 建 zone | `pvesh get /nodes/{n}/network`，只列 `type=bridge` 且无 IP 冲突提示 | 记忆 |
-| 内网网段 | 建 zone | 用户填，实时查冲突（已存在桥、已分配 zone） | 不记忆 |
-| 上联 | 建 zone | 现有 zone 列表 + `wan` | 记忆 |
-| apt 源 | 建 zone、设置页 | 内置清单；也可填自定义 URL，实时 `HEAD` 探测可达性 | 记忆 |
-| SSH 公钥 | 设置页 | 读宿主 `~/.ssh/*.pub`，也可粘贴 | 记忆 |
-| 时区 | 设置页 | 内置 `zoneinfo` 列表（标准库，无网络依赖） | 记忆 |
-| analysis 的出口 | 新增分析机时 | `wan`（拿管理网地址）/ 某 zone 的 inner（走该 zone 网关）/ `none`（完全离线） | 记忆 |
-| 外来成员 | `/observed`、拓扑图 | `ip -o link show master <桥>` + PVE 的 LXC/QEMU 清单（§5.9） | 不记忆（每次实时扫） |
-| 终端字号 / 主题 | 终端页 | 浏览器 `localStorage` | 记忆（存前端，不进 DB） |
-| VIP 端口范围 | 建 zone | 用户填，查宿主 `ss -ltn` 冲突 | 记忆 |
+| 信息 | 出现在哪 | 数据来源 |
+|---|---|---|
+| 规格清单 | 规格页、编排页 | `GET /api/specs`（扫 `paths.specs/*.yaml`，坏文件也会列出并标 `valid:false`，不会让整个列表消失） |
+| 单个 zone 的片段 | 规格页的片段抽屉 | `GET /api/specs/{name}/zones/{z}`，返回原文片段；不存在返回 `exists:false` 而不是 404 |
+| zone 与上联关系、镜像连线 | 拓扑页 | `GET /api/topology`（后端解析好的 nodes + edges，前端只画） |
+| 主机、角色、IP、vmid、电源、retired | 主机页 | `GET /api/hosts`（`db.all_vmids()` 与 `pct list` 对账后合并规格里的角色与地址） |
+| 网关实况（egress / 端口映射 / VPN 是否真在跑） | 网关面板 | `GET /api/zones/{z}/gateway/status`；VPN 的运行态只能问容器（`systemctl is-active`），查不到就报未运行，不猜 |
+| 端口映射现状 | 网关面板 | 同上响应里的 `pubs` 数组；删除按索引 `DELETE .../gateway/pub/{idx}` |
+| 镜像连线现状 | 网关面板、拓扑 | `GET /api/mirrors` |
+| 快照 | 主机页 | `GET /api/snapshots/{z}/{h}` |
+| 存储能力、模板存储、PVE 版本、外部命令 | 概览页、`labyard doctor` | `GET /api/doctor`（`pvesm status` 列存储与内容类型；`vztmpl` 能力单独一行，因为模板和 rootfs 是两种内容类型） |
+| run 状态与日志 | 运行历史 | `GET /api/runs`、`/runs/{id}/steps`、`/runs/{id}/events`（SSE） |
 
-"记忆"存在 `settings` 表（key-value），不进 YAML——它属于**操作习惯**，不属于**期望状态**。这样换个人用不会互相干扰，清空浏览器也不影响。
+**没有做的两件事**，写在这里免得被当成承诺：
 
-**冲突检测必须实时**，不能等到 Apply 才报。输入网段时就查：这张网段在别的 zone 用过吗？桥上已有的 IP 会不会撞？这类错误在表单上标红一句话就能解决，等到 Plan 阶段就变成"我填了半小时，最后告诉我重来"。
+1. **没有 `settings` 表**。早期设想要存"上次选的存储、终端字号、主题"这类
+   操作习惯。实际实现时发现这类状态几乎没有：界面只有 6 个入口，没有多步表单，
+   也就没有"上次的选择"可言。真需要的偏好放浏览器 `localStorage`，不进 DB。
+2. **模板名与存储名不做校验下拉**。写错时由 apply 阶段 PVE 自己报错（错误信息
+   原文透传到 run 日志里）。在 Web 侧再做一遍白名单等于把 PVE 的版本差异复制一份
+   到我们这边——`doctor` 把"能放模板的存储"列出来已经够用。
+
+**冲突检测放在解析层**，不放在表单层：网段重叠、vmid 冲突、`uplink` 指向不存在的
+zone、镜像目标不是 `analysis`、同一端口映射写两遍……全部在 `resolve_all()` 里报错，
+`POST /api/preview` 与 `POST /api/apply` 都走同一条路径，所以"预览能过、应用报错"
+这种事不会发生。错误信息带具体对象名（哪个 zone、哪台主机、哪个端口），
+不返回 `invalid spec` 这种废话。
 
 ### 8.6 网关策略 / VPN / retire / 多规格 / 拓扑（2026-11 补齐）
 
@@ -1395,29 +1503,29 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 
 | # | 风险 | 影响 | 缓解 |
 |---|---|---|---|
-| 1 | 平台以 root 跑 + Web 暴露 | 拿到面板 = 拿到宿主 | §8.4 全部默认值 + 审计 + allowlist + 自签 TLS |
+| 1 | 平台以 root 跑 + Web 暴露 | 拿到面板 = 拿到宿主 | 默认只一个 `admin` + scrypt + 会话 cookie（`HttpOnly`/`SameSite=Strict`/TLS 下加 `Secure`）+ 自签 TLS；**没有** IP allowlist / TOTP / 审计表（§8.4 里逐条写明），外网暴露前请在宿主或上游加一层来源限制 |
 | 2 | Web 是唯一界面，服务挂了就没法操作 | 实验环境"停在那儿" | `labyard doctor` 不需要 Web；`systemctl restart labyard` 恢复；`apply` 命令可应急；再不济直接点 PVE 页面（桥和 CT 都在，只是没人管状态） |
-| 3 | 桥名 15 字符 | 长 zone 名直接失败 | zone 名限 ≤10 + plan 阶段校验 + 给出建议名 |
-| 4 | 多层 NAT | 端口映射要逐层配；conntrack 表项按层数翻倍；排障路径变长 | 映射链自动生成；`labyard doctor --trace <src> <dst>` 逐跳 ping/tcpdump（只读，Web 上也有按钮） |
+| 3 | 桥名受 `IFNAMSIZ`(15) 限制 | 长 zone 名会让 `lab` + 名字超长，建桥直接失败 | 解析阶段就拦：zone 名 >10 字符报 `zone 名 \`x\` 超过 10 字符，网桥名会超出 IFNAMSIZ(15) 限制`（桥名规则是 `lab` + zone 名） |
+| 4 | 多层 NAT | 端口映射要逐层配；conntrack 表项按层数翻倍；排障路径变长 | 映射链按 zone 上联自动生成（`uplink` 指向谁，就把 DNAT 落在谁的网关上）；**没有** `doctor --trace` 逐跳探测——排障靠 `nft list ruleset` 看 prerouting 链 + 在靶机侧 `tcpdump` |
 | 5 | analysis 重建后 veth 名变 | 镜像静默失效（规则挂不上但不报错） | 每次 apply 重算 `DST_IF`；doctor 校验 filter 数 = 成员口数 |
 | 6 | apt 源不可达 | provision 失败 | 源可切（tuna/ustc/官方/自定义）；`--no-install-recommends`；失败原样回传 |
 | 7 | 半成品状态 | 重跑不确定 | §4.3 reconcile；不自动删重建 |
-| 8 | 你手动建的 VM 接进内网 | 镜像漏掉它，抓包文件缺主角 | §5.9 observed 机制：桥上看见、拓扑显示、镜像自动覆盖、可封禁，但**不能改不能删** |
-| 8b | QEMU 开了 PVE 防火墙时成员口是 `fwln`/`fwpr` | 按 `tap` 前缀识别不到 | 识别规则含 `fwln`/`fwpr`；`doctor` 检测到这类口时打印说明 |
+| 8 | 你手动建的 VM 接进内网 | 镜像漏掉它，抓包文件缺主角 | 规格里声明为成员（§5.9）后，平台按声明接管：桥、地址、镜像都覆盖；**没有**自动发现（"桥上看见但没声明"的机器不会被列出来），也就是说漏配一台不会被提醒 |
+| 8b | QEMU 开了 PVE 防火墙时成员口是 `fwln`/`fwpr` | 按 `tap` 前缀识别不到 | **未处理**：成员口按规格里声明的 vmid 定位（`veth<vmid>i<idx>` / `tap<vmid>i<idx>`），PVE 防火墙把 veth 换成 `fwln`/`fwpr` 时镜像口会挂不上，需要在 zone 里关掉 PVE 防火墙 |
 | 9 | 快照与镜像口 | 回滚后 veth 变化 | 回滚后重跑 `mirror` 步骤 |
-| 10 | 平台自身升级 | DB schema 变 | 编号 SQL 迁移 + `schema_version` 表；升级前用 `VACUUM INTO` 做一致性备份（保留 7 份）——**不依赖外部的 `sqlite3` 命令**，宿主上未必装了 |
-| 11 | 关了 IPv6 但没显式 drop | 主机用 link-local / 自配 ULA 绕过 v4 防火墙，封禁形同虚设 | 默认开；即便是 `false` 也在 forward 链显式 drop v6，`doctor` 用 `nft list ruleset` 校验这条规则在 |
+| 10 | 平台自身升级 | DB schema 变 | 编号 SQL 迁移 + `schema_version` 表，启动时按序补齐；**备份要自己做**（`docs/operations.md` 给了 `VACUUM INTO` 的一行命令），平台不会自动备份 |
+| 11 | IPv4 / IPv6 两套规则不一致 | 主机用 link-local / 自配 ULA 绕过 v4 防火墙 | 网关规则表是 `inet labyard`（同时匹配 v4 与 v6），`iifname <上联> oifname <内网> drop` 对两族都生效，不存在"只挡了 v4"的分叉；`nat: false` 只是不生成 masquerade，不影响过滤 |
 | 12 | 多节点下桥不存在于目标节点 | CT 建好却起不来，或起在错误的二层域 | **首版只支持单节点**；`doctor` 检测到集群直接警告不阻止（单节点功能仍可用），建 zone 时强制绑定当前节点 |
-| 13 | PVE 9 AppArmor 4 + 嵌套容器 | 靶机里跑 Docker 报错怪异 | README 写明已知问题（bug #6538）；平台不碰业务软件，但报错信息里给这条链接 |
-| 14 | 厚 LVM 快照是 tech preview | 以为有快照，实际不可靠 | `doctor` 打黄标；创建快照时二次确认 |
-| 15 | 并发 provision 打满磁盘 IO | **全宿主机卡死**，含 PVE 管理面与 SSH（内存/CPU 不足不会这样） | 三级并发闸（§7.6.4）+ 重步骤并发 3 + `ionice -c2 -n7 nice -n 10` + 同模板 `pct create` 串行 |
-| 16 | 高频 probe 打慢 pmxcfs | `/etc/pve` 是单线程 FUSE，20 台 N+1 查询会拖慢整个节点 | 一律用 `pvesh get /cluster/resources --type vm` 批量取状态；配置详情缓存 10 秒；拓扑轮询 ≥10 秒且页面隐藏时暂停 |
+| 13 | PVE 9 AppArmor 4 + 嵌套容器 | 靶机里跑 Docker 报错怪异 | §6.7 写明已知问题（bug #6538）；平台不碰业务软件，但报错会很怪，先知道这条 |
+| 14 | 厚 LVM 快照是 tech preview | 以为有快照，实际不可靠 | `doctor` 列出存储类型（`lvmthin` / `lvm`），快照操作原样透传 PVE 的报错；**没有**额外的"二次确认"门禁 |
+| 15 | 并发 provision 打满磁盘 IO | **全宿主机卡死**，含 PVE 管理面与 SSH（内存/CPU 不足不会这样） | apply 批内并发默认 3（`--concurrency`）+ `systemd` 的 `IOWeight=50` 兜底；**没有** `ionice`（§7.6.5 第 3 条） |
+| 16 | 高频 probe 打慢 pmxcfs | `/etc/pve` 是单线程 FUSE，20 台 N+1 查询会拖慢整个节点 | 状态一律走一次 `GET /cluster/resources?type=vm` 批量取（`Pve::cluster_vms`），不逐台查；前端轮询 6–15 秒（§7.6.5 第 7 条） |
 | 17 | 改了生成器但步骤哈希不变 | 改好了却不生效，apply 全程 `done`——最容易骗过自己的一类 bug | 生成器版本 `RULESET_VERSION` 进哈希（§8.6.6）；生成逻辑有实质变化必须 +1，否则等于没改 |
 | 18 | 容器 / 宿主重启后运行时状态丢失 | 地址没了 → zone 静默失联；nft 表没了 → 网关静默 fail-open（平台仍显示"策略已下发"） | 地址与策略落成容器内开机 oneshot 单元（§8.6.6），重启自愈；真机用 `pct reboot` 验证过 |
-| 17 | 日志与临时文件撑满 `/var` | 宿主写不进去，PVE 自己开始报错 | 单 step 日志 8 MB 上限、临时文件 TTL 1 小时、总量 5 GB 触发清理、`systemd MemoryMax` 兜底 |
-| 18 | 一次 apply 跑到一半资源不足 | 半成品状态要手工收拾，比拒绝更贵 | apply 前预检内存/磁盘/load，不满足直接拒绝并报出差额（§7.6.7） |
-| 19 | CLI 输出不是兼容契约（改用命令直连的代价） | PVE 小版本改字段 → `KeyError`，且 `pct` 文本格式比 API 更容易变 | 只吃 `--output-format json`，不解析表格；`doctor` 校验关键字段存在；`pve/` 层集中所有命令拼接，一处可改 |
-| 20 | 每次命令 fork/exec 约 100–200 ms | 误在循环里逐台调用 → apply 变慢，且频繁唤醒 pmxcfs | 读一律批量（一条 `pvesh get /cluster/resources`）；`pct config` 结果缓存 10 秒；review 时禁止"循环里起子进程" |
+| 19 | 日志与临时文件撑满 `/var` | 宿主写不进去，PVE 自己开始报错 | 日志不落盘（只走 SSE 与 DB 里每步一行），临时文件任务结束即删；容量风险主要来自**你自己**在容器里产生的数据 |
+| 20 | 一次 apply 跑到一半资源不足 | 半成品状态要手工收拾，比拒绝更贵 | **没有** apply 前预检（§7.6.7 是设想）。半成品靠 §4.3 的 reconcile：修好后重跑，哈希没变的步骤会跳过 |
+| 21 | CLI 输出不是兼容契约（改用命令直连的代价） | PVE 小版本改字段 → `KeyError`，且 `pct` 文本格式比 API 更容易变 | 只吃 `--output-format json`，不解析表格；`doctor` 校验关键字段存在；`pve/` 层集中所有命令拼接，一处可改 |
+| 22 | 每次命令 fork/exec 约 100–200 ms | 误在循环里逐台调用 → apply 变慢，且频繁唤醒 pmxcfs | 读一律批量（一条 `pvesh get /cluster/resources`）；`pct config` 结果缓存 10 秒；review 时禁止"循环里起子进程" |
 
 ---
 
@@ -1444,25 +1552,31 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 
 | 步 | 内容 | 为什么必须在这 |
 |---|---|---|
-| 0 | 仓库骨架：`Cargo.toml`、`rust-toolchain.toml`、`Makefile`（`web` → `build` 依赖链）、`Runner` trait + `testdata/` 回放 | 后面每一步都要能 `cargo test`，骨架不定就会各自长歪 |
+| 0 | 仓库骨架：`Cargo.toml`、`rust-toolchain.toml`、`Makefile`（`web` → `build` 依赖链）、`Runner` 抽象 | 后面每一步都要能 `cargo test`，骨架不定就会各自长歪 |
 | 1 | `src/pve/` 封装 + `doctor` | 连不通、能力不知道，后面全是猜 |
 | 2 | `src/core/schema` + `planner` | 纯函数，能在 fixture 上完整单测，不需要集群 |
-| 3 | `src/core/runner` + `src/resources/`（bridge / ct / bootstrap / mirror / observed） | 引擎成型；此时 `apply` 已能在真机建出东西 |
+| 3 | `src/core/runner` + `src/resources/`（bridge / ct / bootstrap / mirror / provision） | 引擎成型；此时 `apply` 已能在真机建出东西 |
 | 4 | `src/api/` + SSE + 认证 + 反代 | 网页能登、能看、能点 |
 | 5 | 前端：拓扑与详情 → 向导 → 终端与文件 | 前端要有真数据才画得对 |
 | 6 | netns 回归 + 真机验收 | 见 10.3 |
 
 每完成一步都是**可运行**的（能起服务、能登录、能看状态），但中间状态不发布、不打 tag。你可以随时 `git pull` 跑起来看一眼，只是功能不全。
 
-### 10.3 验收（这一步绕不过去）
+### 10.3 验收（对照结果，不含糊）
 
-- **第二遍 0 变更**：同一份 spec 连跑两次，第二次 Plan 全 `noop`，按钮直接变灰
-- **多层同时存在**：`main` + `suba`(接 main) + `subb`(接 suba) + `subc`(接 main) 四种接法并存，各自能出网，镜像流量落同一台 analysis
-- **双栈**：v6 开（默认）与显式关两组用例都过，且关掉时 forward 链的 v6 drop 规则确实在
-- **外来成员**：手动建一台 VM 挂到 `main-inner`，30 秒内出现在拓扑上，且它的流量进了 analysis 的抓包文件
-- **终端与文件**：网页开两个终端窗口同时用不互踢；`rz`/`sz` 通；面板上传下载通
+| 验收项 | 结果 |
+|---|---|
+| **第二遍 0 变更**：同一份 spec 连跑两次，第二次全部 `noop` | ✅ 真机成立。`step_state` 记 `input_hash`，哈希没变就跳过；改一个字段只重跑受影响的那一步 |
+| **多层同时存在**：`main` + `suba` + `subb` + `subc` 四种接法并存，各自能出网 | ✅ `examples/multi.yaml` / `nested.yaml` 都能出计划；真机上跑过 `main` + `lab` 两层，`.1` 落在网关、NAT 生效 |
+| **双栈**：v6 开（默认）与 `nat: false` 两组用例都过 | ⚠️ 区域内 ULA 互通与 NAT66 实测通过；**出公网**没验过（宿主没有 IPv6 上游）。早期打算的"关掉 v6 时显式 drop"没有实现——规则表是 `inet`，两族一起过滤，见 §9 第 11 条 |
+| **外来成员**：手动建一台 VM 挂到桥上，30 秒内出现在拓扑上 | ❌ **没有实现**。现在必须在规格里声明 `vmid` 才会被接管（§5.9） |
+| **终端与文件**：两个终端窗口同时用不互踢；`rz`/`sz` 通 | ✅ 每个连接独立 fork shell，互不干扰；ttyd 自带 ZMODEM，`sz`/`rz` 可用。**没有**面板上的上传下载（早期想过，砍了：ZMODEM 覆盖主场景） |
+| **真机全链路** | ✅ PVE 9.2.2 / x86_64 / 4C11G 上 `doctor` 全绿、`apply` 全步成功、幂等重跑全跳过；详见 §附录 |
 
-一个必须说的现实约束：**我没有 PVE 9 环境**。这台 Mac 上只有 OrbStack（普通 VM，不是 PVE）。所以 1–5 步在"假 Runner"上开发——把真实 `pvesh`/`pct` 的输出录成 fixture，回放给引擎，第 6 步必须你在真机上跑。**回放全绿不等于真机通过**——README 的"已验证 / 未验证"两栏就是为这个留的，不会拿假数据冒充。
+早期这一节写着"我没有 PVE 9 环境，所以 1–5 步在假 Runner 上开发"——那个前提已经不成立：
+现在有真机，**每条 ✅ 都有真机证据**。也没有留下 `testdata/` fixture 回放层：
+纯函数（脚本生成、哈希、YAML 编辑、拓扑）直接单测，需要 PVE 的部分一律上真机跑，
+中间那层"录制回放"既不保真也不会腐烂，省了。
 
 ---
 
@@ -1474,7 +1588,7 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 |---|---|
 | 镜像网职责 | **只做流量镜像**。全局一张 `mirr` 纯二层桥，无 IP、不挂网关，只挂 analysis。gateway 只有 WAN + LAN 两块口 |
 | analysis 外网 | **三选一**：`egress: wan`（默认，拿管理网地址，方便 SSH/传报告）/ `<zone>`（走该 zone 网关，受策略约束）/ `none`（完全离线） |
-| 靶机 | **只做 LXC**。VM 由你在 PVE 自建；建好后平台**能看见**（§5.9 observed）、镜像能覆盖、能封禁，但不建、不配、不纳管 |
+| 靶机 | **只做 LXC**。VM 由你在 PVE 自建；要接进 zone 就在规格里声明 `vmid`（§5.9），声明后地址与镜像都覆盖，但平台不重建磁盘。**不做自动发现** |
 | 凭据 | **创建时选**：`key` / `password` / `key-password`，可在 defaults / zone / host 三层逐级覆盖 |
 | 结构 | 不是"单层/双层"，是**同构 zone 的自由组合**。`uplink` 指向 `wan` 或任意 zone，串几层都行 |
 | 平台边界 | 只管网络环境与基础设施；业务软件、VM、具体服务一律不管，责任分开 |
@@ -1490,12 +1604,12 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 | 名称与许可 | 项目名 `labyard`；许可证 Apache-2.0（专利授权；只通过 subprocess 调 PVE 的 CLI，不链接其代码，不传染 AGPL） |
 | PVE 基线 | **9.x / 单节点**。低于 9.0 拒绝启动，不做 8.x 兼容层；集群只警告不阻止（§6.7） |
 | PVE 交互方式 | **命令直连**：`pct` / `qm` / `pvesh`，不用 HTTP API 客户端、不用 token、不配 ACL。读走 `pvesh --output-format json`，写走原生命令（§6.3）。原因：exec 与 conf 直写 API 本来就做不到，用 API 只会多一条通道 |
-| 后端语言 | **Rust 1.100**（Python → Go → Rust，见 §7.5.1）。直接收益：峰值 6.5 MB、2.6 MB 单二进制、无 GC 抖动、长期内存曲线平坦。代价约 +1.5～1.8 倍工期，集中在三层配置合并、异步子进程生命周期、utoipa 注解 |
+| 后端语言 | **Rust 1.100**（Python → Go → Rust，见 §7.5.1）。收益：常驻 12 MB、12.7 MB 单二进制（含前端）、无 GC 抖动、长期内存曲线平坦。代价约 +1.5～1.8 倍工期，集中在三层配置合并与异步子进程生命周期 |
 | 交付形态 | **单二进制**：`rust-embed` 打进前端与 `assets/`，宿主只需 `scp` + 一个 systemd 单元，不装运行时、不建 venv（§7.3） |
-| 界面形态 | **Web 唯一**。不做操作型 CLI，只留 `serve` / `doctor` / `apply`（给测试）三条（§0） |
-| 账号 | **单管理员** `admin` + 可选 TOTP。不做多用户、不做角色（§8.4） |
-| Web 终端 | **ttyd** 1.7.7 静态二进制（Debian 13 仓库没有）+ 反代；终端内 `rz`/`sz`（lrzsz），大文件走 `pct push/pull`；**独立标签页、可多开**（§7.4） |
-| 外来成员 | 桥上看得见的全部列出（observed）：拓扑显示、镜像自动覆盖、可封禁，**不可改不可删**（§5.9） |
+| 界面形态 | **Web 为主**。不做操作型 CLI，只留 `serve` / `doctor` / `apply`（给测试）/ `destroy`（拆环境）四条（§0） |
+| 账号 | **单管理员** `admin`，scrypt 存储，密码在首次启动时生成一次。不做多用户、不做角色、**不做 TOTP**（§8.4） |
+| Web 终端 | **ttyd** 1.7.7 静态二进制（Debian 13 仓库没有）+ 反代；终端内 `rz`/`sz`（lrzsz）；**内嵌在主机页的抽屉里**，可多开（§7.4） |
+| 外来成员 | **不做自动发现**。在规格里声明 `vmid` 即接管；没声明的机器不列、不管、不镜像（§5.9 说明了为什么） |
 | 交付范围 | **不设阶段**。多层嵌套、全局拓扑、完整页面、终端、文件都属于"做完"的定义（§10） |
 
 ### 11.3 仍按默认执行，你不反对就这么定
@@ -1504,14 +1618,14 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 - apt 源默认 `tuna`；模板列表从 `pveam available` 实时拉，不硬编码版本
 - 容器内应急面板（旧的 `labpanel`）**不移植**——Web 是唯一入口，再塞一个容器内面板就是两套认证、两套审计
 - 单节点上限：12 张桥、单 zone 32 台主机——超了先报错，别等 PVE 自己变慢
-- 所有写操作进审计表；面板监听 `0.0.0.0:8443` + 自签 TLS + 初始随机密码（§8.4）
-- 存储、模板、网卡、apt 源、凭据全部在页面上选，不在配置里猜
+- 面板监听 `0.0.0.0:8443` + 自签 TLS + 首次启动生成的随机密码（§8.4）。**没有审计表**：`runs` + `run_steps` 已经是"谁在什么时候跑了什么"
+- 存储、模板、apt 源、凭据写在 YAML 里（不是下拉框），写错由 apply 阶段 PVE 原文报错；`doctor` 负责把可选项列出来
 
 ### 11.4 这一轮我替你做的三个判断（有异议就说）
 
 | 判断 | 我的选择 | 反方理由 | 为什么还是这么定 |
 |---|---|---|---|
-| 要不要 CLI | 只留 3 条命令 | "脚本化/CICD 需要" | 单机单用户场景，CI 跑不到你的 PVE；真需要批量，Web 的一次 apply 就是批量 |
+| 要不要 CLI | 只留 4 条命令 | "脚本化/CICD 需要" | 单机单用户场景，CI 跑不到你的 PVE；真需要批量，Web 的一次 apply 就是批量 |
 | IPv6 默认 | 开 | "实验室不需要 v6，默认关更简单" | 默认关 = 这段代码永远不被测；等要用时才开，必然炸 |
 | 存储默认 | 不设默认，**第一次必须手选** | "给个默认值体验更顺" | 存储选错（选了不支持快照的 `lvm`）会在两个月后才报应，不如建 zone 时就撞一次墙 |
 
@@ -1523,24 +1637,23 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 
 | 原问题 | 现在怎么做 |
 |---|---|
-| 宿主上哪些 CIDR / VMID 已被占用 | `doctor` 读 `ip -o addr`、`pct list`、`qm list`，算出已用网段与 vmid，建 zone 时在页面上标红冲突项。不靠你手填 |
-| 宿主磁盘是 SATA SSD 还是 NVMe | `doctor` 做一次 `dd` 顺序写测带宽（10 秒、只写 256 MB 临时文件），据此给并发建议。**默认 3 是保守值，实测更快就自动上调** |
-| CPU 架构 / 模板名 | 从 `pveam available` 实时拉，不猜 |
+| 宿主上哪些 CIDR / VMID 已被占用 | `doctor` 列存储与模板存储能力、`pct list` 列现状；**网段/vmid 冲突在解析阶段拦**（`resolve()` 里查本规格内的重复与 `vmid_base` 撞号），不做全局占用扫描 |
+| 宿主磁盘是 SATA SSD 还是 NVMe | **没做**。`--concurrency` 默认 3，想调得自己试（README 里有实测数据：1/2/3/4 → 200/105/70/95 秒） |
+| CPU 架构 / 模板名 | 模板名写在你自己的 YAML 里；`doctor` 检查"有没有能放 `vztmpl` 的存储"，不猜模板名 |
 
 **B. 真需要你表态的三条（偏好，不是技术）**
 
 | 问题 | 我的默认 | 另一种选择 |
 |---|---|---|
-| apply 时资源不够（内存/磁盘/load 超阈值） | **直接拒绝**并报差额 | 硬着头皮跑，跑到哪算哪——半成品要你手工收拾，不推荐 |
-| 日志与 `retired` 机器的保留期 | 日志 30 天或 5 GB 先到者；`retired` **无限期保留**（继续占 IP 与 VMID） | 日志 7 天；`retired` 30 天后自动清理并释放分配 |
-| `observed`（你手工建的机器）要不要支持"纳管" | **不做**，永远只读 | 做的话要处理"纳管前的历史 IP 记录"归属，这是一整套新语义 |
+| apply 时资源不够（内存/磁盘/load 超阈值） | **没做预检**：跑到哪算哪，失败后靠 reconcile 重跑 | 加一道预检要自己估模板解压后的体积、内存峰值与并发叠加，估错了比不估更糟 |
+| 日志与 `retired` 机器的保留期 | 日志不落盘；`retired` **无限期保留**（继续占 IP 与 VMID） | 给 `retired` 加过期回收会让"我明明没删它"变成"它自己没了" |
+| 自动发现（你手工建的机器） | **不做**（§5.9） | 做的话要引入一份"运行时发现但不入档"的影子名单，与"文件即真相"冲突 |
 
 **C. 我按默认执行，随时可改（纯参数）**
 
-- 并发：全局 run 2、重步骤 3、轻步骤 8（§7.6.4）
-- 终端并发 8；单文件上传 2 GB；磁盘水位 5 GB
+- 并发：apply 批内 3（`--concurrency`）、计划闸 4、scrypt 闸 1（§7.6.4）
 - `systemd`：`MemoryMax=64M`、`CPUQuota=50%`、`IOWeight=50`、`TasksMax=256`
-- 拓扑轮询 10 秒；配置缓存 10 秒
+- 前端轮询：拓扑 15 s、运行历史 10 s、概览 10 s、主机 8 s、网关 6 s
 
 ---
 
@@ -1552,42 +1665,57 @@ labyard/                          Apache-2.0
 ├── Cargo.toml  Cargo.lock         依赖定义与锁定（Cargo.lock 必须提交）
 ├── rust-toolchain.toml            锁编译器版本（与 Cargo.lock 一起保证可复现）
 ├── Makefile                       web（vite build）→ build（cargo build）依赖链
-├── .cargo/config.toml             rsproxy 源 + 交叉编译 target 配置
+├── .gitattributes                 web/dist 标 linguist-generated / -diff（免得 diff 被构建产物淹没）
 ├── src/
 │   ├── main.rs                    入口：clap 分发 serve / doctor / apply
-│   ├── core/                      schema / planner / runner / events（不 import axum）
-│   ├── pve/                       pct/qm/pvesh 命令拼装 + JSON 解析 + capability 探测
-│   ├── resources/                 bridge / template / container / net / mirror / observed
-│   ├── db/                        rusqlite 封装 + include_str! 编号 SQL 迁移器（不用 ORM）
-│   ├── api/                       axum handler + SSE + auth + /tty 反代
-│   ├── web/                       rust-embed：#[folder = "web/dist"]
-│   └── assets/                    rust-embed：随二进制分发的执行体
-│       ├── gateway/               重写的 nftables.conf / labgw / labvpn / restore unit
-│       ├── base/bootstrap.sh      主机接入（IP·v6 / SSH / apt / hostname / 时区 / lrzsz）
-│       └── tty/attach.sh          ttyd 的启动命令：校验 vmid → pct exec login
+│   ├── config.rs                  config.toml 解析（含 tls_enabled 等派生判断）
+│   ├── core/                      spec（YAML→模型）/ plan（步骤图）/ runner（子进程）
+│   ├── pve/                       pct/pvesh 命令拼装 + JSON 解析 + 能力探测
+│   ├── resources/                 执行器：probe → decide → apply
+│   │   ├── mod.rs                 Executor：各 StepKind 的落地与开机单元安装
+│   │   ├── net.rs                 地址/路由/解析器脚本（纯函数，可快照回归）
+│   │   ├── gateway.rs             nft 原子批次 + VPN 脚本（纯函数，可快照回归）
+│   │   └── assets.rs              rust-embed 读取 + provisioner 哈希
+│   ├── db/                        rusqlite 封装 + 编号 SQL 迁移器（不用 ORM）
+│   ├── api/                       axum 路由
+│   │   ├── mod.rs                 路由表 / 认证 / SSE / 终端反代 / OpenAPI
+│   │   ├── ops.rs                 规格 CRUD、网关、镜像、retire/revive、拓扑入口
+│   │   ├── specs.rs               规格文件的 CST 就地编辑（yaml-edit）
+│   │   └── topology.rs            YAML → 节点与边
+│   └── (前端产物)                  rust-embed：api/mod.rs 里的 #[folder = "web/dist"]
+├── assets/                        rust-embed：随二进制分发的执行体
+│   ├── base/bootstrap.sh          主机接入（IP·v6 / SSH / apt / hostname / 时区 / lrzsz）
+│   ├── base/labmirror.sh          宿主侧 tc mirred 镜像脚本
+│   ├── base/labmirror@.service    镜像单元模板（每对源/目标一个实例）
+│   └── provisioners/apt-mirror/   apt-cacher-ng 的安装与配置
 ├── web/                           React + TS + AntD 源码（vite 构建到 web/dist）
-├── tests/
-│   ├── unit/                      假 Runner 回放 pct/pvesh 输出（testdata/），不碰真机
-│   └── netns/                     从旧 44 项断言移植
-├── bench/
-│   ├── py_app.py  go_app/  rs_app/   三语言同负载对照（§7.5 的数据来源）
-│   └── alloc/                     分配器对照：glibc / jemalloc / mimalloc（§7.5.2）
-├── installer/install.sh           宿主一键安装 / --update（含 ttyd 静态二进制下载）
+├── bench/                         三语言内存对照 + 分配器对照（可复现）
+├── scripts/                       smoke.sh（HTTP 冒烟）/ api-regress.py（真机逐接口回归）
+│                                   / dev.sh / measure.sh
+├── installer/install.sh           宿主一键安装 / --ttyd（离线）/ --uninstall / --purge
 ├── examples/                      main.yaml / nested.yaml / multi.yaml
 └── docs/
-    ├── design.md                  本文
-    └── operations.md              安装、升级、排障、降级
+    ├── design.md                  本文（唯一权威设计文档）
+    └── operations.md              安装、升级、备份恢复、排障
 ```
+
+单测写在各自模块里的 `#[cfg(test)] mod tests`（不另设 `tests/` 目录）：纯函数
+（脚本生成、哈希、YAML 编辑、拓扑）全部可在没有 PVE 的机器上跑——这是刻意的，
+CI 不需要 root 也不需要 PVE。
 
 三条纪律：
 
-- 旧目录（`lab-net/` 等）**不进这个仓库、不做依赖**；`assets/gateway/` 是重写版，行为以 §1 的教训清单为准
+- 旧目录（`lab-net/` 等）**不进这个仓库、不做依赖**；旧实现的行为清单（空 set、
+  0 字节密钥、`enabled-runtime`、tun 必须 bind mount、veth 名漂移、reset 清状态）
+  已经内化成回归测试项
 - `docs/design.md` 是唯一权威设计文档，旧的 `部署.md` 不再维护
-- CI 跑 `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test` + `cross build --target x86_64-unknown-linux-gnu`；netns 那组需要 root 和 `CAP_NET_ADMIN`，单独一个 job，不要塞进普通单测
+- 没有 CI：这是单人单机的项目，真正要防的回归都在真机上（`make test` + `scripts/api-regress.py`）。
+  `rust-toolchain.toml` 声明了 `rustfmt`/`clippy` 组件，装了就能用；**精简镜像里装不上，
+  所以两者都不作门禁**——`cargo test` 与真机回归才是门禁
 
-**关于 `web/dist/` 要不要提交**：提交。理由：`install.sh` 在 PVE 宿主上放一个二进制就能跑，用户不需要装 Node 20 再 `npm ci && npm run build`（在 Debian 13 上装 Node 20 还得先加 nodesource 源，正好撞上"不要多一层依赖"的原则）。代价是仓库里多几 MB 构建产物、diff 里噪音大——用 `.gitattributes` 标 `linguist-generated` 和 `-diff` 就够了。**注意 `rust-embed` 要求目录在编译时存在，所以 `web/dist` 必须在 `cargo build` 之前生成，`Makefile` 里把 `web` target 设为 `build` 的前置，并在 `web/dist/` 里提交一个占位的 `index.html`，否则 `cargo check` 在干净 clone 上直接失败。**
+**关于 `web/dist/` 要不要提交**：提交。理由：`install.sh` 在 PVE 宿主上放一个二进制就能跑，用户不需要装 Node 20 再 `npm ci && npm run build`（在 Debian 13 上装 Node 20 还得先加 nodesource 源，正好撞上"不要多一层依赖"的原则）。代价是仓库里多几 MB 构建产物、diff 里噪音大——用 `.gitattributes` 标 `linguist-generated` 和 `-diff` 就够了。**注意 `rust-embed` 要求目录在编译时存在，所以 `web/dist` 必须在 `cargo build` 之前生成，`Makefile` 里把 `web` target 设为 `build` 的前置，并保证 `web/dist/` 里有东西，否则 `cargo check` 在干净 clone 上直接失败。**
 
-**关于 `ttyd` 二进制要不要进仓库**：不进。它 1.3 MB、有独立的版本节奏和 CVE 响应，塞进仓库等于我们替上游发版。`install.sh` 从 GitHub Release 按 `uname -m` 下载并校验 SHA256；离线环境提供 `--ttyd /path/to/binary` 跳过下载。
+**关于 `ttyd` 二进制要不要进仓库**：不进。它 1.3 MB、有独立的版本节奏和 CVE 响应，塞进仓库等于我们替上游发版。`install.sh` 从 GitHub Release 按 `uname -m` 下载；离线环境用 `--ttyd /path/to/ttyd` 指定本地文件（不校验 SHA256——上游按架构滚动发布，没有稳定的校验和文件，与其假装校验不如写清楚这一点）。
 
 ---
 

@@ -4,8 +4,8 @@
 可以推倒重来的实验网络。
 
 **状态：功能完整，已在真实 PVE 9.2.2 上端到端验证。** 核心引擎、PVE 命令层、Web 界面
-（规格管理 / 拓扑图 / 网关面板 / 运维 / 终端）、幂等与并发控制全部实现，91 项单元测试
-与真机全链路验证通过（详见文末「已验证 / 未验证」）。
+（规格管理 / 拓扑图 / 网关面板 / 运维 / 终端）、幂等与并发控制全部实现，98 项单元测试、
+26 项 HTTP 冒烟、82 项真机逐接口回归全部通过（详见文末「已验证 / 未验证」）。
 
 ---
 
@@ -94,7 +94,9 @@ mirrors:                      # 跨 zone 的精确镜像连线（host 级 mirror
 ./installer/install.sh
 
 # 浏览器打开 https://<宿主IP>:8443
-# 初始密码在安装结束时会打印一次
+# 初始密码只在服务首次启动时打进 journal 一次：
+journalctl -u labyard | grep 初始管理员密码
+# 忘了就删 /var/lib/labyard/password.hash 再 systemctl restart labyard
 ```
 
 或者只用命令行：
@@ -106,15 +108,17 @@ labyard apply -f examples/main.yaml              # 执行
 labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 ```
 
-## 三条命令
+## 四个子命令
 
 | 命令 | 用途 |
 |---|---|
-| `serve` | Web 界面（唯一完整的操作界面） |
+| `serve` | Web 界面（日常操作都在这里） |
 | `doctor` | 自检：PVE 版本、`pct`/`pvesh`/`pveam` 是否可用、存储能力、桥是否存在 |
-| `apply` | 无界面执行，给测试与 CI 用 |
+| `apply` | 无界面执行一份规格，给测试与 CI 用 |
+| `destroy` | 删掉一个 zone 的全部资源（不可逆，要求显式传 zone 名） |
 
-没有第四种操作型命令。所有日常操作走 Web，避免两套逻辑慢慢长歪。
+没有 `zone create` / `host add` 这类操作型子命令：两套界面维护同一套语义，
+迟早会不一致。
 
 ## 环境要求
 
@@ -126,8 +130,9 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 | 宿主依赖 | `pct` `pvesh` `pveam` `ip` `nft` | `install.sh` 检查，不自动装 PVE 组件 |
 | 存储 | 用户指定，**没有默认值** | 选错代价太大，强制每次确认 |
 
-**自身开销（实测，Debian 13 / amd64，HTTPS，含拓扑图与规格管理）**：常驻 **12.0 MB**、
-二进制 **12.4 MB**（含 1.52 MB 前端）、峰值 **44.9 MB**（`VmHWM`）。
+**自身开销（实测，Debian 13 / amd64，HTTPS，含拓扑图与规格页）**：常驻 **12.0 MiB**
+（`VmRSS` 12248 kB）、二进制 **12.7 MB**（12,703,216 B，含 1.48 MB 前端）、峰值
+**44.8 MB**（`VmHWM` 44784 kB，登录那一瞬间）。
 
 峰值比常驻高 33 MB，原因只有一个：`scrypt(N=2¹⁵, r=8)` 的工作内存是
 `128·N·r = 32 MB`，只在启动生成密码和登录的那一瞬间存在。实测确认——`VmHWM`
@@ -145,11 +150,11 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 
 | 层 | 选择 | 为什么 |
 |---|---|---|
-| 语言 | Rust 1.100 | 常驻 6.9 MB、无 GC 抖动、8.0 MB 单文件（含前端） |
+| 语言 | Rust 1.100 | 常驻 12 MiB、无 GC 抖动、12.7 MB 单文件（含前端） |
 | HTTP | axum 0.8 | 与 tokio 同一 runtime，SSE/WebSocket 原生 |
-| DB | rusqlite（bundled） | 10 张表、按主键取一行，不需要 ORM |
+| DB | rusqlite（bundled） | 6 张表、按主键取一行，不需要 ORM |
 | 配置 | serde_yaml_ng | `serde_yaml` 已归档，这是活跃继任 |
-| 前端 | React 18 + TypeScript + Ant Design 5 + Vite | 成熟组件库，少写表单 |
+| 前端 | React 18 + TypeScript + Ant Design 5 + Vite + React Flow | 成熟组件库；拓扑图用 react-flow + dagre，懒加载 |
 | PVE 通道 | **原生命令**（`pct`/`pvesh`） | 见下 |
 
 **为什么不用 PVE 的 HTTP API**：`pct exec`、写 `/etc/pve/lxc/*.conf`、启停 systemd 模板
@@ -160,16 +165,21 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 
 ```
 src/
-├── core/        schema（YAML→模型）、plan（步骤图）、runner（子进程）
+├── core/        spec（YAML→模型）、plan（步骤图）、runner（子进程）
 ├── pve/         pct/pvesh 命令拼装 + JSON 解析 + 能力探测
-├── resources/   执行器：probe → decide → apply；网络脚本生成
+├── resources/   执行器：probe → decide → apply；net/gateway 脚本生成
 ├── db/          SQLite + 编号迁移
-├── api/         axum 路由、SSE、认证、静态资源
-├── web/         rust-embed 嵌入前端产物
-└── assets/      执行体（bootstrap.sh、ttyd attach、provisioner）
-web/             React + AntD 源码
+├── api/         axum 路由、SSE、认证、规格 CST 编辑、拓扑、终端反代
+│                （前端产物由这里的 rust-embed 从 web/dist 嵌入）
+└── config.rs    宿主配置
+assets/          执行体（base/bootstrap.sh、base/labmirror、provisioners/）
+web/             React + AntD 源码（构建产物在 web/dist，被嵌入二进制）
 bench/           三语言内存对照 + 分配器对照（可复现）
+installer/       install.sh（宿主一键安装 / 卸载）
+scripts/         smoke.sh（HTTP 冒烟）/ api-regress.py（真机逐接口回归）
+                 / dev.sh / measure.sh
 docs/design.md   唯一权威设计文档
+docs/operations.md  安装、升级、备份恢复、排障
 ```
 
 ## 设计上写死的几件事
@@ -190,9 +200,10 @@ docs/design.md   唯一权威设计文档
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | **91 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
+| ✅ 单元测试通过 | **98 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
-| ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.4 MB，含 1.52 MB 前端）与内存（常驻 12.0 MB / 峰值 44.9 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
+| ✅ 真机逐接口回归 | 82 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 分析机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
+| ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.7 MB，含 1.48 MB 前端）与内存（常驻 12.0 MiB / 峰值 44.8 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
 | ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` **14/14** 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、靶机**无默认路由**、宿主入向被网关丢弃；幂等重跑全部跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、靶机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）|
 | ✅ **Web 运维** | 主机表格（电源 start/stop/reboot）、快照（列/建/回滚/删）、run 历史与明细、retry、destroy（zone 名二次确认）。真机逐项验证通过 |
 | ✅ **mirror/analysis** | analysis 主机自动挂 `mirr` 桥（纯二层无 IP）+ 宿主侧 `labmirror@` 单元（tc mirred），落点按桥探测自愈；apt-cacher-ng 缓存链路端到端验证（无外网靶机经缓存装包成功） |
@@ -204,6 +215,7 @@ docs/design.md   唯一权威设计文档
 | ✅ **重启自愈** | 地址与 nft 规则落成容器内开机单元（`labyard-net` / `labyard-nft`）：`pct reboot` 后地址、含端口映射的完整策略、关闭态的 egress 都原样恢复。这一步是真机发现的——早先只 `ip addr` 一次性下发，容器重启后整个 zone 静默失联，网关静默 fail-open |
 | ✅ **Web 终端** | ttyd 1.7.7 静态二进制注入容器（systemd 单元、绑容器内网地址）→ axum HTTP+WS 反代（hyper client + tokio-tungstenite）→ iframe 嵌入（ttyd 自带 xterm.js、CJK 输入、ZMODEM 传文件）。真机验证：页面 200（729 KB）、WS 握手 `101 Switching Protocols` |
 | ⚠️ 仅设计推演 | IPv6 出公网（宿主无 IPv6 上游，环境限制；区域内 ULA 互通与 NAT66 已实测）、厚 LVM 快照、`pct snapshot`、升级迁移（**从未发布，刻意不做**） |
+| ❌ 明确没做 | 自动发现外来成员（`observed`/`unknown`）、IP allowlist、TOTP、审计表、`ionice`、apply 前资源预检、`doctor --trace`。逐条都在 `docs/design.md` §5.9 / §7.6.5 / §8.4 / §9 写明，并在原位置标注了"这是设想，没有实现" |
 
 **mock 全绿不等于真机通过**，这一条不含糊——现在的每一条 ✅ 都有真机证据。
 
