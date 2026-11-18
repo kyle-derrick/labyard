@@ -47,7 +47,11 @@ zones:
 - 三层默认值：`defaults` → `zone` → `host`，逐字段覆盖
 - IPv6 默认开启，只发 ULA（`fd` 开头，按 zone 名确定性派生）+ NAT66，不向上游要前缀
 - 靶机（server/client）**不给默认路由**，只能从内网发起
+- `nat: true`（默认）让网关做地址转换；`nat: false` 只转发不转换，用于上游已经路由了整个网段的情形
+- 同角色主机不写 `ip` 时自动取不同主机位（两台 `server` 是 `.20`/`.21`，不会撞）
 - 幂等的单位是「步骤 key + 输入哈希」，不是版本号
+
+Web 界面里编辑的规格保存在服务端（`paths.specs/lab.yaml`），刷新不丢；改动未保存时标题旁有提示。
 
 ## 快速开始
 
@@ -88,12 +92,13 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 | 宿主依赖 | `pct` `pvesh` `pveam` `ip` `nft` | `install.sh` 检查，不自动装 PVE 组件 |
 | 存储 | 用户指定，**没有默认值** | 选错代价太大，强制每次确认 |
 
-**自身开销（实测，Debian 13 / arm64，HTTP 模式）**：常驻 **6.9 MB**、二进制 **7.9 MB**
-（含 1 MB 前端）、峰值 **38 MB**。
+**自身开销（实测，Debian 13 / arm64，HTTP 模式）**：常驻 **6.9 MB**、二进制 **8.0 MB**
+（含 1.07 MB 前端）、峰值 **38.1 MB**。
 
 峰值比常驻高 31 MB，原因只有一个：`scrypt(N=2¹⁵, r=8)` 的工作内存是
 `128·N·r = 32 MB`，只在启动生成密码和登录的那一瞬间存在。实测确认——`VmHWM`
-在启动完成时就已到 38 MB，之后 200 个并发请求只让常驻从 6.7 涨到 7.4 MB。
+在启动完成时就已到 38.1 MB，之后 200 个并发请求（20 并发）只让常驻从 6.9 涨到 7.5 MB。
+8 个并发登录只把峰值从 38.1 推到 39.2 MB——这是哈希串行化真的生效的证据。
 
 因此 `systemd` 的 `MemoryMax` 取 **64 MB**（32 + 7 + 余量），并且密码哈希与规格解析
 都做了串行/限流。取 16 MB 会在第一次登录时被 OOM kill。
@@ -105,7 +110,7 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 
 | 层 | 选择 | 为什么 |
 |---|---|---|
-| 语言 | Rust 1.100 | 峰值 6.5 MB、无 GC 抖动、2.6 MB 单二进制 |
+| 语言 | Rust 1.100 | 常驻 6.9 MB、无 GC 抖动、8.0 MB 单文件（含前端） |
 | HTTP | axum 0.8 | 与 tokio 同一 runtime，SSE/WebSocket 原生 |
 | DB | rusqlite（bundled） | 10 张表、按主键取一行，不需要 ORM |
 | 配置 | serde_yaml_ng | `serde_yaml` 已归档，这是活跃继任 |
@@ -150,9 +155,9 @@ docs/design.md   唯一权威设计文档
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | 45 项：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、分配器对照 |
-| ✅ HTTP 冒烟通过 | 19 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、错误输入、无 PVE 时优雅降级、OpenAPI |
-| ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（7.9 MB）与内存（常驻 6.9 MB / 峰值 38.1 MB，含 scrypt 32 MB 工作区） |
+| ✅ 单元测试通过 | 50 项：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、分配器对照 |
+| ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
+| ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（8.0 MB）与内存（常驻 6.9 MB / 峰值 38.1 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
 | ⚠️ 仅设计推演 | PVE 9 的字段级行为（`network`、`lxc`、`snapshot`）、`pveam` 模板列表结构、厚 LVM 快照 |
 | ❌ 完全未验证 | 真实 PVE 上的完整 apply、IPv6 双栈全链路、ttyd 反代与文件传输、升级迁移 |
 
