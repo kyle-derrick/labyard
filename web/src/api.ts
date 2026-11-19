@@ -52,11 +52,33 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * 会话令牌（与后端 cookie 同值）。面板被嵌进第三方 iframe 时浏览器不发
+ * cookie，只能靠 Bearer 头；直接访问时 cookie 照常生效，两通道并存。
+ */
+let sessionToken: string | null = null;
+try {
+  sessionToken = localStorage.getItem("labyard-token");
+} catch {
+  /* localStorage 不可用就纯走 cookie */
+}
+
+function saveToken(t: string | null) {
+  sessionToken = t;
+  try {
+    if (t) localStorage.setItem("labyard-token", t);
+    else localStorage.removeItem("labyard-token");
+  } catch {
+    /* 忽略 */
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
       ...(init?.headers ?? {}),
     },
     credentials: "same-origin",
@@ -85,16 +107,26 @@ export const api = {
   me: () => req<{ user: string }>("/api/auth/me"),
 
   login: (password: string) =>
-    req<{ user: string }>("/api/auth/login", {
+    req<{ user: string; token: string }>("/api/auth/login", {
       method: "POST",
       body: JSON.stringify({ password }),
+    }).then((r) => {
+      saveToken(r.token);
+      return r;
     }),
 
-  logout: () => req<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
+  logout: () =>
+    req<{ ok: boolean }>("/api/auth/logout", { method: "POST" }).then((r) => {
+      saveToken(null);
+      return r;
+    }),
   changePassword: (old_password: string, new_password: string) =>
-    req<{ ok: boolean }>("/api/auth/password", {
+    req<{ ok: boolean; token: string }>("/api/auth/password", {
       method: "POST",
       body: JSON.stringify({ old_password, new_password }),
+    }).then((r) => {
+      saveToken(r.token);
+      return r;
     }),
 
   state: () =>
@@ -473,9 +505,11 @@ export function vpnClientUrl(
   return `/api/zones/${encodeURIComponent(zone)}/gateway/vpn/${proto}/client${q}`;
 }
 
-/** Web 终端的 iframe 地址（ttyd 的 base path 与后端反代一致）。 */
+/** Web 终端的 iframe 地址（ttyd 的 base path 与后端反代一致）。
+ * 嵌入环境里浏览器不给第三方 iframe 发 cookie，把令牌放进地址兜底。 */
 export function terminalUrl(zone: string, host: string): string {
-  return `/terminal/${encodeURIComponent(zone)}/${encodeURIComponent(host)}/`;
+  const t = sessionToken ? `?token=${encodeURIComponent(sessionToken)}` : "";
+  return `/terminal/${encodeURIComponent(zone)}/${encodeURIComponent(host)}/${t}`;
 }
 
 /**
@@ -494,6 +528,9 @@ export function streamRun(
       const res = await fetch(`/api/runs/${runId}/events`, {
         signal: ctrl.signal,
         credentials: "same-origin",
+        headers: sessionToken
+          ? { Authorization: `Bearer ${sessionToken}` }
+          : undefined,
       });
       if (!res.body) {
         onDone();

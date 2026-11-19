@@ -145,16 +145,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 // ───────────────────────── 认证 ─────────────────────────
 
-/// 从 cookie 里取用户名。未登录返回 None。
-fn current_user(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    if state.cfg.server.allow_anonymous {
-        return Some("anonymous".into());
-    }
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    let token = cookie
-        .split(';')
-        .filter_map(|c| c.trim().strip_prefix("labyard_session="))
-        .next()?;
+/// 校验一个签名令牌（cookie / Bearer / query 共用）：验签 + 查过期。
+fn verify_token(state: &AppState, token: &str) -> Option<String> {
     let payload = auth::verify(&state.secret, token)?;
     let (user, exp) = payload.rsplit_once('|')?;
     let exp: i64 = exp.parse().ok()?;
@@ -162,6 +154,25 @@ fn current_user(state: &AppState, headers: &HeaderMap) -> Option<String> {
         return None;
     }
     Some(user.to_string())
+}
+
+/// 从请求里取用户。优先 `Authorization: Bearer`（嵌入环境 cookie 可能被
+/// 浏览器拒发），其次 cookie。
+fn current_user(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if state.cfg.server.allow_anonymous {
+        return Some("anonymous".into());
+    }
+    if let Some(h) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(t) = h.strip_prefix("Bearer ") {
+            return verify_token(state, t.trim());
+        }
+    }
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    let token = cookie
+        .split(';')
+        .filter_map(|c| c.trim().strip_prefix("labyard_session="))
+        .next()?;
+    verify_token(state, token)
 }
 
 macro_rules! require_auth {
@@ -185,6 +196,9 @@ struct LoginReq {
 #[derive(Serialize)]
 struct LoginResp {
     user: String,
+    /// 同 cookie 里那个签名令牌。cookie 在第三方 iframe（面板嵌在别处）里
+    /// 会被浏览器拒发，前端把 token 存 localStorage 走 Bearer 头兜底。
+    token: String,
 }
 
 async fn login(
@@ -228,7 +242,11 @@ async fn login(
         "labyard_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age={}",
         state.cfg.server.session_hours * 3600
     );
-    let mut resp = Json(LoginResp { user: "admin".into() }).into_response();
+    let mut resp = Json(LoginResp {
+        user: "admin".into(),
+        token,
+    })
+    .into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
         cookie.parse().unwrap_or_else(|_| "".parse().unwrap()),
@@ -303,7 +321,7 @@ async fn change_password(
         "labyard_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age={}",
         state.cfg.server.session_hours * 3600
     );
-    let mut resp = Json(serde_json::json!({"ok": true})).into_response();
+    let mut resp = Json(serde_json::json!({"ok": true, "token": token})).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
         cookie.parse().unwrap_or_else(|_| "".parse().unwrap()),
@@ -311,7 +329,8 @@ async fn change_password(
     resp
 }
 
-async fn logout(State(state): State<Arc<AppState>>) -> Response {    let secure = if state.cfg.tls_enabled() { "; Secure" } else { "" };
+async fn logout(State(state): State<Arc<AppState>>) -> Response {
+    let secure = if state.cfg.tls_enabled() { "; Secure" } else { "" };
     let mut resp = Json(serde_json::json!({"ok": true})).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
@@ -1094,10 +1113,17 @@ async fn terminal_impl(
     path: String,
     req: axum::extract::Request,
 ) -> Response {
-    // 认证走 cookie（前端 iframe 与 WebSocket 都自动带，无需额外令牌）
+    // 认证三通道：cookie / Authorization Bearer / ?token=（面板嵌在 iframe 里时
+    // 浏览器对第三方 iframe 不发 cookie，终端 iframe 只能把令牌放进地址）。
     {
         let headers = req.headers().clone();
-        if current_user(&state, &headers).is_none() {
+        let qs_token = req
+            .uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")));
+        let authed = current_user(&state, &headers).is_some()
+            || qs_token.is_some_and(|t| verify_token(&state, t).is_some());
+        if !authed {
             return unauthorized();
         }
     }
@@ -1110,10 +1136,18 @@ async fn terminal_impl(
     };
 
     let (mut parts, body) = req.into_parts();
+    // token 别转发给 ttyd——它只认自己的参数
     let qs = parts
         .uri
         .query()
-        .map(|q| format!("?{q}"))
+        .map(|q| {
+            let filtered: Vec<&str> = q.split('&').filter(|kv| !kv.starts_with("token=")).collect();
+            if filtered.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", filtered.join("&"))
+            }
+        })
         .unwrap_or_default();
     let target = format!("/terminal/{z}/{h}/{path}");
 

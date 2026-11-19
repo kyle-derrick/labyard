@@ -40,7 +40,7 @@ import {
   ThunderboltOutlined,
 } from "@ant-design/icons";
 import TopologyGraph, { ROLE_LABEL } from "./TopologyGraph";
-import { api, vpnClientUrl, type GatewayStatus, type MirrorRow, type ReconcileInfo, type TopoEdge, type TopoNode } from "./api";
+import { api, terminalUrl, vpnClientUrl, type GatewayStatus, type MirrorRow, type ReconcileInfo, type TopoEdge, type TopoNode } from "./api";
 
 const { Text } = Typography;
 
@@ -302,11 +302,7 @@ export default function TopologyPage() {
         key: "term",
         label: "打开终端",
         onClick: () => {
-          window.open(
-            `/terminal/${encodeURIComponent(menuNode.zone!)}/${encodeURIComponent(menuNode.label)}/`,
-            "_blank",
-            "noopener",
-          );
+          window.open(terminalUrl(menuNode.zone!, menuNode.label), "_blank", "noopener");
           setMenu(null);
         },
       });
@@ -575,11 +571,7 @@ export default function TopologyPage() {
               <Button
                 size="small"
                 onClick={() =>
-                  window.open(
-                    `/terminal/${encodeURIComponent(detail.zone!)}/${encodeURIComponent(detail.label)}/`,
-                    "_blank",
-                    "noopener",
-                  )
+                  window.open(terminalUrl(detail.zone!, detail.label), "_blank", "noopener")
                 }
               >
                 打开终端
