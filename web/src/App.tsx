@@ -172,6 +172,10 @@ export default function App() {
           borderBottom: "1px solid var(--border)",
           paddingInline: 20,
           height: 56,
+          // antd 的 Header 默认 line-height:64，只改 height 会让菜单项比顶栏高、
+          // 下划线和右缘溢出。两者必须一起改。
+          lineHeight: "56px",
+          overflow: "hidden",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 24, flex: 1, minWidth: 0 }}>
@@ -183,7 +187,7 @@ export default function App() {
             disabledOverflow
             selectedKeys={[page]}
             onClick={(e) => setPage(e.key as Page)}
-            style={{ flex: 1, minWidth: 0, borderBottom: "none", background: "transparent" }}
+            style={{ flex: 1, minWidth: 0, borderBottom: "none", background: "transparent", lineHeight: "56px" }}
             items={[
               {
                 key: "editor",

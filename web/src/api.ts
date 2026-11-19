@@ -41,7 +41,9 @@ export type RunEvent =
   | { kind: "skipped"; key: string; lines: number }
   | { kind: "upstream_skipped"; key: string; reason: string }
   | { kind: "finished"; key: string; code: number | null; duration_ms: number }
-  | { kind: "failed"; key: string; error: string };
+  | { kind: "failed"; key: string; error: string }
+  /** 整个 run 的进度（done/total 步），由执行器每完成一步推一次 */
+  | { kind: "progress"; done: number; total: number };
 
 class ApiError extends Error {
   constructor(
@@ -240,8 +242,10 @@ export const api = {
     ),
 
   // ── 网关 ──
-  gateway: (zone: string) =>
-    req<GatewayStatus>(`/api/zones/${encodeURIComponent(zone)}/gateway/status`),
+  gateway: (zone: string, fresh = false) =>
+    req<GatewayStatus>(
+      `/api/zones/${encodeURIComponent(zone)}/gateway/status${fresh ? "?fresh=true" : ""}`,
+    ),
 
   setEgress: (zone: string, on: boolean) =>
     req<{ ok: boolean; run_id: string }>(
@@ -476,6 +480,8 @@ export type MirrorRow = {
   spec: string;
   from: string;
   to: string;
+  /** 监控机的声明名（如 lab:monitor）；to 是实际落点（wan:monitor）时用它展示 */
+  to_alias?: string | null;
   src_bridge: string;
   capture_bridge?: string;
   source_iface?: string;

@@ -272,7 +272,7 @@ impl Pve {
         spec: CommandSpec,
         cancel: &CancellationToken,
     ) -> Result<Output, PveError> {
-        let display = spec.display();
+        let display = spec.brief();
         let out = self.runner.run(key, &spec, None, cancel, true).await?;
         match out.code {
             Some(0) => Ok(out),
@@ -533,6 +533,40 @@ fi
             .collect())
     }
 
+    /// 容器里**实际存在**的 eth* 网口数量（读 /sys/class/net，不问配置）。
+    ///
+    /// 用来发现"配置改了但 netns 没重建"——`pct set --netN` 对运行中的容器
+    /// 不生效，这是最容易被忽略的一条：`pct config` 看着对，`ip addr` 里没有。
+    /// 查询失败返回 0，调用方据此**不做**重启（不能因为一次 exec 失败就重启用户容器）。
+    pub async fn ct_running_nics(
+        &self,
+        vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<usize, PveError> {
+        let out = self
+            .runner
+            .run(
+                &format!("ct-nics:{vmid}"),
+                &CommandSpec::new(
+                    "pct",
+                    vec![
+                        "exec".into(),
+                        vmid.to_string(),
+                        "--".into(),
+                        "sh".into(),
+                        "-c".into(),
+                        "ls /sys/class/net | grep -c '^eth'".into(),
+                    ],
+                )
+                .with_timeout(Duration::from_secs(15)),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(out.stdout.trim().parse::<usize>().unwrap_or(0))
+    }
+
     /// 建 CT。已存在则改为 `pct set` 更新配置（幂等的关键）。
     ///
     /// 三件事必须在这里做掉，否则后面的步骤全是空转：
@@ -558,6 +592,7 @@ fi
         template_vol: &str,
         bridge: &str,
         uplink_bridge: Option<&str>,
+        uplink_ip: Option<&str>,
         capture_bridges: &[String],
         dhcp: bool,
         password: Option<&str>,
@@ -572,17 +607,19 @@ fi
 
         // 期望的网卡列表：顺序即 eth 编号，建机与改机共用一份，避免两条路径
         // 各写一遍而慢慢漂开。
-        let mut nets: Vec<(String, String, &'static str)> = Vec::new();
+        let mut nets: Vec<(String, String, String)> = Vec::new();
         let mgmt_ip = if dhcp { "dhcp" } else { "manual" };
-        nets.push(("eth0".into(), bridge.to_string(), mgmt_ip));
+        nets.push(("eth0".into(), bridge.to_string(), mgmt_ip.to_string()));
         if let Some(up) = uplink_bridge {
-            nets.push(("eth1".into(), up.to_string(), "dhcp"));
+            // 嵌套 zone 的上联桥没有 DHCP 服务，必须给静态地址；
+            // 只有上联是真实外网桥时才走 dhcp。
+            nets.push(("eth1".into(), up.to_string(), uplink_ip.unwrap_or("dhcp").to_string()));
         }
         for b in capture_bridges {
             nets.push((
                 format!("eth{}", nets.len()),
                 b.clone(),
-                "manual",
+                "manual".to_string(),
             ));
         }
 
@@ -629,6 +666,12 @@ fi
                 .await?;
             }
             Some(row) => {
+                // 运行时网口数：`pct set --netN` 对**运行中**的容器只改配置，
+                // 新网卡要等重启才会出现在 netns 里。不比较这个，"网关 eth1
+                // 上联"就永远只是配置文件里的一行——容器里没有 eth1，整段
+                // 内网没有出口，apt bootstrap 每次都退出码 100，run 一跑就是
+                // 好几分钟且永远不收敛。
+                let runtime_nics = self.ct_running_nics(vmid, cancel).await.unwrap_or(0);
                 // 已存在：只更新会漂移的字段，一条命令合并，避免 N 次 pct set 打 pmxcfs
                 let mut args: Vec<String> = vec!["set".into(), vmid.to_string()];
                 args.extend(["--cores".into(), cores.to_string()]);
@@ -656,6 +699,10 @@ fi
                 // 手工 `pct stop` 过的容器如果这里不管，后面 `pct exec` 会全部失败。
                 if row.status.as_deref() != Some("running") {
                     self.ct_action(vmid, "start", cancel).await?;
+                } else if runtime_nics > 0 && runtime_nics != nets.len() {
+                    // 网口数量对不上：配置里有的口容器里没有（或反过来）。
+                    // 重启一次让 netns 按新配置重建；net 步骤随后会重放地址脚本。
+                    self.ct_action(vmid, "reboot", cancel).await?;
                 }
             }
         }

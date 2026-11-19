@@ -30,8 +30,17 @@ function runStatusTag(s: string) {
       return <Tag color="red">失败</Tag>;
     case "cancelled":
       return <Tag color="orange">已取消</Tag>;
-    default:
+    case "interrupted":
+      // 服务重启/进程被杀留下的：它不会自己再跑完，别显示成"进行中"
+      return (
+        <Tooltip title="执行进程已不在（服务重启或被杀）。点「重试」按当前规格续跑。">
+          <Tag color="volcano">已中断</Tag>
+        </Tooltip>
+      );
+    case "running":
       return <Tag color="blue">进行中</Tag>;
+    default:
+      return <Tag>{s}</Tag>;
   }
 }
 

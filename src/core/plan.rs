@@ -96,6 +96,8 @@ pub enum StepKind {
         bridge: String,
         /// 只有网关有第二块网卡（上联）。没有它，网关脚本配 eth1 会直接失败。
         uplink_bridge: Option<String>,
+        /// 上联口的静态地址（嵌套 zone 必填，父 zone 的桥上没有 DHCP）
+        uplink_ip: Option<String>,
         /// eth0 走 DHCP 而不是静态地址。只有"挂在外部网桥上"的主机是这样。
         dhcp: bool,
         ipv4: String,
@@ -105,6 +107,11 @@ pub enum StepKind {
         /// 建机时的 root 密码；不写就用 PVE 默认（无密码 + SSH key）
         password: Option<String>,
         hostname: String,
+        /// 网口收敛版本。`pct set --netN` 对运行中的容器不生效，早期版本
+        /// 没在网口数量不一致时重启，导致"配置里有 eth1、容器里没有"，
+        /// 嵌套网关整段没出口、bootstrap 永远 apt 失败。把版本写进步骤
+        /// 哈希里，升级后所有容器步骤重跑一次，顺带把这类漂移修正掉。
+        net_rev: u8,
     },
     Net {
         zone: String,
@@ -115,6 +122,9 @@ pub enum StepKind {
         ipv6_prefix: Option<String>,
         /// 是否网关：走带 NAT 的网关脚本，内网口 eth0 / 上联口 eth1
         is_gateway: bool,
+        /// 上联口静态地址与默认路由（嵌套 zone 用；外网桥留 None 走 DHCP）
+        uplink_ip: Option<String>,
+        uplink_gw: Option<String>,
         /// 是否需要默认路由。网关与监控机需要（要出网装包），普通主机不要
         default_route: bool,
         /// 解析器列表（来自 spec，逐级继承）。空 = 用内置公共 DNS。
@@ -318,12 +328,18 @@ impl Plan {
                     } else {
                         None
                     },
+                    uplink_ip: if h.role == Role::Gateway {
+                        z.uplink_ip.clone()
+                    } else {
+                        None
+                    },
                     dhcp: z.external,
                     ipv4: h.ipv4.clone(),
                     gateway,
                     ssh_keys: h.ssh_keys.clone(),
                     password: h.password.clone(),
                     hostname: format!("{}-{}", sanitize(&z.name), sanitize(&h.name)),
+                    net_rev: 2,
                 };
                 let mut deps = vec![format!(
                     "template:{}:{}",
@@ -365,7 +381,12 @@ impl Plan {
                 let vmid = h.vmid.unwrap_or_else(|| vmid_for(&z.name, &h.name));
                 let is_gw = h.role == Role::Gateway;
                 // 网关要出网（走 eth1），监控机要装包/上报，其余主机必须隔离
-                let wants_route = matches!(h.role, Role::Gateway | Role::Monitor);
+                // 网关要出网（走 eth1），监控机要装包/上报；普通主机**只在
+                // 这个网络真的开了 NAT 时**才给默认路由——`nat` 默认是开的
+                // （"网段能上网"是这个产品的默认预期），不开 NAT 的网络才是
+                // 纯隔离网段，里面的主机连网关都不该有默认路由。
+                let wants_route =
+                    matches!(h.role, Role::Gateway | Role::Monitor) || z.nat;
                 let kind = StepKind::Net {
                     zone: z.name.clone(),
                     host: h.name.clone(),
@@ -374,6 +395,8 @@ impl Plan {
                     gateway: if is_gw { None } else { gw_ipv4.clone() },
                     ipv6_prefix: h.ipv6_prefix.clone(),
                     is_gateway: is_gw,
+                    uplink_ip: if is_gw { z.uplink_ip.clone() } else { None },
+                    uplink_gw: if is_gw { z.uplink_gw.clone() } else { None },
                     default_route: wants_route,
                     nat: is_gw && z.nat,
                     dns: h.dns.clone(),
@@ -740,7 +763,7 @@ zones:
     }
 
     #[test]
-    fn only_targets_lack_default_route() {
+    fn default_route_follows_nat_and_role() {
         let p = build(Y);
         let get = |name: &str| -> (bool, bool) {
             p.steps
@@ -759,8 +782,11 @@ zones:
         // (is_gateway, default_route)
         assert_eq!(get("gateway"), (true, true), "网关是网关，且要出网");
         assert_eq!(get("analysis"), (false, true), "监控机不是网关，但要装包");
-        assert_eq!(get("server1"), (false, false), "普通主机不要默认路由");
-        assert_eq!(get("client1"), (false, false), "普通主机不要默认路由");
+        // nat 默认开：内网主机经网关出网是默认预期，所以要有默认路由。
+        // （以前这里断言 false——那条规则让"nat 默认开"变成了空话：
+        //  主机根本没有路由，apt 装包必然失败。）
+        assert_eq!(get("server1"), (false, true), "nat 开的网络里主机要能出网");
+        assert_eq!(get("client1"), (false, true), "nat 开的网络里主机要能出网");
     }
 
     #[test]

@@ -11,8 +11,10 @@ const qc = new QueryClient({
     queries: {
       retry: 1,
       refetchOnWindowFocus: false,
-      // 拓扑/状态轮询交给页面控制，全局不自动轮询
-      staleTime: 5_000,
+      // 页面间来回切不该每次都重打接口（hosts ~1s、doctor ~4s 都是慢接口），
+      // 15 秒内复用缓存；需要实时的页面自己设 refetchInterval。
+      staleTime: 15_000,
+      gcTime: 5 * 60_000,
     },
   },
 });
@@ -30,7 +32,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
             '-apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif',
         },
         components: {
-          Layout: { headerBg: "#ffffff", siderBg: "#ffffff" },
+          Layout: { headerBg: "#ffffff", headerHeight: 56, headerPadding: "0 20px" },
         },
       }}
     >

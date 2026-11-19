@@ -12,6 +12,7 @@ import {
   Input,
   Modal,
   Popconfirm,
+  Progress,
   Row,
   Segmented,
   Select,
@@ -39,7 +40,7 @@ import { api, streamRun, type PreviewStep, type RunEvent, type SpecMeta } from "
 import Topology, { type Zone } from "./Topology";
 import SpecVisual from "./SpecVisual";
 
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
 
 const SAMPLE = `defaults:
   cores: 2
@@ -81,7 +82,14 @@ mirrors:
   - { from: "sub:win1", to: "main:probe" }
 `;
 
-type LogLine = { cls: string; text: string };
+type LogLine = { cls: string; text: string; key?: string };
+
+/** 毫秒 → 1m23s / 45s，执行进度里显示用时 */
+function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(s / 60);
+  return m > 0 ? `${m}m${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+}
 
 /** 规格文件管理（原独立「规格」页的核心部分，并进编排页的抽屉）。
  *
@@ -281,11 +289,27 @@ export default function Editor() {
   const [busy, setBusy] = useState(false);
   const [runId, setRunId] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogLine[]>([]);
+  /** 进度：后端每完成一步推一次 {done,total} */
+  const [prog, setProg] = useState<{ done: number; total: number } | null>(null);
+  /** 当前正在跑的步骤 */
+  const [cur, setCur] = useState<string | null>(null);
+  /** 本次运行的计数与失败清单，结束后给结论 */
+  const [tally, setTally] = useState<{ ok: number; skip: number; fail: number; errors: string[] }>({
+    ok: 0,
+    skip: 0,
+    fail: 0,
+    errors: [],
+  });
+  /** 日志过滤：all=全部，error=只看失败/错误 */
+  const [logFilter, setLogFilter] = useState<"all" | "error">("all");
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
   const [snapshot, setSnapshot] = useState(false);
   // 服务端保存的那一份。null = 从未保存过（此时以内置样例为基准判断是否改动）
   const [saved, setSaved] = useState<string | null>(null);
   const [specMgrOpen, setSpecMgrOpen] = useState(false);
   const stopRef = useRef<null | (() => void)>(null);
+  const pollRef = useRef<number | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
   const dirty = yaml !== (saved ?? SAMPLE);
@@ -375,6 +399,11 @@ export default function Editor() {
     setErr(null);
     setBusy(true);
     setLogs([]);
+    setProg(null);
+    setCur(null);
+    setTally({ ok: 0, skip: 0, fail: 0, errors: [] });
+    setStartedAt(Date.now());
+    setNow(Date.now());
     // 记下这一刻提交的文本：执行期间用户可能继续改编辑器，
     // 自动保存要存的是"跑的那一份"，不是改过的新文本。
     const sent = yaml;
@@ -404,23 +433,49 @@ export default function Editor() {
           } else if (ev.kind === "upstream_skipped") {
             pushLog({ cls: "ln-skip", text: `⊘ ${ev.key}: ${ev.reason}` });
           } else if (ev.kind === "failed") {
-            pushLog({ cls: "ln-fail", text: `✗ ${ev.key}: ${ev.error}` });
+            pushLog({ cls: "ln-fail", text: `✗ ${ev.key}: ${ev.error}`, key: ev.key });
+            setTally((t) => ({ ...t, fail: t.fail + 1, errors: [...t.errors, `${ev.key}: ${ev.error}`] }));
           } else if (ev.kind === "started") {
-            pushLog({ cls: "ln-skip", text: `▶ ${ev.command}` });
+            setCur(ev.key);
+            pushLog({ cls: "ln-skip", text: `▶ ${ev.command}`, key: ev.key });
+          } else if (ev.kind === "progress") {
+            setProg({ done: ev.done, total: ev.total });
           } else if (ev.kind === "finished" && !ev.key.startsWith("run:")) {
             pushLog({
               cls: ev.code === 0 ? "ln-ok" : "ln-fail",
               text: `■ ${ev.key} 退出码 ${ev.code}（${ev.duration_ms} ms）`,
+              key: ev.key,
             });
+            setTally((t) => ({ ...t, ok: t.ok + (ev.code === 0 ? 1 : 0) }));
           }
         },
         () => {
           setBusy(false);
           stopRef.current = null;
-          message.success("执行结束");
+          setCur(null);
         },
       );
       stopRef.current = stop;
+
+      // 兜底：SSE 断流、切页回来、或浏览器把流掐了的时候，靠轮询 run 状态收尾。
+      // 没有这条，"进行中"会一直挂着，用户永远等不到结论。
+      if (pollRef.current) window.clearInterval(pollRef.current);
+      pollRef.current = window.setInterval(async () => {
+        try {
+          const list = await api.runs();
+          const row = list.runs.find((x) => x.id === r.run_id);
+          if (row && row.status !== "running") {
+            if (pollRef.current) window.clearInterval(pollRef.current);
+            pollRef.current = null;
+            stopRef.current?.();
+            stopRef.current = null;
+            setBusy(false);
+            setCur(null);
+          }
+        } catch {
+          /* 网络抖动忽略，下一轮再试 */
+        }
+      }, 5000);
     } catch (e) {
       setErr((e as Error).message);
       setBusy(false);
@@ -437,8 +492,23 @@ export default function Editor() {
     }
   };
 
-  const grouped = useMemo(() => {
-    const g = new Map<string, PreviewStep[]>();
+  // 秒表：跑的时候每秒刷一次"已用时"
+  useEffect(() => {
+    if (!busy) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [busy]);
+
+  // 卸载时收干净：轮询定时器与 SSE 连接都不该留在后台
+  useEffect(
+    () => () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+      stopRef.current?.();
+    },
+    [],
+  );
+
+  const grouped = useMemo(() => {    const g = new Map<string, PreviewStep[]>();
     for (const s of steps) {
       const arr = g.get(s.phase) ?? [];
       arr.push(s);
@@ -630,11 +700,21 @@ export default function Editor() {
         )}
 
         <Card
-          title="执行日志"
+          title={
+            <Space size={8}>
+              <span>执行</span>
+              {busy && <Tag color="processing">进行中</Tag>}
+              {!busy && prog && prog.done > 0 && (
+                <Tag color={tally.fail > 0 ? "red" : "green"}>
+                  {tally.fail > 0 ? "有失败" : "完成"}
+                </Tag>
+              )}
+            </Space>
+          }
           size="small"
           extra={
             runId ? (
-              <Text type="secondary" className="mono">
+              <Text type="secondary" className="mono" style={{ fontSize: 12 }}>
                 {runId}
               </Text>
             ) : (
@@ -644,6 +724,50 @@ export default function Editor() {
             )
           }
         >
+          {(prog || busy) && (
+            <div style={{ marginBottom: 10 }}>
+              <Progress
+                percent={prog && prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0}
+                size="small"
+                status={busy ? "active" : tally.fail > 0 ? "exception" : "success"}
+                format={() =>
+                  prog ? `${prog.done}/${prog.total} 步` : busy ? "排队中…" : ""
+                }
+              />
+              <Space size={14} wrap style={{ fontSize: 12, marginTop: 4 }}>
+                {busy && cur && (
+                  <Text>
+                    正在执行 <code>{cur}</code>
+                  </Text>
+                )}
+                <Text type="secondary">
+                  成功 {tally.ok} · 失败 {tally.fail}
+                </Text>
+                {startedAt && (
+                  <Text type="secondary">
+                    {busy ? "已用时" : "总用时"} {fmtDuration(now - startedAt)}
+                  </Text>
+                )}
+              </Space>
+            </div>
+          )}
+
+          {!busy && tally.errors.length > 0 && (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 10 }}
+              message={`${tally.errors.length} 个步骤失败`}
+              description={
+                <div className="mono" style={{ fontSize: 12, maxHeight: 160, overflow: "auto" }}>
+                  {tally.errors.map((e, i) => (
+                    <div key={i}>✗ {e}</div>
+                  ))}
+                </div>
+              }
+            />
+          )}
+
           <div className="log-view" ref={logRef}>
             {logs.length === 0 ? (
               <span style={{ color: "#5b6b84" }}>
@@ -651,19 +775,32 @@ export default function Editor() {
                 {"\n"}已完成且参数未变的步骤会被跳过，并标注原因。
               </span>
             ) : (
-              logs.map((l, i) => (
+              (logFilter === "error"
+                ? logs.filter((l) => l.cls.includes("fail") || l.cls === "ln-stderr")
+                : logs
+              ).map((l, i) => (
                 <div key={i} className={l.cls}>
                   {l.text}
                 </div>
               ))
             )}
           </div>
-          {runId && (
-            <Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0, fontSize: 12 }}>
-              <CheckCircleOutlined /> 日志超过 3000 行会丢弃较早部分；
-              <CloseCircleOutlined /> 超过 500 行的瞬时输出会丢中间行并标注。
-            </Paragraph>
-          )}
+          <Space style={{ marginTop: 8 }} size={12} wrap>
+            <Segmented
+              size="small"
+              value={logFilter}
+              onChange={(v) => setLogFilter(v as "all" | "error")}
+              options={[
+                { value: "all", label: "全部" },
+                { value: "error", label: "只看错误" },
+              ]}
+            />
+            {runId && (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                <CheckCircleOutlined /> 日志超 3000 行丢弃较早部分；瞬时超 500 行会丢中间行并标注
+              </Text>
+            )}
+          </Space>
         </Card>
       </Col>
 

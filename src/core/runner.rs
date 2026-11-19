@@ -61,6 +61,18 @@ impl CommandSpec {
         }
         s
     }
+
+    /// 命令摘要：单行、限长。错误信息与日志里都用它——`pct exec -- sh -c
+    /// "<base64 脚本>"` 完整的能刷满好几屏，真正有用的信息（哪个容器、哪一步）
+    /// 反而被埋掉了。
+    pub fn brief(&self) -> String {
+        let full = self.display();
+        if full.chars().count() <= 180 {
+            return full;
+        }
+        let head: String = full.chars().take(160).collect();
+        format!("{head}…（共 {} 字符，长脚本已省略）", full.chars().count())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -102,6 +114,12 @@ pub enum Event {
     Failed {
         key: String,
         error: String,
+    },
+    /// 整个 run 的粗粒度进度：done/total 步。前端据此画进度条，
+    /// 不必自己数 Started/Finished（并发阶段数不准）。
+    Progress {
+        done: usize,
+        total: usize,
     },
 }
 
@@ -169,7 +187,8 @@ impl Runner for RealRunner {
         capture: bool,
     ) -> Result<Output, RunError> {
         let started = Instant::now();
-        let display = spec.display();
+        // 真实执行用完整 display；事件流/错误信息用 brief（限长）。
+        let display = spec.brief();
 
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)

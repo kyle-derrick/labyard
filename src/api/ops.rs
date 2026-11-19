@@ -14,6 +14,7 @@ use axum::{
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{build_plan, current_user, spawn_plan, AppState};
@@ -23,6 +24,43 @@ use crate::core::spec::Spec;
 use crate::resources::Executor;
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
+
+/// 网关面板状态缓存（8 秒）。抽屉一开就要问容器"VPN 真的在跑吗"，
+/// 而 `pct exec` 还要排在全局 exec 闸后面——run 正在跑的时候，打开面板
+/// 会干等几十秒才有第一个像素。缓存让打开面板立刻出数，实时性靠
+/// `?fresh=1`（刷新按钮）和 8 秒自然过期来保证。
+static GW_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (Instant, serde_json::Value)>>,
+> = std::sync::OnceLock::new();
+
+fn gw_cache_get(zone: &str) -> Option<serde_json::Value> {
+    let c = GW_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let g = c.lock().ok()?;
+    let (at, v) = g.get(zone)?;
+    (at.elapsed() < Duration::from_secs(8)).then(|| v.clone())
+}
+
+fn gw_cache_put(zone: &str, v: serde_json::Value) {
+    let c = GW_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = c.lock() {
+        g.insert(zone.to_string(), (Instant::now(), v));
+    }
+}
+
+/// 写操作之后必须踢掉缓存：出网开关/映射/VPN 改完立刻回读，
+/// 8 秒的旧值会让人以为"点了没生效"。
+fn gw_cache_clear(zone: &str) {
+    let c = GW_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = c.lock() {
+        g.remove(zone);
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GwQuery {
+    #[serde(default)]
+    pub fresh: bool,
+}
 
 fn err(code: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
     (code, msg.into())
@@ -388,6 +426,8 @@ where
     save_spec(&state, &spec_name, &next)?;
     let plan = gateway_step_plan(&state, zone, &next).await?;
     let run_id = spawn_plan(&state, &plan, &format!("gateway:{zone}")).await;
+    // 改动已落规格：状态缓存必须立刻作废，否则紧接着的回读拿的是旧值。
+    gw_cache_clear(zone);
     Ok(Json(serde_json::json!({
         "ok": true,
         "run_id": run_id,
@@ -468,6 +508,30 @@ pub async fn set_zone_monitor(
             }
             Some(serde_json::Value::Object(obj))
         } else {
+            // 关掉之前先看有没有别的 zone 在 `use` 这台监控机：直接删声明会让
+            // 它们的 `use` 变成悬空引用，报错会以"监控机不存在"的形式出现，
+            // 完全误导人（用户明明是刚把这个开关关掉）。这里提前挡住并说明。
+            if let Ok(sp) = Spec::parse(&cur) {
+                let mut dependents: Vec<String> = Vec::new();
+                for (zn, z) in &sp.zones {
+                    if zn == &zone {
+                        continue;
+                    }
+                    if let Some(m) = &z.monitor {
+                        if let Some(u) = &m.existing {
+                            if u.split(':').next() == Some(zone.as_str()) {
+                                dependents.push(zn.clone());
+                            }
+                        }
+                    }
+                }
+                if !dependents.is_empty() {
+                    return Err(bad(format!(
+                        "{} 正在复用这个网络的监控机（monitor.use），先把它们的监控关掉或改指向别的监控机",
+                        dependents.join("、")
+                    )));
+                }
+            }
             None
         };
         let next = specs::set_zone_monitor(&cur, &zone, monitor.as_ref()).map_err(bad)?;
@@ -576,9 +640,15 @@ pub async fn gateway_status(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(zone): Path<String>,
+    Query(q): Query<GwQuery>,
 ) -> Response {
     render_async(async {
         authed(&state, &headers)?;
+        if !q.fresh {
+            if let Some(v) = gw_cache_get(&zone) {
+                return Ok(Json(v));
+            }
+        }
         let (spec_name, cur) = locate_zone(&state, &zone)?;
         let sp = Spec::parse(&cur).map_err(|e| bad(e))?;
         let resolved = sp
@@ -622,7 +692,7 @@ pub async fn gateway_status(
                         "systemctl is-active wg-quick@wg0 2>/dev/null || true; \
                          systemctl is-active openvpn-server@labyard 2>/dev/null || true",
                     ],
-                    std::time::Duration::from_secs(20),
+                    std::time::Duration::from_secs(6),
                     &cancel,
                 )
                 .await
@@ -640,7 +710,7 @@ pub async fn gateway_status(
             .map(|h| h.name.as_str())
             .collect();
 
-        Ok(Json(serde_json::json!({
+        let value = serde_json::json!({
             "zone": zone,
             "spec": spec_name,
             "gateway": { "host": host.name, "vmid": vmid, "ipv4": host.ipv4 },
@@ -661,7 +731,9 @@ pub async fn gateway_status(
                 "openvpn_active": ovpn_active,
             },
             "retired_hosts": retired_hosts,
-        })))
+        });
+        gw_cache_put(&zone, value.clone());
+        Ok(Json(value))
     })
     .await
 }
@@ -807,6 +879,10 @@ pub async fn topology_view(
         authed(&state, &headers)?;
         let dir = spec_dir(&state);
         let mut resolved: Vec<(String, crate::core::spec::ResolvedSpec)> = Vec::new();
+        // 监控机"声明名"账本：zone 里写了 monitor 但管理口落在别的网络时，
+        // 实际主机被建在 mgmt 那个网络里（如 lab:monitor → wan:monitor）。
+        // 图/面板上要同时给出这两个名字，否则用户会以为多了一台机器。
+        let mut decls: Vec<(String, String, String)> = Vec::new();
         for meta in specs::list(&dir, &state.cfg.pve.wan_bridge) {
             if let Some(only) = &q.spec {
                 if &meta.name != only {
@@ -820,6 +896,17 @@ pub async fn topology_view(
                 continue;
             };
             let sp = Spec::parse(&text).map_err(|e| bad(e))?;
+            for (zn, z) in &sp.zones {
+                if let Some(m) = &z.monitor {
+                    if m.existing.is_none() {
+                        let name = m.name.clone().unwrap_or_else(|| "monitor".to_string());
+                        let mgmt = m.mgmt.clone().unwrap_or_else(|| zn.clone());
+                        if mgmt != *zn {
+                            decls.push((zn.clone(), name, mgmt));
+                        }
+                    }
+                }
+            }
             let mut r = sp
                 .resolve_all(&state.cfg.pve.wan_bridge)
                 .map_err(|e| bad(e))?;
@@ -853,7 +940,16 @@ pub async fn topology_view(
             status: &status_fn,
             retired: &retired_fn,
         };
-        let (nodes, edges) = crate::api::topology::build(&resolved, &st);
+        let (mut nodes, edges) = crate::api::topology::build(&resolved, &st);
+        for (dz, name, mgmt) in &decls {
+            if let Some(n) = nodes
+                .iter_mut()
+                .find(|n| n.id == format!("host:{mgmt}:{name}"))
+            {
+                n.meta["declared"] = serde_json::json!(format!("{dz}:{name}"));
+                n.meta["decl_mgmt"] = serde_json::json!(mgmt);
+            }
+        }
         Ok(Json(serde_json::json!({
             "nodes": nodes,
             "edges": edges,
@@ -931,6 +1027,22 @@ fn collect_mirrors(state: &AppState, only: Option<&str>) -> ApiResult<Vec<serde_
         let Ok(resolved) = sp.resolve_all(&state.cfg.pve.wan_bridge) else {
             continue;
         };
+        // 监控机的"声明名"：zone 里的 monitor 声明管理口在别处时，主机实际
+        // 建在那个网络里。总账按声明名展示，用户写的是什么就看到什么。
+        let alias_of = |z: &str, h: &str| -> Option<String> {
+            for (zn, zz) in &sp.zones {
+                if let Some(m) = &zz.monitor {
+                    if m.existing.is_none() {
+                        let name = m.name.clone().unwrap_or_else(|| "monitor".to_string());
+                        let mgmt = m.mgmt.clone().unwrap_or_else(|| zn.clone());
+                        if name == h && mgmt == z {
+                            return Some(format!("{zn}:{name}"));
+                        }
+                    }
+                }
+            }
+            None
+        };
         for m in &resolved.mirrors {
             // 实例名要与执行器/巡检完全一致：{源zone}-{源vmid}-{目标vmid}。
             // vmid 优先用规格里写死的；没写就用 DB 里的分配号（与 build_plan
@@ -956,6 +1068,7 @@ fn collect_mirrors(state: &AppState, only: Option<&str>) -> ApiResult<Vec<serde_
                 "spec": meta.name,
                 "from": format!("{}:{}", m.from_zone, m.from_host),
                 "to": format!("{}:{}", m.to_zone, m.to_host),
+                "to_alias": alias_of(&m.to_zone, &m.to_host),
                 "src_bridge": m.src_bridge,
                 "capture_bridge": m.capture_bridge,
                 "source_iface": "eth0",

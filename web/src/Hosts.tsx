@@ -314,6 +314,34 @@ export default function Hosts() {
     [rows],
   );
 
+  // 网络/网关概览：zone 层的网段、出网、VPN、监控机只能在拓扑接口里拿到，
+  // 主机列表本身只有每台机器的一行。15 秒缓存，够新也不至于一直打。
+  const topo = useQuery({
+    queryKey: ["topology"],
+    queryFn: () => api.topology(),
+    staleTime: 15000,
+    refetchInterval: 20000,
+  });
+
+  const zoneRows = useMemo(() => {
+    type ZoneMeta = { cidr?: string; egress?: boolean; vpn?: string[]; monitor?: string };
+    const meta = new Map<string, ZoneMeta>();
+    for (const n of topo.data?.nodes ?? []) {
+      if (n.kind === "network" && n.zone) meta.set(n.zone, (n.meta ?? {}) as ZoneMeta);
+    }
+    return zones.map((z) => {
+      const list = rows.filter((r) => r.zone === z && r.host !== "*");
+      return {
+        zone: z,
+        gw: list.find((r) => r.role === "gateway"),
+        meta: meta.get(z) ?? {},
+        total: list.length,
+        running: list.filter((r) => r.status === "running" && !r.retired).length,
+        retired: zoneRetired(z),
+      };
+    });
+  }, [zones, rows, topo.data, zoneRetired]);
+
   const doPower = useCallback(
     async (r: HostRow, action: "start" | "stop" | "reboot") => {
       try {
@@ -611,6 +639,193 @@ export default function Hosts() {
         </Space>
       </Card>
 
+      <Card
+        size="small"
+        title="网络与网关"
+        style={{ marginBottom: 16 }}
+        extra={
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            网关策略、出网与 VPN 都在这里进
+          </Text>
+        }
+      >
+        <Table
+          size="small"
+          rowKey="zone"
+          pagination={false}
+          dataSource={zoneRows}
+          locale={{
+            emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有网络" />,
+          }}
+          columns={[
+            {
+              title: "网络",
+              dataIndex: "zone",
+              width: 130,
+              render: (z: string, r) => (
+                <Space size={6}>
+                  <Text strong>{z}</Text>
+                  {r.retired && <Tag color="orange">已废弃</Tag>}
+                </Space>
+              ),
+            },
+            {
+              title: "网关主机",
+              width: 190,
+              render: (_: unknown, r) =>
+                r.gw ? (
+                  <Space size={6}>
+                    <Text className="mono">{r.gw.host}</Text>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      CT {r.gw.vmid}
+                    </Text>
+                    {r.gw.status === "running" ? (
+                      <Tag color="green">运行</Tag>
+                    ) : (
+                      <Tag>停止</Tag>
+                    )}
+                  </Space>
+                ) : (
+                  <Text type="secondary">—</Text>
+                ),
+            },
+            {
+              title: "网段",
+              width: 170,
+              render: (_: unknown, r) => (
+                <Text className="mono" type="secondary">
+                  {r.meta.cidr ?? "—"}
+                </Text>
+              ),
+            },
+            {
+              title: "出网",
+              width: 90,
+              render: (_: unknown, r) =>
+                !r.gw ? (
+                  <Text type="secondary">—</Text>
+                ) : r.meta.egress ? (
+                  <Tag color="green">开</Tag>
+                ) : (
+                  <Tag>关</Tag>
+                ),
+            },
+            {
+              title: "VPN",
+              width: 150,
+              render: (_: unknown, r) => {
+                const v = (r.meta.vpn as string[] | undefined) ?? [];
+                return v.length === 0 ? (
+                  <Text type="secondary">—</Text>
+                ) : (
+                  <Space size={4} wrap>
+                    {v.map((x) => (
+                      <Tag key={x} className="mono">
+                        {x}
+                      </Tag>
+                    ))}
+                  </Space>
+                );
+              },
+            },
+            {
+              title: "主机",
+              width: 100,
+              render: (_: unknown, r) => (
+                <Text>
+                  {r.running}/{r.total}
+                </Text>
+              ),
+            },
+            {
+              title: "流量监控",
+              width: 140,
+              render: (_: unknown, r) =>
+                r.meta.monitor ? (
+                  <Text className="mono" style={{ fontSize: 12 }}>
+                    {String(r.meta.monitor)}
+                  </Text>
+                ) : (
+                  <Text type="secondary">—</Text>
+                ),
+            },
+            {
+              title: "操作",
+              width: 210,
+              render: (_: unknown, r) => (
+                <Space size={4}>
+                  <Button
+                    size="small"
+                    icon={<SafetyOutlined />}
+                    onClick={() => setGw(r.zone)}
+                  >
+                    网关策略
+                  </Button>
+                  <Dropdown
+                    menu={{
+                      items: [
+                        {
+                          key: "retire",
+                          icon: <PauseCircleOutlined />,
+                          label: "废弃整个网络（停机保号）",
+                          onClick: () => doRetire(r.zone, "*"),
+                        },
+                        {
+                          key: "revive",
+                          icon: <UndoOutlined />,
+                          label: "恢复整个网络",
+                          disabled: !r.retired,
+                          onClick: () => doRevive(r.zone, "*"),
+                        },
+                      ],
+                    }}
+                  >
+                    <Button size="small" icon={<MoreOutlined />} />
+                  </Dropdown>
+                  <Popconfirm
+                    open={destroyZone === r.zone}
+                    title={`销毁网络 ${r.zone}？`}
+                    description={
+                      <Space direction="vertical" size={8} style={{ maxWidth: 360 }}>
+                        <Text type="danger">
+                          删除该网络的全部容器、网桥与分配记录，不可逆。
+                        </Text>
+                        <Text>输入网络名确认：</Text>
+                        <Input
+                          size="small"
+                          value={confirmName}
+                          onChange={(e) => setConfirmName(e.target.value)}
+                          placeholder={r.zone}
+                        />
+                      </Space>
+                    }
+                    okText="销毁"
+                    okButtonProps={{ danger: true, disabled: confirmName !== r.zone }}
+                    cancelText="取消"
+                    onConfirm={doDestroy}
+                    onCancel={() => {
+                      setDestroyZone(null);
+                      setConfirmName("");
+                    }}
+                  >
+                    <Button
+                      size="small"
+                      danger
+                      type="text"
+                      icon={<PoweroffOutlined />}
+                      onClick={() => {
+                        setDestroyZone(r.zone);
+                        setConfirmName("");
+                      }}
+                    />
+                  </Popconfirm>
+                </Space>
+              ),
+            },
+          ]}
+        />
+      </Card>
+
       <Space style={{ marginBottom: 12 }} size={12} wrap>
         <Input
           allowClear
@@ -629,73 +844,6 @@ export default function Hosts() {
         >
           刷新
         </Button>
-
-        {zones.map((z) => (
-          <Space.Compact key={z} size="small">
-            <Button size="small" icon={<SafetyOutlined />} onClick={() => setGw(z)}>
-              {z} 网关
-            </Button>
-            <Dropdown
-              menu={{
-                items: [
-                  {
-                    key: "retire",
-                    icon: <PauseCircleOutlined />,
-                    label: "废弃整个 zone（停机保号）",
-                    onClick: () => doRetire(z, "*"),
-                  },
-                  {
-                    key: "revive",
-                    icon: <UndoOutlined />,
-                    label: "恢复整个 zone",
-                    disabled: !zoneRetired(z),
-                    onClick: () => doRevive(z, "*"),
-                  },
-                ],
-              }}
-            >
-              <Button size="small" icon={<MoreOutlined />} />
-            </Dropdown>
-            <Popconfirm
-              open={destroyZone === z}
-              title={`销毁 zone ${z}？`}
-              description={
-                <Space direction="vertical" size={8} style={{ maxWidth: 360 }}>
-                  <Text type="danger">
-                    删除该 zone 全部容器、网桥与分配记录，不可逆。
-                  </Text>
-                  <Text>输入 zone 名确认：</Text>
-                  <Input
-                    size="small"
-                    value={confirmName}
-                    onChange={(e) => setConfirmName(e.target.value)}
-                    placeholder={z}
-                  />
-                </Space>
-              }
-              okText="销毁"
-              okButtonProps={{ danger: true, disabled: confirmName !== z }}
-              cancelText="取消"
-              onConfirm={doDestroy}
-              onCancel={() => {
-                setDestroyZone(null);
-                setConfirmName("");
-              }}
-            >
-              <Button
-                size="small"
-                danger
-                icon={<PoweroffOutlined />}
-                onClick={() => {
-                  setDestroyZone(z);
-                  setConfirmName("");
-                }}
-              >
-                销毁
-              </Button>
-            </Popconfirm>
-          </Space.Compact>
-        ))}
       </Space>
 
       {/* 批量操作条：选中才出现，动作前先按可操作性过滤 */}

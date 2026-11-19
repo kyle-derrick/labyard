@@ -242,8 +242,18 @@ if PW:
     check("监控开关-use+name 冲突被拒", "POST", f"/api/zones/{q(ZONE)}/monitor",
           {"on": True, "name": "probe", "use": f"{ZONE}:probe"}, want=400)
     before = call("GET", f"/api/specs/{q(ZONE)}")[1]
-    check("监控开关-关（幂等）", "POST", f"/api/zones/{q(ZONE)}/monitor",
-          {"on": False}, keys=["ok", "spec"])
+    # 关监控有两种合法结果：
+    # ① 200 —— 没有别的 zone 在复用，声明被移除；
+    # ② 400 —— 有别的 zone 还在 monitor.use 指向它。这时**必须**拒绝并说明
+    #    依赖方，否则删掉声明会让那些 use 变成悬空引用（以"监控机不存在"
+    #    的面目报出来，把用户引向完全错误的方向）。
+    code, p = call("POST", f"/api/zones/{q(ZONE)}/monitor", {"on": False})
+    ok = code == 200 and isinstance(p, dict) and "ok" in p
+    if code == 400 and isinstance(p, dict) and "正在复用" in str(p.get("error", "")):
+        ok = True
+    record(ok, "监控开关-关（幂等 / 有依赖时拒绝）",
+           f"POST /api/zones/{q(ZONE)}/monitor", code,
+           "" if ok else str(p)[:110])
     check("加 zone", "POST", f"/api/specs/{q(TMP)}/zones",
           {"zone": "tmp1",
            "yaml": "uplink: wan\nv4: 10.99.1.0/24\nhosts:\n  gw: { role: gateway }\n"},

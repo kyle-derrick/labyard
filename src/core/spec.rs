@@ -453,6 +453,14 @@ pub struct ResolvedZone {
     pub uplink: Option<String>,
     /// 上联网桥名（wan 时是用户配置的外部桥，否则是上游 zone 的桥）
     pub uplink_bridge: Option<String>,
+    /// 网关**上联口**的地址（在父 zone 网段里，静态）。
+    ///
+    /// 上联是外网桥时留 None，走 DHCP（真实网络里通常有 DHCP）。
+    /// 上联是另一个 labyard zone 时必须给静态地址：那座桥是平台自己建的，
+    /// 上面没有 DHCP 服务，让 eth1 去 dhcp 只会永远拿不到地址。
+    pub uplink_ip: Option<String>,
+    /// 网关的默认路由（父 zone 的网关地址）。与 `uplink_ip` 成对出现。
+    pub uplink_gw: Option<String>,
     pub v4_cidr: String,
     /// 宿主在桥上的管理地址；Web 终端从宿主直连容器用
     pub bridge_mgmt_ip: String,
@@ -984,6 +992,8 @@ fn resolve_zone(
         bridge,
         uplink,
         uplink_bridge,
+        uplink_ip: None,
+        uplink_gw: None,
         v4_cidr: z.v4.clone(),
         bridge_mgmt_ip: mgmt,
         v6_prefix,
@@ -1216,6 +1226,47 @@ impl Spec {
                     h.capture = s.iter().cloned().collect();
                 }
             }
+        }
+
+        // ── 第六步：嵌套网关的上联地址 ──
+        //
+        // 上联是另一个 labyard zone 时，那座桥是平台自己建的，上面**没有
+        // DHCP 服务**。以前这里一律 eth1 走 dhcp，结果嵌套网关永远拿不到
+        // 地址 → 整段内网没有出口 → bootstrap 的 apt 每次都失败，run 一跑
+        // 就是好几分钟且永不收敛。这里按父 zone 网段给一个静态地址（.253，
+        // 避开 .1 网关与 .254 宿主管理口），默认路由指向父网关。
+        for i in 0..out.len() {
+            let Some(parent_name) = out[i].uplink.clone() else {
+                continue;
+            };
+            let Some(parent) = out.iter().find(|z| z.name == parent_name) else {
+                continue;
+            };
+            let parent_cidr = parent.v4_cidr.clone();
+            let parent_gw = parent
+                .hosts
+                .iter()
+                .find(|h| h.role == Role::Gateway)
+                .map(|h| h.ipv4.clone());
+            // 父网段里已经用掉的最后一段，避免撞车
+            let used: Vec<String> = parent
+                .hosts
+                .iter()
+                .filter_map(|h| h.ipv4.split('.').nth(3).map(|s| s.split('/').next().unwrap_or("").to_string()))
+                .collect();
+            let (net, prefix) = parent_cidr.split_once('/').unwrap_or((&parent_cidr, "24"));
+            let mut parts: Vec<String> = net.split('.').map(|s| s.to_string()).collect();
+            if parts.len() != 4 {
+                continue;
+            }
+            let mut octet = 253u32;
+            while used.iter().any(|u| u == &octet.to_string()) && octet > 2 {
+                octet -= 1;
+            }
+            parts[3] = octet.to_string();
+            out[i].uplink_ip = Some(format!("{}/{}", parts.join("."), prefix));
+            out[i].uplink_gw = parent_gw
+                .map(|ip| ip.split('/').next().unwrap_or(&ip).to_string());
         }
 
         Ok(ResolvedSpec {

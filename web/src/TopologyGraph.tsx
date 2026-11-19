@@ -195,6 +195,11 @@ function LabNode({ data }: NodeProps<GNode>) {
           {data.vmidLabel}
           {data.vmidLabel && data.retired ? " · " : ""}
           {data.retired ? "已废弃" : ""}
+          {/* 监控机声明在别的网络里（如 lab:monitor、管理口在 wan）时，
+              把声明名标出来，否则用户会以为凭空多了一台机器 */}
+          {typeof meta.declared === "string" && (
+            <span> · 声明 {String(meta.declared)}</span>
+          )}
         </div>
         {/* 分侧网口：绝对定位在框边缘，chip 突出 9px 方便连线 */}
         <div

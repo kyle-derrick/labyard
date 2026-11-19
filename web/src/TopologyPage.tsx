@@ -112,8 +112,13 @@ export default function TopologyPage() {
         name: (
           <Space size={8}>
             <Tag color="blue" style={{ marginInlineEnd: 0 }}>
-              监控机 {mon}
+              监控机 {rs[0]?.to_alias ?? mon}
             </Tag>
+            {rs[0]?.to_alias && rs[0]?.to_alias !== mon && (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                实际建在 {mon}
+              </Text>
+            )}
             <Text type="secondary" style={{ fontSize: 12 }}>
               {rs.length} 条连线 · {byZone.size} 个网络
             </Text>
@@ -535,7 +540,14 @@ export default function TopologyPage() {
         {detail?.kind === "host" && (
           <Space direction="vertical" size={14} style={{ width: "100%" }}>
             <Descriptions size="small" column={2} bordered>
-              <Descriptions.Item label="Zone">{detail.zone ?? "—"}</Descriptions.Item>
+              <Descriptions.Item label="Zone">
+                {detail.zone ?? "—"}
+                {typeof detail.meta.declared === "string" && (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {" "}（规格里声明为 {String(detail.meta.declared)}，管理口在 {detail.zone}）
+                  </Text>
+                )}
+              </Descriptions.Item>
               <Descriptions.Item label="角色">
                 {ROLE_LABEL[detail.role ?? ""] ?? detail.role ?? "—"}
               </Descriptions.Item>

@@ -3,7 +3,7 @@
  * 所有改动都写回规格文件（后端负责改 YAML 并立刻重跑该 zone 的 gateway 步骤），
  * 这里只做"显示 + 触发"。没有另存一份运行态，页面刷新后看到的仍是真相。
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -47,13 +47,22 @@ export default function GatewayPanel({
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm();
 
+  const freshRef = useRef(false);
   const q = useQuery({
     queryKey: ["gateway", zone],
-    queryFn: () => api.gateway(zone!),
+    queryFn: () => api.gateway(zone!, freshRef.current),
     enabled: !!zone,
-    // 改动后要重跑 gateway 步骤，状态会变；面板开着时轮询比"让用户点刷新"好
+    // 改动后要重跑 gateway 步骤，状态会变；面板开着时轮询比"让用户点刷新"好。
+    // fresh 只在"点刷新/刚改完"的那一次置位，平时吃服务端 8 秒缓存——
+    // run 占着 exec 闸时也不会让面板空白干等。
     refetchInterval: 6000,
   });
+  const refetchFresh = () => {
+    freshRef.current = true;
+    q.refetch().finally(() => {
+      freshRef.current = false;
+    });
+  };
 
   useEffect(() => {
     if (zone) form.resetFields();
@@ -65,7 +74,7 @@ export default function GatewayPanel({
       await fn();
       message.success(ok);
       // 立刻刷一次（步骤可能还在跑），并让主机/拓扑跟着更新
-      setTimeout(() => q.refetch(), 1200);
+      setTimeout(() => refetchFresh(), 1200);
       qc.invalidateQueries({ queryKey: ["hosts"] });
       qc.invalidateQueries({ queryKey: ["topology"] });
     } catch (e) {
@@ -98,7 +107,7 @@ export default function GatewayPanel({
         </Space>
       }
       extra={
-        <Button size="small" onClick={() => q.refetch()} loading={q.isFetching}>
+        <Button size="small" onClick={refetchFresh} loading={q.isFetching}>
           刷新
         </Button>
       }

@@ -15,6 +15,8 @@ pub fn gateway_addressing(
     gw_v4: &str,
     v6_prefix: Option<&str>,
     uplink: &str,
+    uplink_ip: Option<&str>,
+    uplink_gw: Option<&str>,
     dns: &[String],
 ) -> String {
     let mut s = String::new();
@@ -28,14 +30,26 @@ pub fn gateway_addressing(
         let base = p.trim_end_matches("/64").trim_end_matches(':');
         s.push_str(&format!("ip -6 addr replace {base}::1/64 dev eth0\n"));
     }
-    // 上联口走 DHCP（PVE 的 wan 桥通常有 DHCP 或用户自己配）
-    s.push_str(&format!(
-        "if ! ip -4 addr show {uplink} | grep -q 'inet '; then\n  \
-         (command -v dhclient >/dev/null && dhclient -1 {uplink}) || true\nfi\n"
-    ));
-    s.push_str(&format!(
-        "ip route replace default via $(ip -4 route show dev {uplink} | awk '/default/{{print $3; exit}}') dev {uplink} 2>/dev/null || true\n"
-    ));
+    match (uplink_ip, uplink_gw) {
+        // 嵌套 zone：上联是平台自己的桥，没有 DHCP。直接静态配地址 + 默认路由。
+        (Some(ip), Some(gw)) => {
+            s.push_str(&format!("ip addr replace {ip} dev {uplink}\n"));
+            s.push_str(&format!("ip route replace default via {gw} dev {uplink}\n"));
+        }
+        (Some(ip), None) => {
+            s.push_str(&format!("ip addr replace {ip} dev {uplink}\n"));
+        }
+        // 上联是真实外网桥：通常有 DHCP 或用户自己配
+        _ => {
+            s.push_str(&format!(
+                "if ! ip -4 addr show {uplink} | grep -q 'inet '; then\n  \
+                 (command -v dhclient >/dev/null && dhclient -1 {uplink}) || true\nfi\n"
+            ));
+            s.push_str(&format!(
+                "ip route replace default via $(ip -4 route show dev {uplink} | awk '/default/{{print $3; exit}}') dev {uplink} 2>/dev/null || true\n"
+            ));
+        }
+    }
     s.push_str("sysctl -qw net.ipv4.ip_forward=1\n");
     s.push_str("sysctl -qw net.ipv6.conf.all.forwarding=1\n");
     // 网关自己也要能解析（apt 装包、provisioner 用）
@@ -139,7 +153,7 @@ mod tests {
         assert!(h.contains("nameserver 10.10.1.10"));
         assert!(h.contains("nameserver 1.1.1.1"));
         assert!(!h.contains("223.5.5.5"), "显式 dns 不应被公共解析器混进来");
-        let g = gateway_addressing("10.10.1.1/24", None, "eth1", &dns);
+        let g = gateway_addressing("10.10.1.1/24", None, "eth1", None, None, &dns);
         assert!(g.contains("nameserver 10.10.1.10"), "网关自己也要能解析");
     }
 
@@ -153,14 +167,14 @@ mod tests {
     fn gateway_uses_its_own_ip_not_the_zone_cidr() {
         // 真机教训：早期把网段地址 10.10.1.0/24 写上接口——网段号当 IP 是错的，
         // 网关必须拿 .1 这个身份，主机的默认路由才有落点。
-        let s = gateway_addressing("10.10.1.1/24", None, "eth1", &[]);
+        let s = gateway_addressing("10.10.1.1/24", None, "eth1", None, None, &[]);
         assert!(s.contains("ip addr replace 10.10.1.1/24 dev eth0"));
         assert!(!s.contains("ip addr replace 10.10.1.0/24"), "网段号不该上接口");
     }
 
     #[test]
     fn gateway_turns_forwarding_on() {
-        let s = gateway_addressing("10.10.1.1/24", Some("fd00:1::/64"), "eth1", &[]);
+        let s = gateway_addressing("10.10.1.1/24", Some("fd00:1::/64"), "eth1", None, None, &[]);
         assert!(s.contains("net.ipv4.ip_forward=1"));
         assert!(s.contains("net.ipv6.conf.all.forwarding=1"));
         assert!(s.contains("ip -6 addr replace fd00:1::1/64 dev eth0"));

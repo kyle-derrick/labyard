@@ -188,6 +188,11 @@ impl Executor {
         // ct 不算 failed，如果跳过不进集合，net 还会去 exec 一个不存在的容器。
         let mut failed_keys: std::collections::HashSet<String> = Default::default();
 
+        // 进度账本：每完成一步（执行/跳过/失败）加一，实时推给前端画进度条。
+        let total = plan.steps.len();
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _ = tx.send(Event::Progress { done: 0, total }).await;
+
         for phase in [
             Phase::Bridge,
             Phase::Template,
@@ -216,6 +221,8 @@ impl Executor {
                         reason: "上游步骤失败，本步骤跳过".into(),
                     })
                     .await;
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let _ = tx.send(Event::Progress { done: n, total }).await;
             }
             if runnable.is_empty() {
                 continue;
@@ -229,7 +236,7 @@ impl Executor {
             };
 
             let results = self
-                .run_phase(steps, limit, run_id, &tx, &cancel, &snap)
+                .run_phase(steps, limit, run_id, &tx, &cancel, &snap, done.clone(), total)
                 .await;
 
             for (key, state, err) in results {
@@ -270,6 +277,8 @@ impl Executor {
         tx: &mpsc::Sender<Event>,
         cancel: &CancellationToken,
         snap: &Arc<tokio::sync::Mutex<Snapshot>>,
+        done: Arc<std::sync::atomic::AtomicUsize>,
+        total: usize,
     ) -> Vec<(String, StepState, Option<String>)> {
         use futures_util::stream::{self, StreamExt};
 
@@ -282,8 +291,12 @@ impl Executor {
                 let cancel = cancel.clone();
                 let snap = snap.clone();
                 let run_id = run_id.to_string();
+                let done = done.clone();
                 async move {
-                    execute_one(pve, db, runner, step, &run_id, tx, cancel, snap).await
+                    let r = execute_one(pve, db, runner, step, &run_id, tx.clone(), cancel, snap).await;
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let _ = tx.send(Event::Progress { done: n, total }).await;
+                    r
                 }
             })
             .buffer_unordered(limit)
@@ -434,6 +447,7 @@ async fn apply_step(
             template_storage,
             bridge,
             uplink_bridge,
+            uplink_ip,
             capture_bridges,
             dhcp,
             ssh_keys,
@@ -457,6 +471,7 @@ async fn apply_step(
                 vol,
                 bridge,
                 uplink_bridge.as_deref(),
+                uplink_ip.as_deref(),
                 capture_bridges,
                 *dhcp,
                 password.as_deref(),
@@ -473,6 +488,8 @@ async fn apply_step(
             gateway,
             ipv6_prefix,
             is_gateway,
+            uplink_ip,
+            uplink_gw,
             default_route,
             nat,
             dns,
@@ -481,7 +498,14 @@ async fn apply_step(
             // 地址/路由落成开机单元而不是"执行一次"：容器重启后这些运行时
             // 状态全没了，而本步骤是哈希门控的——apply 不会再跑一遍。
             let addressing = if *is_gateway {
-                net::gateway_addressing(ipv4, ipv6_prefix.as_deref(), "eth1", dns)
+                net::gateway_addressing(
+                    ipv4,
+                    ipv6_prefix.as_deref(),
+                    "eth1",
+                    uplink_ip.as_deref(),
+                    uplink_gw.as_deref(),
+                    dns,
+                )
             } else {
                 net::host_script(
                     ipv4,
