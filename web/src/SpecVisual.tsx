@@ -338,7 +338,8 @@ export default function SpecVisual({
 
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
-      {!exists && (
+      {/* 出错时不知道文件到底存不存在，别再叠加"还不存在"误导人 */}
+      {!exists && !err && (
         <Alert
           type="info"
           showIcon

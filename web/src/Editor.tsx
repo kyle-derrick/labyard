@@ -309,7 +309,10 @@ export default function Editor() {
         }
         setErr(null);
       })
-      .catch(() => {});
+      .catch((e) => {
+        // 读取失败要露出来——静默吞掉会把"未登录/服务不可达"伪装成"文件没建过"。
+        if (alive) setErr(`读取 ${specName}.yaml 失败：${(e as Error).message}`);
+      });
     return () => {
       alive = false;
     };

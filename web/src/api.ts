@@ -62,6 +62,11 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     credentials: "same-origin",
   });
   if (!res.ok) {
+    // 会话中途失效（cookie 过期/被浏览器拒收/服务端换密）：全局广播，
+    // App 收到后踢回登录页。不广播 auth 端点——那里的 401 是登录探测的正常路径。
+    if (res.status === 401 && !path.startsWith("/api/auth/")) {
+      window.dispatchEvent(new Event("labyard:unauthorized"));
+    }
     let msg = res.statusText;
     try {
       const j = await res.json();

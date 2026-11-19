@@ -136,6 +136,14 @@ export default function App() {
       .catch(() => setAuthed(false));
   }, []);
 
+  // 会话中途失效（cookie 过期/被浏览器拒收）：任何 API 401 都踢回登录页，
+  // 不再把"未登录"伪装成"文件不存在/空列表"。
+  useEffect(() => {
+    const kick = () => setAuthed(false);
+    window.addEventListener("labyard:unauthorized", kick);
+    return () => window.removeEventListener("labyard:unauthorized", kick);
+  }, []);
+
   const onLogin = useCallback(() => setAuthed(true), []);
 
   const logout = async () => {

@@ -41,6 +41,17 @@ export default function Login({ onOk }: { onOk: () => void }) {
     setError(null);
     try {
       await api.login(v.password);
+      // 密码对不等于会话可用：cookie 可能被浏览器拒收（页面嵌在别的网站的
+      // iframe 里、隐身模式拦第三方 cookie 等）。立刻探一次 me()，失败就
+      // 给出可操作的原因，而不是进主界面后到处"未登录/文件不存在"。
+      try {
+        await api.me();
+      } catch {
+        setError(
+          "密码正确，但浏览器没有保存会话 Cookie——常见于页面嵌在其他网站的框架里，或浏览器拦截了 Cookie。请直接在浏览器地址栏打开本面板地址访问。",
+        );
+        return;
+      }
       message.success("已登录");
       onOk();
     } catch (e) {
