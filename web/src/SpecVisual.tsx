@@ -108,11 +108,11 @@ const ROLES = [
 ];
 
 /** 角色下拉的选项：YAML 里可能还写着老的 server / client——后端按别名
- * 接受，但下拉里裸显示一个不在选项里的值会让人以为是坏数据，补一条
- * "（旧写法）"让用户知道它等价于主机。 */
+ * 接受。这里直接显示成"主机"，不暴露"旧写法"这种内部概念：对用户来说
+ * 它就是主机，值保留原样即可。 */
 function roleOptions(cur?: string) {
-  if (cur && (cur === "server" || cur === "client") && !ROLES.some((r) => r.value === cur)) {
-    return [...ROLES, { value: cur, label: "主机（旧写法）" }];
+  if (cur && (cur === "server" || cur === "client")) {
+    return ROLES.map((r) => (r.value === "host" ? { value: cur, label: "主机" } : r));
   }
   return ROLES;
 }
@@ -310,7 +310,13 @@ export default function SpecVisual({
         if (!out.some((o) => o.value === v))
           out.push({
             value: v,
-            label: `${zn} / ${m.name}（将新建${m.mgmt ? `，管理口挂 ${m.mgmt}` : ""}）`,
+            // 声明名与落点不是一回事：`lab/monitor` 管理口挂 wan 时，容器
+            // 实际建在 wan 网络里。这里提前说清楚，免得用户以为会多一台。
+            label: `${zn}/${m.name}（${
+              m.mgmt && m.mgmt !== zn
+                ? `管理口在 ${m.mgmt}，实际建在 ${m.mgmt}`
+                : "建在本网络"
+            }）`,
           });
       }
     }
@@ -326,6 +332,11 @@ export default function SpecVisual({
     label: t.label,
   }));
   const diskStorageOptions = (catalog?.disk_storages ?? []).map((s) => ({
+    value: s.storage,
+    label: `${s.storage}（${s.kind}）`,
+  }));
+  // 能放模板的存储（dir 类）：模板是文件，lvmthin 放不了
+  const tplStorageOptions = (catalog?.template_storages ?? []).map((s) => ({
     value: s.storage,
     label: `${s.storage}（${s.kind}）`,
   }));
@@ -433,7 +444,7 @@ export default function SpecVisual({
             </Field>
           </Col>
           <Col span={12} style={{ marginTop: 8 }}>
-            <Field label="存储">
+            <Field label="系统盘存储">
               <Select
                 size="small"
                 showSearch
@@ -446,6 +457,30 @@ export default function SpecVisual({
                     ...m,
                     defaults: { ...(m.defaults ?? {}), storage: v },
                   }))
+                }
+              />
+            </Field>
+          </Col>
+          <Col span={12} style={{ marginTop: 8 }}>
+            <Field
+              label="模板存储"
+              hint="模板文件（tar.zst）放在哪个存储。模板是文件，只有 dir 类存储能放；不填跟随系统盘存储"
+            >
+              <Select
+                size="small"
+                showSearch
+                allowClear
+                style={{ width: "100%" }}
+                placeholder="跟随系统盘"
+                value={(model?.defaults?.template_storage as string) ?? undefined}
+                options={withFallback(tplStorageOptions, model?.defaults?.template_storage as string | undefined)}
+                onChange={(v) =>
+                  patch((m) => {
+                    const d = { ...(m.defaults ?? {}) };
+                    if (v) d.template_storage = v;
+                    else delete d.template_storage;
+                    return { ...m, defaults: d };
+                  })
                 }
               />
             </Field>
@@ -747,9 +782,9 @@ export default function SpecVisual({
                   ),
                 },
                 {
-                  title: "末位",
+                  title: "IP 末位",
                   dataIndex: "ip",
-                  width: 76,
+                  width: 84,
                   render: (v: number | undefined, r) => (
                     <Tooltip title="主机号（网段的最后一段）。留空按角色自动分配：网关 .1、流量监控 .10、主机 .20">
                       <InputNumber
@@ -778,24 +813,31 @@ export default function SpecVisual({
                     />
                   ),
                 },
-                {
-                  title: "C/M/G",
-                  width: 150,
-                  render: (_, r) => (
-                    <Space size={2}>
-                      {(["cores", "memory", "disk"] as const).map((k) => (
-                        <InputNumber
-                          key={k}
-                          size="small"
-                          style={{ width: 46 }}
-                          value={r[k]}
-                          placeholder={String(model?.defaults?.[k] ?? "")}
-                          onChange={(nv) => patchHost(zn, r.name, { [k]: nv ?? undefined })}
-                        />
-                      ))}
-                    </Space>
+                // 三个数字原来挤在一列（标题 "C/M/G"），既看不懂也没法写单位。
+                // 拆成三列，表头直接用中文，单位放 tooltip。
+                ...(
+                  [
+                    { key: "cores", label: "CPU", unit: "核", w: 62 },
+                    { key: "memory", label: "内存", unit: "MB", w: 72 },
+                    { key: "disk", label: "磁盘", unit: "GB", w: 72 },
+                  ] as const
+                ).map((c) => ({
+                  title: (
+                    <Tooltip title={`${c.label}（${c.unit}）。留空跟随默认配置`}>
+                      <span>{c.label}</span>
+                    </Tooltip>
                   ),
-                },
+                  width: c.w,
+                  render: (_: unknown, r: HostM & { name: string }) => (
+                    <InputNumber
+                      size="small"
+                      style={{ width: "100%" }}
+                      value={r[c.key]}
+                      placeholder={String(model?.defaults?.[c.key] ?? "")}
+                      onChange={(nv) => patchHost(zn, r.name, { [c.key]: nv ?? undefined })}
+                    />
+                  ),
+                })),
                 {
                   title: "数据盘",
                   width: 78,

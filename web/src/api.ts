@@ -132,9 +132,12 @@ export const api = {
     }),
 
   state: () =>
-    req<{ steps: StepState[]; retired?: [string, string, string, string][] }>(
-      "/api/state",
-    ),
+    req<{
+      steps: StepState[];
+      /** 规格已删除、记录仍在库里的条数（不混进 steps） */
+      orphans?: number;
+      retired?: [string, string, string, string][];
+    }>("/api/state"),
 
   /** 读取服务端已保存的规格；从未保存过时 exists=false、yaml=null。 */
   getSpec: () =>
@@ -330,6 +333,31 @@ export const api = {
 
   hosts: () => req<{ hosts: HostRow[] }>("/api/hosts"),
 
+  pruneHosts: () =>
+    req<{ removed: number; kept: number }>("/api/hosts/prune", {
+      method: "POST",
+    }),
+
+  /** 销毁"规格里没有、容器还在跑"的孤儿。破坏性：需要确认串。 */
+  purgeOrphans: () =>
+    req<{ destroyed: string[]; forgotten: string[]; errors: string[] }>(
+      "/api/hosts/purge",
+      {
+        method: "POST",
+        body: JSON.stringify({ confirm: "destroy-orphans" }),
+      },
+    ),
+
+  pruneState: () =>
+    req<{ removed: number }>("/api/state/prune", { method: "POST" }),
+
+  bridges: () => req<{ bridges: BridgeRow[] }>("/api/bridges"),
+
+  pruneBridges: () =>
+    req<{ removed: string[]; kept: string[] }>("/api/bridges/prune", {
+      method: "POST",
+    }),
+
   power: (zone: string, host: string, action: "start" | "stop" | "reboot") =>
     req<{ ok: boolean; vmid: number }>(
       `/api/hosts/${zone}/${host}/power`,
@@ -371,6 +399,9 @@ export type RunRow = {
   spec_name: string | null;
   started_at: string;
   finished_at: string | null;
+  /** 失败的第一个步骤（成功的 run 为 null） */
+  failed_step?: string | null;
+  failed_message?: string | null;
 };
 
 export type RunStepRow = {
@@ -391,7 +422,23 @@ export type HostRow = {
   role: string | null;
   ipv4: string | null;
   spec: string | null;
+  /** 规格里已经没有这台主机了：vmid 记录是历史残留 */
+  orphan?: boolean;
   retired: boolean;
+};
+
+/** 宿主上的 labyard 网桥。orphan = 规格里已经没有这个网络了。 */
+export type BridgeRow = {
+  name: string;
+  zone: string | null;
+  /** 逗号分隔的 IPv4 地址，空串表示没有地址 */
+  ips: string;
+  members: number;
+  orphan: boolean;
+  /** 无地址、无成员：可以安全自动删 */
+  safe: boolean;
+  /** false = 内核里已经没有了，只剩 /etc/network/interfaces 里的持久化段 */
+  kernel: boolean;
 };
 
 export type SpecMeta = {
@@ -410,6 +457,8 @@ export type GatewayStatus = {
   gateway: { host: string; vmid: number | null; ipv4: string };
   v4_cidr: string;
   nat: boolean;
+  /** 上联网络：嵌套 zone 是父 zone 名，顶层是 wan */
+  uplink?: string;
   egress: boolean;
   pubs: { proto: string; port: number; to: string; spec: string }[];
   vpn: {

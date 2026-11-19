@@ -18,7 +18,7 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::wrappers::BroadcastStream;
@@ -85,6 +85,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/me", get(me))
         .route("/api/auth/password", post(change_password))
         .route("/api/state", get(state_of_world))
+        .route("/api/state/prune", post(prune_state))
         .route("/api/spec", get(get_spec).put(put_spec))
         // 多份规格：文件级 CRUD + 文件内的 zone 级 CRUD
         .route("/api/specs", get(ops::list_specs).post(ops::create_spec))
@@ -115,6 +116,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/runs/{id}/steps", get(run_steps))
         .route("/api/runs/{id}/retry", post(retry_run))
         .route("/api/hosts", get(hosts))
+        .route("/api/hosts/prune", post(prune_hosts))
+        .route("/api/hosts/purge", post(purge_orphans))
+        .route("/api/bridges", get(list_bridges))
+        .route("/api/bridges/prune", post(prune_bridges))
         .route("/api/hosts/{z}/{h}/power", post(power))
         .route("/api/hosts/{z}/{h}/retire", post(ops::retire_host))
         .route("/api/hosts/{z}/{h}/revive", post(ops::revive_host))
@@ -367,23 +372,153 @@ struct StepView {
 
 async fn state_of_world(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     require_auth!(state, headers);
-    let steps: Vec<StepView> = state
-        .db
-        .all_step_states()
-        .into_iter()
-        .map(|(key, st, msg)| StepView {
+    let live = live_entities(&state.cfg);
+    let mut steps: Vec<StepView> = Vec::new();
+    let mut orphans = 0usize;
+    for (key, st, msg) in state.db.all_step_states() {
+        if is_orphan_key(&key, &live) {
+            orphans += 1;
+            continue;
+        }
+        steps.push(StepView {
             phase: phase_of_key(&key),
             key,
             state: st,
             message: msg,
-        })
-        .collect();
+        });
+    }
     Json(serde_json::json!({
         "steps": steps,
+        // 规格已删除、记录还留在库里。数字如实告诉前端，让它能提示"可清理"，
+        // 而不是把这些记录混进"当前失败"里吓人。
+        "orphans": orphans,
         // 废弃标记是运行态，前端要能直接看到"这台是我有意收起来的"
         "retired": state.db.retired_list(),
     }))
     .into_response()
+}
+
+/// 清掉已删除规格留下的步骤记录。
+///
+/// 显式操作而不是自动清理：用户可能只是临时删了一份规格、过会儿想贴回来，
+/// 那时幂等哈希还有用。所以只在他点"清理"时动手。
+async fn prune_state(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    let live = live_entities(&state.cfg);
+    let dead: Vec<String> = state
+        .db
+        .all_step_states()
+        .into_iter()
+        .map(|(k, _, _)| k)
+        .filter(|k| is_orphan_key(k, &live))
+        .collect();
+    let n = state.db.forget_steps(&dead);
+    Json(serde_json::json!({ "removed": n })).into_response()
+}
+
+/// 现存规格里"还活着"的实体。
+///
+/// vmid 分配与步骤记录是有意长期留存的（重建不换号），但规格文件被删掉之后
+/// 它们就成了孤儿：主机页多出空网络、概览页红着一个找不到实体的失败数字。
+/// 判断依据只能是**磁盘上现在还有没有这份规格**，所以每次重新解析目录。
+struct LiveEntities {
+    zones: HashSet<String>,
+    hosts: HashSet<(String, String)>,
+    /// (模板存储, 模板文件名)
+    templates: HashSet<(String, String)>,
+}
+
+fn live_entities(cfg: &Config) -> LiveEntities {
+    let mut out = LiveEntities {
+        zones: HashSet::new(),
+        hosts: HashSet::new(),
+        templates: HashSet::new(),
+    };
+    for meta in specs::list(&cfg.paths.specs, &cfg.pve.wan_bridge) {
+        if !meta.valid {
+            continue;
+        }
+        let Ok(Some(text)) = specs::read(&cfg.paths.specs, &meta.name) else {
+            continue;
+        };
+        let Ok(sp) = Spec::parse(&text) else { continue };
+        // 优先用 resolve 的结果：自动生成的监控机（`lab:monitor` 落在 wan）
+        // 不在原始 `hosts:` 里，拿原表判断会把它误判成孤儿。
+        match sp.resolve_all(&cfg.pve.wan_bridge) {
+            Ok(res) => {
+                for z in res.zones {
+                    for h in &z.hosts {
+                        out.hosts.insert((z.name.clone(), h.name.clone()));
+                        out.templates
+                            .insert((h.template_storage.clone(), h.template.clone()));
+                    }
+                    out.zones.insert(z.name);
+                }
+            }
+            Err(_) => {
+                // 解析不了就退一步只认 zone/host；模板无从得知，宁可留着
+                // 记录也不误删
+                for (zn, z) in &sp.zones {
+                    for h in z.hosts.keys() {
+                        out.hosts.insert((zn.clone(), h.clone()));
+                    }
+                    out.zones.insert(zn.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 这条步骤记录是否属于已删除的规格。
+///
+/// key 的形态有十来种（`ct:z:h`、`bridge:z`、`bridge:mir:z`、
+/// `mirror:z:h->z:h`、`template:storage:name`……）。这里只做一件保守的事：
+/// 把 key 里出现的 zone / 模板挑出来，**全部都不在现存规格里**才算孤儿。
+fn is_orphan_key(key: &str, live: &LiveEntities) -> bool {
+    let mut parts = key.split(':');
+    let Some(head) = parts.next() else {
+        return false;
+    };
+    if head == "template" {
+        // template:<storage>:<name>；storage 与模板名一起比对，因为
+        // "local-lvm 上放模板"这种组合本身就不可用
+        let rest = key.strip_prefix("template:").unwrap_or("");
+        let (st, nm) = rest.split_once(':').unwrap_or((rest, ""));
+        return !live
+            .templates
+            .contains(&(st.to_string(), nm.to_string()));
+    }
+    if head == "mirror" {
+        // mirror:<z>:<h>-><z>:<h>
+        let rest = key.strip_prefix("mirror:").unwrap_or("");
+        let mut any_live = false;
+        for side in rest.split("->") {
+            let mut it = side.split(':');
+            let (Some(z), Some(h)) = (it.next(), it.next()) else {
+                continue;
+            };
+            if live.hosts.contains(&(z.to_string(), h.to_string())) {
+                any_live = true;
+            }
+        }
+        return !any_live;
+    }
+    if head == "bridge" {
+        // bridge:mir:<z> / bridge:<z>
+        let seg: Vec<&str> = key.split(':').collect();
+        let z = if seg.len() >= 3 && seg[1] == "mir" {
+            seg[2]
+        } else {
+            seg.get(1).copied().unwrap_or("")
+        };
+        return !z.is_empty() && !live.zones.contains(z);
+    }
+    // ct / disk / net / bootstrap / gateway / snapshot：第二段都是 zone
+    let Some(z) = parts.next() else {
+        return false;
+    };
+    !live.zones.contains(z)
 }
 
 fn phase_of_key(key: &str) -> String {
@@ -832,11 +967,232 @@ async fn hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
                 "role": meta.map(|m| m.0.clone()),
                 "ipv4": meta.map(|m| m.1.clone()),
                 "spec": meta.map(|m| m.2.clone()),
+                // 规格里已经没有这台主机了：vmid 分配记录还在，但它是历史残留。
+                // 前端默认折叠，避免把"早就删掉的实验"混进当前环境。
+                "orphan": meta.is_none(),
                 "retired": state.db.is_retired(&zone, &host),
             })
         })
         .collect();
     Json(serde_json::json!({ "hosts": rows })).into_response()
+}
+
+/// 清掉"规格已删除、容器也不存在"的 vmid 分配记录。
+///
+/// 为什么不一并删掉容器还在的那些：vmid 记录是 `zone/host → 容器` 的唯一映射，
+/// 规格只是暂时没写回来时，删了它就再也认不回那台容器（只能按名字猜）。
+/// 所以这里只清"两边都没有"的纯残留。
+async fn prune_hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    let live = live_entities(&state.cfg);
+    let vms = state
+        .pve
+        .cluster_vms_view(&CancellationToken::new())
+        .await
+        .unwrap_or_default();
+    let mut removed = 0usize;
+    let mut kept = 0usize;
+    for (zone, host, vmid) in state.db.all_vmids() {
+        if live.hosts.contains(&(zone.clone(), host.clone())) {
+            continue;
+        }
+        // 容器还在：这条记录是唯一的对应关系，必须保留
+        if vms.iter().any(|r| r.vmid_parsed() == Some(vmid)) {
+            kept += 1;
+            continue;
+        }
+        if state.db.forget_vmid(&zone, &host) {
+            removed += 1;
+        }
+    }
+    Json(serde_json::json!({ "removed": removed, "kept": kept })).into_response()
+}
+
+/// 销毁"规格里已经没有、但容器还在跑"的孤儿。
+///
+/// 为什么需要这个入口：`destroy` 是按 zone 走的，而 zone 已经从规格里删掉了，
+/// 于是这些容器在面板上既看不见、也没法删——只剩 `规格外` 的 vmid 记录。
+/// 真机遇到的是早前测试留下的 `zt` 三个容器：一直开着，还占着 `labzt`/`mirzt`
+/// 两座桥（清掉桥它们会把桥带回来），只能手工上机器才收拾得掉。
+///
+/// 破坏性操作：必须显式带上 `confirm: "destroy-orphans"`，且只处理
+/// `live.hosts` 里没有的主机。停 → destroy → 释放 vmid → 忘步骤。
+async fn purge_orphans(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PurgeReq>,
+) -> Response {
+    require_auth!(state, headers);
+    if req.confirm != "destroy-orphans" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "这是删除容器的操作，需要 confirm=\"destroy-orphans\" 才会执行"
+            })),
+        )
+            .into_response();
+    }
+    let live = live_entities(&state.cfg);
+    // 保险：规格读不出来时 `live.hosts` 会是空的，那样"所有 vmid 记录都是孤儿"，
+    // 一次点击就把整片环境删干净。宁可拒绝执行。
+    if live.hosts.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "读不到任何现存规格里的主机，为安全起见没有执行任何删除。请先确认规格能正常解析"
+            })),
+        )
+            .into_response();
+    }
+    let cancel = CancellationToken::new();
+    let vms = match state.pve.cluster_vms(&cancel).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("查集群现状失败，没动任何容器: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let mut destroyed: Vec<String> = Vec::new();
+    let mut forgotten: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (zone, host, vmid) in state.db.all_vmids() {
+        if live.hosts.contains(&(zone.clone(), host.clone())) {
+            continue;
+        }
+        let exists = vms.iter().any(|r| r.vmid_parsed() == Some(vmid));
+        if exists {
+            // 先停再删：运行中的容器直接 destroy 会有磁盘锁残留
+            if let Ok(Some(st)) = state.pve.ct_status(vmid, &cancel).await {
+                if st == "running" {
+                    if let Err(e) = state.pve.ct_action(vmid, "stop", &cancel).await {
+                        errors.push(format!("{zone}/{host}({vmid}) 停机失败: {e}"));
+                        continue;
+                    }
+                }
+            }
+            if let Err(e) = state.pve.ct_action(vmid, "destroy", &cancel).await {
+                errors.push(format!("{zone}/{host}({vmid}) 删除失败: {e}"));
+                continue;
+            }
+            destroyed.push(format!("{zone}/{host}({vmid})"));
+        } else {
+            forgotten.push(format!("{zone}/{host}({vmid})"));
+        }
+        state.db.forget_vmid(&zone, &host);
+        let mut keys = Vec::new();
+        for prefix in ["ct", "net", "bootstrap", "snapshot"] {
+            keys.push(format!("{prefix}:{zone}:{host}"));
+        }
+        state.db.forget_steps(&keys);
+    }
+    state.pve.clear_cache();
+    Json(serde_json::json!({
+        "destroyed": destroyed,
+        "forgotten": forgotten,
+        "errors": errors,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct PurgeReq {
+    confirm: String,
+}
+
+/// 宿主上的 labyard 网桥现状：哪些还在被现存规格使用，哪些是残留。
+///
+/// 为什么必须看内核而不是看规格：删 zone 只改了文件（`destroy` 才动桥），
+/// 而 `destroy` 需要 zone 还在规格里。规格先删了，桥就永远留下来了——
+/// 界面上完全看不见，却占着名字和地址（`labzt` 上还挂着 10.99.3.254）。
+async fn list_bridges(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    let live = live_entities(&state.cfg);
+    let cancel = CancellationToken::new();
+    let mut usage = state.pve.bridge_usage(&cancel).await.unwrap_or_default();
+    // 只在 /etc/network/interfaces 里躺着的桥也要列出来：内核删掉了但配置还在，
+    // 重启就会被重建，界面上却完全看不见——等于清不掉。
+    let in_kernel: std::collections::HashSet<String> =
+        usage.iter().map(|(n, _, _)| n.clone()).collect();
+    for name in state.pve.persisted_bridges(&cancel).await.unwrap_or_default() {
+        if !in_kernel.contains(&name) {
+            usage.push((name, String::new(), 0));
+        }
+    }
+    let rows: Vec<serde_json::Value> = usage
+        .into_iter()
+        // 只看平台自己建的：PVE 的 vmbr*、外网桥 wan 都不该出现在这里
+        .filter(|(n, _, _)| n.starts_with("lab") || n.starts_with("mir"))
+        .map(|(name, ips, members)| {
+            // `mirr` 是全局镜像桥，不属于任何 zone，永远不算残留
+            let zone = if name == "mirr" {
+                None
+            } else {
+                name.strip_prefix("lab")
+                    .or_else(|| name.strip_prefix("mir"))
+                    .map(|s| s.to_string())
+            };
+            let orphan = zone
+                .as_ref()
+                .map(|z| !live.zones.contains(z))
+                .unwrap_or(false);
+            // 有地址或有成员口就不能自动删：前者可能正被当管理口用，
+            // 后者说明还有容器挂在上面（跑着的抓包口）。
+            let safe = orphan && ips.is_empty() && members == 0;
+            serde_json::json!({
+                "name": name,
+                "zone": zone,
+                "ips": ips,
+                "members": members,
+                "orphan": orphan,
+                "safe": safe,
+                // false = 内核里已经没了，只剩配置里的持久化段
+                "kernel": in_kernel.contains(&name),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "bridges": rows })).into_response()
+}
+
+/// 清掉"无地址、无成员"的残留网桥。有 IP 或有成员的只报告不动手。
+async fn prune_bridges(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    let live = live_entities(&state.cfg);
+    let cancel = CancellationToken::new();
+    let mut usage = state.pve.bridge_usage(&cancel).await.unwrap_or_default();
+    let in_kernel: std::collections::HashSet<String> =
+        usage.iter().map(|(n, _, _)| n.clone()).collect();
+    for name in state.pve.persisted_bridges(&cancel).await.unwrap_or_default() {
+        if !in_kernel.contains(&name) {
+            usage.push((name, String::new(), 0));
+        }
+    }
+    let mut removed: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for (name, ips, members) in usage {
+        let Some(z) = name
+            .strip_prefix("lab")
+            .or_else(|| name.strip_prefix("mir"))
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        if name == "mirr" || live.zones.contains(&z) {
+            continue;
+        }
+        if !ips.is_empty() || members > 0 {
+            kept.push(name);
+            continue;
+        }
+        if state.pve.destroy_bridge(&name, &cancel).await.is_ok() {
+            removed.push(name);
+        } else {
+            kept.push(name);
+        }
+    }
+    Json(serde_json::json!({ "removed": removed, "kept": kept })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1580,6 +1936,7 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
         &[("post", "改管理员密码：{old_password, new_password}（≥8 位）")],
     ),
     ("/api/state", &[("get", "已登记步骤的状态（幂等判定的输入）")]),
+    ("/api/state/prune", &[("post", "清理已删除规格留下的步骤记录")]),
     ("/api/spec", &[
         ("get", "读取默认规格"),
         ("put", "保存默认规格（先校验，再原子写）"),
@@ -1612,7 +1969,11 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
     ("/api/runs/{id}/retry", &[("post", "从失败的步骤续跑")]),
     ("/api/runs/{id}/cancel", &[("post", "取消运行")]),
     ("/api/doctor", &[("get", "环境自检")]),
-    ("/api/hosts", &[("get", "主机清单（含电源状态与 retired 标记）")]),
+    ("/api/hosts", &[("get", "主机清单（含电源状态、orphan 与 retired 标记）")]),
+    ("/api/hosts/prune", &[("post", "清理已删除规格留下的 vmid 分配记录")]),
+    ("/api/hosts/purge", &[("post", "销毁规格外仍在运行的孤儿容器")]),
+    ("/api/bridges", &[("get", "宿主上网桥现状（含残留标记）")]),
+    ("/api/bridges/prune", &[("post", "清理无地址、无成员的残留网桥")]),
     ("/api/hosts/{z}/{h}/power", &[("post", "开/关/重启单台主机")]),
     ("/api/hosts/{z}/{h}/retire", &[("post", "废弃：停机并摘镜像，保留磁盘")]),
     ("/api/hosts/{z}/{h}/revive", &[("post", "从废弃状态恢复")]),
@@ -1708,6 +2069,39 @@ mod tests {
         assert_eq!(phase_of_key("ct:main:gw"), "ct");
         assert_eq!(phase_of_key("bridge:main"), "bridge");
         assert_eq!(phase_of_key("garbage"), "garbage");
+    }
+
+    #[test]
+    fn orphan_detection_follows_live_spec() {
+        let mut live = LiveEntities {
+            zones: HashSet::new(),
+            hosts: HashSet::new(),
+            templates: HashSet::new(),
+        };
+        live.zones.insert("lab".to_string());
+        live.hosts.insert(("lab".to_string(), "t1".to_string()));
+        live.templates
+            .insert(("local".to_string(), "debian-12-standard_x.tar.zst".to_string()));
+
+        // 还活着的实体
+        assert!(!is_orphan_key("ct:lab:t1", &live));
+        assert!(!is_orphan_key("bridge:lab", &live));
+        assert!(!is_orphan_key("gateway:lab", &live));
+        assert!(!is_orphan_key(
+            "template:local:debian-12-standard_x.tar.zst",
+            &live
+        ));
+        // 已删除的规格
+        assert!(is_orphan_key("ct:main:gateway", &live));
+        assert!(is_orphan_key("bridge:mir:zt", &live));
+        assert!(is_orphan_key("mirror:zt:s1->zt:a1", &live));
+        // 模板名对、存储不对（lvmthin 放不了模板）也算失效
+        assert!(is_orphan_key(
+            "template:local-lvm:debian-12-standard",
+            &live
+        ));
+        // 模板名已不再使用
+        assert!(is_orphan_key("template:local:debian-13-standard", &live));
     }
 
     /// 契约测试：OpenAPI 是给外部集成方看的，漏一条就等于"这个接口不存在"。

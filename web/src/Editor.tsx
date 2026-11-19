@@ -418,7 +418,11 @@ export default function Editor() {
       api
         .putSpecNamed(specName, sent)
         .then(() => setSaved(sent))
-        .catch((e) => message.warning(`规格未能保存：${(e as Error).message}`));
+        .catch((e) =>
+          message.warning(
+            `规格未能存盘：${(e as Error).message}。执行仍在进行，内容也还在编辑器里，稍后可手动保存。`,
+          ),
+        );
 
       const stop = streamRun(
         r.run_id,
@@ -477,8 +481,13 @@ export default function Editor() {
         }
       }, 5000);
     } catch (e) {
-      setErr((e as Error).message);
+      // 这里失败通常是"保存规格"没成功（执行还没开始）。必须让用户明白
+      // 两件事：没有跑，以及他的配置还在编辑器里没丢。
+      setErr(
+        `执行没有启动：${(e as Error).message}。编辑器里的配置仍然保留，处理完再点执行即可。`,
+      );
       setBusy(false);
+      setCur(null);
     }
   };
 
@@ -508,7 +517,8 @@ export default function Editor() {
     [],
   );
 
-  const grouped = useMemo(() => {    const g = new Map<string, PreviewStep[]>();
+  const grouped = useMemo(() => {
+    const g = new Map<string, PreviewStep[]>();
     for (const s of steps) {
       const arr = g.get(s.phase) ?? [];
       arr.push(s);
@@ -768,11 +778,26 @@ export default function Editor() {
             />
           )}
 
-          <div className="log-view" ref={logRef}>
+          <div
+            className="log-view"
+            ref={logRef}
+            style={
+              logs.length === 0
+                ? {
+                    minHeight: 84,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    textAlign: "center",
+                  }
+                : undefined
+            }
+          >
             {logs.length === 0 ? (
-              <span style={{ color: "#5b6b84" }}>
-                点击「执行」后，每一步的输出会实时出现在这里。
-                {"\n"}已完成且参数未变的步骤会被跳过，并标注原因。
+              <span style={{ color: "#5b6b84", lineHeight: 1.7 }}>
+                点击右上角「执行」后，每一步的输出会实时出现在这里。
+                <br />
+                已完成且参数未变的步骤会被跳过，并标注原因。
               </span>
             ) : (
               (logFilter === "error"
@@ -785,22 +810,22 @@ export default function Editor() {
               ))
             )}
           </div>
-          <Space style={{ marginTop: 8 }} size={12} wrap>
-            <Segmented
-              size="small"
-              value={logFilter}
-              onChange={(v) => setLogFilter(v as "all" | "error")}
-              options={[
-                { value: "all", label: "全部" },
-                { value: "error", label: "只看错误" },
-              ]}
-            />
-            {runId && (
+          {logs.length > 0 && (
+            <Space style={{ marginTop: 8 }} size={12} wrap>
+              <Segmented
+                size="small"
+                value={logFilter}
+                onChange={(v) => setLogFilter(v as "all" | "error")}
+                options={[
+                  { value: "all", label: "全部" },
+                  { value: "error", label: "只看错误" },
+                ]}
+              />
               <Text type="secondary" style={{ fontSize: 12 }}>
                 <CheckCircleOutlined /> 日志超 3000 行丢弃较早部分；瞬时超 500 行会丢中间行并标注
               </Text>
-            )}
-          </Space>
+            </Space>
+          )}
         </Card>
       </Col>
 

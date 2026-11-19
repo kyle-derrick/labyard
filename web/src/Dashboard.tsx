@@ -1,16 +1,21 @@
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Alert,
+  App as AntApp,
   Button,
   Card,
   Col,
   Empty,
+  Popconfirm,
   Row,
+  Segmented,
   Space,
   Spin,
   Statistic,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import {
@@ -22,13 +27,25 @@ import { api, type DoctorItem, type StepState } from "./api";
 
 const { Text, Paragraph } = Typography;
 
-const STATE_COLOR: Record<string, string> = {
-  done: "green",
-  failed: "red",
-  running: "blue",
+/** 步骤状态是给人看的，别直接摊英文 */
+const STATE_META: Record<string, { label: string; color: string }> = {
+  done: { label: "已完成", color: "green" },
+  failed: { label: "失败", color: "red" },
+  running: { label: "运行中", color: "blue" },
+  skipped: { label: "已跳过", color: "default" },
+  pending: { label: "待执行", color: "default" },
 };
 
+/** 从体检详情里抠出版本号（形如 `9.2.2（需要 ≥ 9.0）`） */
+function pveVersion(items: DoctorItem[]): string {
+  const it = items.find((i) => i.name === "PVE 版本");
+  if (!it) return "未知";
+  const m = it.detail.match(/\d+\.\d+(?:\.\d+)?/);
+  return m ? m[0] : it.ok ? "已就绪" : "未知";
+}
+
 export default function Dashboard() {
+  const { message } = AntApp.useApp();
   const doctor = useQuery({
     queryKey: ["doctor"],
     queryFn: api.doctor,
@@ -42,7 +59,13 @@ export default function Dashboard() {
     refetchInterval: 10_000,
   });
 
+  const [onlyFailed, setOnlyFailed] = useState(false);
+
   const steps: StepState[] = state.data?.steps ?? [];
+  const failedSteps = useMemo(
+    () => steps.filter((s) => s.state === "failed"),
+    [steps],
+  );
   const byState = steps.reduce<Record<string, number>>((acc, s) => {
     acc[s.state] = (acc[s.state] ?? 0) + 1;
     return acc;
@@ -50,6 +73,20 @@ export default function Dashboard() {
 
   const items: DoctorItem[] = doctor.data?.items ?? [];
   const failed = items.filter((i) => !i.ok);
+  const orphans = state.data?.orphans ?? 0;
+  const visibleSteps = onlyFailed ? failedSteps : steps;
+
+  const pruneOrphans = async () => {
+    try {
+      const r = await api.pruneState();
+      message.success(
+        r.removed > 0 ? `已清理 ${r.removed} 条历史记录` : "没有可清理的记录",
+      );
+      await state.refetch();
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  };
 
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
@@ -66,6 +103,26 @@ export default function Dashboard() {
         />
       )}
 
+      {orphans > 0 && (
+        <Alert
+          type="info"
+          showIcon
+          message={`库里有 ${orphans} 条记录属于已删除的规格`}
+          description="它们不计入下面的统计，也不代表当前环境有问题。确认不再需要后可以清掉。"
+          action={
+            <Popconfirm
+              title="清理历史记录？"
+              description="只删「规格里已经没有」的步骤记录，不会碰现存环境。"
+              okText="清理"
+              cancelText="取消"
+              onConfirm={pruneOrphans}
+            >
+              <Button size="small">清理</Button>
+            </Popconfirm>
+          }
+        />
+      )}
+
       <Row gutter={16}>
         <Col xs={12} md={6}>
           <Card size="small">
@@ -77,13 +134,41 @@ export default function Dashboard() {
           </Card>
         </Col>
         <Col xs={12} md={6}>
-          <Card size="small">
-            <Statistic
-              title="失败步骤"
-              value={byState["failed"] ?? 0}
-              valueStyle={{ color: (byState["failed"] ?? 0) > 0 ? "#dc2626" : undefined }}
-            />
-          </Card>
+          <Tooltip
+            title={
+              failedSteps.length > 0
+                ? "点击在右侧只看失败步骤"
+                : "上次执行没有失败的步骤"
+            }
+          >
+            <Card
+              size="small"
+              hoverable={failedSteps.length > 0}
+              onClick={() => {
+                if (failedSteps.length > 0) setOnlyFailed(true);
+              }}
+              style={
+                failedSteps.length > 0
+                  ? { cursor: "pointer", borderColor: "#fecaca" }
+                  : undefined
+              }
+            >
+              <Statistic
+                title="失败步骤"
+                value={byState["failed"] ?? 0}
+                valueStyle={{
+                  color: (byState["failed"] ?? 0) > 0 ? "#dc2626" : undefined,
+                }}
+                suffix={
+                  failedSteps.length > 0 ? (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      查看明细
+                    </Text>
+                  ) : undefined
+                }
+              />
+            </Card>
+          </Tooltip>
         </Col>
         <Col xs={12} md={6}>
           <Card size="small">
@@ -93,8 +178,8 @@ export default function Dashboard() {
         <Col xs={12} md={6}>
           <Card size="small">
             <Statistic
-              title="PVE"
-              value={items.find((i) => i.name === "PVE 版本")?.ok ? "9.x" : "未知"}
+              title="PVE 版本"
+              value={pveVersion(items)}
               valueStyle={{ fontSize: 20 }}
             />
           </Card>
@@ -154,9 +239,21 @@ export default function Dashboard() {
             title="步骤状态"
             size="small"
             extra={
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                每 10 秒刷新
-              </Text>
+              failedSteps.length > 0 ? (
+                <Segmented
+                  size="small"
+                  value={onlyFailed ? "failed" : "all"}
+                  onChange={(v) => setOnlyFailed(v === "failed")}
+                  options={[
+                    { label: `全部 ${steps.length}`, value: "all" },
+                    { label: `只看失败 ${failedSteps.length}`, value: "failed" },
+                  ]}
+                />
+              ) : (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  每 10 秒刷新
+                </Text>
+              )
             }
           >
             {steps.length === 0 ? (
@@ -164,19 +261,33 @@ export default function Dashboard() {
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
                 description="还没有执行过任何规格"
               />
+            ) : visibleSteps.length === 0 ? (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description="没有失败的步骤"
+              />
             ) : (
               <div style={{ maxHeight: 420, overflow: "auto" }}>
-                {steps.map((s) => (
-                  <div className="step-row" key={s.key}>
-                    <Tag color={STATE_COLOR[s.state] ?? "default"}>{s.state}</Tag>
-                    <span className="step-key">{s.key}</span>
-                    {s.message && (
-                      <Text type="danger" style={{ fontSize: 11 }}>
-                        {s.message.slice(0, 40)}
-                      </Text>
-                    )}
-                  </div>
-                ))}
+                {visibleSteps.map((s) => {
+                  const meta = STATE_META[s.state] ?? {
+                    label: s.state,
+                    color: "default",
+                  };
+                  return (
+                    <div className="step-row" key={s.key}>
+                      <Tag color={meta.color}>{meta.label}</Tag>
+                      <span className="step-key">{s.key}</span>
+                      {s.message && (
+                        <Tooltip title={s.message}>
+                          <Text type="danger" style={{ fontSize: 11 }}>
+                            {s.message.slice(0, 40)}
+                            {s.message.length > 40 ? "…" : ""}
+                          </Text>
+                        </Tooltip>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </Card>

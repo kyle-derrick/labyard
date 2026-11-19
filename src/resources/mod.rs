@@ -35,6 +35,13 @@ pub struct Snapshot {
     pub bridges: HashSet<String>,
     /// (storage, 模板简名) → 完整 volid
     pub templates: HashMap<(String, String), Option<String>>,
+    /// 运行中容器里各网卡的 IPv4（`10.77.0.1/24` 这种带前缀的形式）。
+    /// 停着的容器不在表里——没有"现在没配好"这回事，等它起来时开机脚本会补。
+    ///
+    /// 为什么要把这个进快照：地址是**运行时**配的，容器重启或改网卡（热插拔）
+    /// 之后会凭空消失，而 step_state 还写着 done。只看记录，平台会永远认为
+    /// "网络已配好"，人看到的是"配置都对，就是连不上"。
+    pub addrs: HashMap<u32, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +57,36 @@ pub enum StepState {
     Skipped,
     Applied,
     Failed,
+}
+
+/// 容器里的地址是否与规格一致。抽成纯函数方便单测。
+///
+/// - `snap.addrs` 里没有这个 vmid = 容器没在跑：**不改判**。停着的容器没有
+///   "现在没配好"这回事，等它起来 `labyard-net.service` 会补上。
+/// - `ipv4` 是 `dhcp` / 空 = 地址不由我们定，跳过检查（DHCP 拿不到另有路径兜）。
+/// - 网关的 eth1 是上联：只有给了静态 `uplink_ip` 才查，走 DHCP 的不查。
+fn net_addrs_ok(
+    snap: &Snapshot,
+    vmid: u32,
+    ipv4: &str,
+    is_gateway: bool,
+    uplink_ip: Option<&str>,
+) -> bool {
+    let Some(have) = snap.addrs.get(&vmid) else {
+        return true;
+    };
+    let has = |want: &str| have.iter().any(|a| a == want);
+    if !ipv4.is_empty() && ipv4 != "dhcp" && !has(ipv4) {
+        return false;
+    }
+    if is_gateway {
+        if let Some(u) = uplink_ip {
+            if !has(u) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +127,10 @@ impl Executor {
         for b in self.pve.kernel_bridges(cancel).await? {
             snap.bridges.insert(b);
         }
+        // 一次拿全所有运行中容器的地址。这条探测比它看起来便宜：一条命令里
+        // 顺序 `pct exec`，十几台容器一两秒；不查则整类"地址悄悄丢了"的故障
+        // 在平台上完全不可见。失败就当没探测到（不能因为探测失败让人无法 apply）。
+        snap.addrs = self.pve.ct_addrs_all(cancel).await.unwrap_or_default();
 
         let mut storages: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
         storages.sort();
@@ -119,6 +160,21 @@ impl Executor {
                 "从未执行"
             });
         }
+        // 网络步骤要看一眼容器里的地址还在不在。地址是运行时配的，容器重启、
+        // 改网卡（热插拔）之后会消失，而记录仍然写着 done——只信记录就会永远
+        // 认为"网络配好了"，人看到的是"配置都对，就是连不上"。
+        if let StepKind::Net {
+            vmid,
+            ipv4,
+            is_gateway,
+            uplink_ip,
+            ..
+        } = &step.kind
+        {
+            if !net_addrs_ok(snap, *vmid, ipv4, *is_gateway, uplink_ip.as_deref()) {
+                return Decision::Apply("容器里的地址已丢失");
+            }
+        }
         let exists = match &step.kind {
             StepKind::Bridge { name, .. } => snap.bridges.contains(name),
             StepKind::Container { vmid, .. } => snap.vmids.contains(vmid),
@@ -130,8 +186,9 @@ impl Executor {
                 .get(&(template_storage.clone(), template.clone()))
                 .map(|v| v.is_some())
                 .unwrap_or(true),
-            // Net / Bootstrap / Mirror / Snapshot 的"存在"检查需要进容器或查快照，
-            // 代价高且不常被人手工破坏，这里信任记录。
+            // Net 已在上面按容器里的实际地址判过；Bootstrap / Mirror / Snapshot
+            // 的"存在"检查要再进容器或查快照，代价高且不常被人手工破坏，
+            // 这里信任记录。
             _ => true,
         };
         if exists {
@@ -816,6 +873,33 @@ fn zone_cidr_from(ip_with_len: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_check_flags_missing_addresses_only_when_running() {
+        let mut snap = Snapshot::default();
+        // 101 在跑：eth0 有地址、eth1（上联）也有
+        snap.addrs.insert(
+            101,
+            vec!["127.0.0.1/8".into(), "10.77.0.1/24".into(), "192.168.33.201/24".into()],
+        );
+        // 113 在跑：只有上联 eth1 有地址，eth0 空了——真机就是这个形状
+        snap.addrs
+            .insert(113, vec!["127.0.0.1/8".into(), "10.77.0.253/24".into()]);
+
+        // 完好 → 不重跑
+        assert!(net_addrs_ok(&snap, 101, "10.77.0.1/24", true, Some("192.168.33.201/24")));
+        // eth0 地址丢了 → 必须重跑
+        assert!(!net_addrs_ok(&snap, 113, "10.30.1.1/24", true, Some("10.77.0.253/24")));
+        // 同一台机器，只查 eth0（非网关）也一样要重跑
+        assert!(!net_addrs_ok(&snap, 113, "10.30.1.1/24", false, None));
+        // 上联走 DHCP（uplink_ip=None）时不查 eth1
+        assert!(net_addrs_ok(&snap, 101, "10.77.0.1/24", true, None));
+        // ipv4 是 dhcp / 空 → 不由我们定，不据此判死
+        assert!(net_addrs_ok(&snap, 113, "dhcp", false, None));
+        assert!(net_addrs_ok(&snap, 113, "", false, None));
+        // 容器没在跑（快照里没有这个 vmid）→ 不改判，等开机脚本补
+        assert!(net_addrs_ok(&snap, 999, "10.77.0.1/24", true, Some("192.168.33.9/24")));
+    }
 
     #[test]
     fn zone_cidr_normalises_last_octet() {

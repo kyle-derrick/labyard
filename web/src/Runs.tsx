@@ -67,6 +67,23 @@ function fmt(ts: string | null): string {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
+/** 秒数 → 人能读的时长 */
+function fmtSecs(s: number): string {
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r ? `${m} 分 ${r} 秒` : `${m} 分`;
+}
+
+function durationOf(r: RunRow): string {
+  const a = new Date(r.started_at.includes("T") ? r.started_at : r.started_at.replace(" ", "T") + "Z").getTime();
+  const end = r.finished_at
+    ? new Date(r.finished_at.includes("T") ? r.finished_at : r.finished_at.replace(" ", "T") + "Z").getTime()
+    : Date.now();
+  if (isNaN(a) || isNaN(end)) return "—";
+  return fmtSecs(Math.max(0, Math.round((end - a) / 1000)));
+}
+
 export default function Runs() {
   const { message } = AntApp.useApp();
   const [detail, setDetail] = useState<string | null>(null);
@@ -104,16 +121,63 @@ export default function Runs() {
       width: 110,
       render: (v: string | null) => v ?? "—",
     },
-    { title: "开始", dataIndex: "started_at", width: 180, render: fmt },
-    { title: "结束", dataIndex: "finished_at", width: 180, render: fmt },
+    { title: "开始", dataIndex: "started_at", width: 165, render: fmt },
+    {
+      title: "耗时",
+      width: 88,
+      render: (_: unknown, r: RunRow) => {
+        const d = durationOf(r);
+        return r.finished_at ? (
+          <Tooltip title={`结束于 ${fmt(r.finished_at)}`}>
+            <span>{d}</span>
+          </Tooltip>
+        ) : (
+          <Text type="secondary">{r.status === "running" ? `${d}…` : d}</Text>
+        );
+      },
+    },
     {
       title: "结果",
       dataIndex: "status",
-      width: 100,
+      width: 92,
       render: (v: string) => runStatusTag(v),
     },
     {
+      title: "失败原因",
+      width: 300,
+      render: (_: unknown, r: RunRow) => {
+        if (!r.failed_message) {
+          return r.status === "failed" ? (
+            <Text type="secondary">—</Text>
+          ) : null;
+        }
+        return (
+          <Tooltip
+            title={
+              <div style={{ maxWidth: 520, whiteSpace: "pre-wrap" }}>
+                <div style={{ opacity: 0.75, marginBottom: 4 }}>
+                  {r.failed_step}
+                </div>
+                {r.failed_message}
+              </div>
+            }
+          >
+            <span style={{ fontSize: 12 }}>
+              {r.failed_step && (
+                // 完整 key 才能对上"明细"里的那一步：截成 ct:main 反而认不出
+                <code style={{ opacity: 0.65, marginRight: 6 }}>
+                  {r.failed_step}
+                </code>
+              )}
+              <Text type="danger">{r.failed_message}</Text>
+            </span>
+          </Tooltip>
+        );
+      },
+    },
+    {
       title: "操作",
+      width: 150,
       render: (_: unknown, r: RunRow) => (
         <Space size={4}>
           <Button size="small" onClick={() => setDetail(r.id)}>

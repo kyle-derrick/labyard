@@ -84,6 +84,10 @@ pub struct RunRow {
     pub spec_name: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// 失败的第一个步骤与原因。列表里直接给出来——让用户为了知道"为什么失败"
+    /// 还要点进明细，是这次复盘里最常被抱怨的一处。
+    pub failed_step: Option<String>,
+    pub failed_message: Option<String>,
 }
 
 /// 一次 run 内的步骤记录。
@@ -319,7 +323,14 @@ impl Db {
     pub fn list_runs(&self, limit: u32) -> Vec<RunRow> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, status, spec_name, started_at, finished_at FROM runs ORDER BY started_at DESC LIMIT ?1",
+            "SELECT r.id, r.status, r.spec_name, r.started_at, r.finished_at,
+                    (SELECT s.step_key FROM run_steps s
+                      WHERE s.run_id = r.id AND s.state = 'failed'
+                      ORDER BY s.started_at LIMIT 1),
+                    (SELECT s.message FROM run_steps s
+                      WHERE s.run_id = r.id AND s.state = 'failed'
+                      ORDER BY s.started_at LIMIT 1)
+             FROM runs r ORDER BY r.started_at DESC LIMIT ?1",
         ) {
             Ok(st) => st,
             Err(_) => return vec![],
@@ -331,6 +342,8 @@ impl Db {
                 spec_name: r.get(2)?,
                 started_at: r.get(3)?,
                 finished_at: r.get(4)?,
+                failed_step: r.get(5)?,
+                failed_message: r.get(6)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -380,6 +393,45 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM step_state WHERE key LIKE ?1", params![pattern])
             .unwrap_or(0)
+    }
+
+    /// 按 key 精确删步骤记录，返回删除条数。
+    ///
+    /// 规格文件被删掉之后，它留下的步骤记录不会自己消失：概览页会把
+    /// `ct:main:gateway` 这种早已不存在的步骤当成"当前失败"，红着一个大数字
+    /// 却找不到对应实体。清理必须按 key 精确删——用 LIKE 去猜会误伤名字前缀
+    /// 相同的 zone（`lab` 与 `lab2`）。
+    pub fn forget_steps(&self, keys: &[String]) -> usize {
+        if keys.is_empty() {
+            return 0;
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let mut n = 0;
+        for k in keys {
+            n += tx
+                .execute("DELETE FROM step_state WHERE key = ?1", params![k])
+                .unwrap_or(0);
+        }
+        let _ = tx.commit();
+        n
+    }
+
+    /// 删掉一条 vmid 分配记录。
+    ///
+    /// 只有在"规格里已经没有这台主机，且容器也确实不存在"时才允许调用——
+    /// 分配记录是 IP 与笔记的锚，误删会让重建的主机换号。调用方负责判条件。
+    pub fn forget_vmid(&self, zone: &str, host: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM vmids WHERE zone = ?1 AND host = ?2",
+            params![zone, host],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
     }
 
     // ── retire / revive（运行态，不是声明式配置）──

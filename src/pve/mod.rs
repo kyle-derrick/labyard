@@ -18,6 +18,42 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// 从 `/etc/network/interfaces` 里整段删掉某个网桥的 awk 程序（`-v n=<桥名>`）。
+///
+/// 为什么要按块结构删、而不是按行数删：一个段的行数并不固定（配了管理地址
+/// 会多一行 `up ip addr replace …`），按固定行数砍会在没有那一行时连带吃掉
+/// 下一段的首行——那是别人的配置。这里只认三种行：段首 `auto <n>`、段内的
+/// 缩进行、以及结尾的空行；遇到别的就立刻收手。
+///
+/// 抽成常量是为了让单测能真的跑它（见 `unpersist_awk_removes_only_its_block`）。
+const BRIDGE_UNPERSIST_AWK: &str = r#"$0 == "auto " n { skip = 1; next }
+skip && $0 ~ /^[ \t]*$/ { skip = 0; next }
+skip && ($0 ~ /^[ \t]/ || $0 == "iface " n " inet manual") { next }
+skip { skip = 0 }
+{ print }"#;
+
+/// 比较 PVE 存的 `net<N>` 串与我们期望的三项是否一致。
+///
+/// 只比 `name` / `bridge` / `ip`：`hwaddr`、`type`、`firewall` 我们不管，也不能
+/// 因为它们在就重写一遍——重写等于热插拔，容器里那块网卡会被换成新接口，
+/// 运行时配的地址当场丢失（真机现象：清完网桥后网关容器 eth0 空地址，
+/// 整片实验网断掉，而步骤状态还是"已完成"，没人去补）。
+///
+/// `ip` 缺省视为 `dhcp`（PVE 的默认值），`name` 缺省视为 `eth<idx>`。
+fn net_spec_matches(have: &str, idx: u32, name: &str, bridge: &str, ip: &str) -> bool {
+    let field = |k: &str| {
+        have.split(',')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(kk, _)| kk.trim() == k)
+            .map(|(_, v)| v.trim().to_string())
+    };
+    let have_name = field("name").unwrap_or_else(|| format!("eth{idx}"));
+    let have_ip = field("ip").unwrap_or_else(|| "dhcp".to_string());
+    have_name == name
+        && field("bridge").as_deref() == Some(bridge)
+        && have_ip == ip
+}
+
 pub struct Pve {
     runner: Arc<dyn Runner>,
     pub node: String,
@@ -560,6 +596,74 @@ impl Pve {
         Ok(v.into_iter().filter(|i| i.kind == "bridge").collect())
     }
 
+    /// `/etc/network/interfaces` 里持久化的网桥名。
+    ///
+    /// 只删内核接口是不够的：PVE 重启（或 `ifreload -a`）会照这个文件把桥重建
+    /// 出来。真机踩过——`labmain` 用 `ip link del` 删掉，重启后又回来了，
+    /// 因为文件里还留着 `auto labmain` 段。所以"有没有残留"要连这张表一起看，
+    /// 否则界面上看不见、清也清不掉。
+    pub async fn persisted_bridges(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, PveError> {
+        let out = self
+            .runner
+            .run(
+                "probe:ifaces",
+                &CommandSpec::new(
+                    "sed",
+                    vec![
+                        "-n".to_string(),
+                        r"s/^iface \([^ ]*\) inet .*/\1/p".to_string(),
+                        "/etc/network/interfaces".to_string(),
+                    ],
+                ),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(out
+            .stdout
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
+
+    /// 每个桥的当前用法：地址、挂了多少成员口。
+    ///
+    /// 用来回答"这个桥还有人在用吗"——规格删了但桥没删，内核里照样躺着，
+    /// 占着名字和地址。只看名字无法判断，必须同时看 IP 与成员。
+    pub async fn bridge_usage(&self, cancel: &CancellationToken) -> Result<Vec<(String, String, usize)>, PveError> {
+        let script = r#"for b in $(ip -o link show type bridge | awk -F': ' '{print $2}'); do
+  ip=$(ip -4 -o addr show "$b" 2>/dev/null | awk '{print $4}' | paste -sd, -)
+  n=$(ip -o link show master "$b" 2>/dev/null | wc -l)
+  printf '%s|%s|%s\n' "$b" "$ip" "$n"
+done"#;
+        let out = self
+            .runner
+            .run(
+                "probe:bridge-usage",
+                &CommandSpec::new("sh", vec!["-c", script]),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.trim().split('|');
+                let name = it.next()?.to_string();
+                let ips = it.next().unwrap_or("").to_string();
+                let n = it.next().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+                Some((name, ips, n))
+            })
+            .collect())
+    }
+
     /// 内核实际生效面：`ip -o link show type bridge`。桥的本质是内核接口，
     /// /etc/network/interfaces 只是持久化——"存在不存在"看这里才不会说谎。
     pub async fn kernel_bridges(&self, cancel: &CancellationToken) -> Result<Vec<String>, PveError> {
@@ -832,11 +936,18 @@ fi
         Ok(())
     }
 
-    /// 容器现有的网卡槽位（`net0`、`net1`……）。
-    /// 只在"更新一台已有容器"时调用：网卡列表变短了（比如监控机不再抓某个
-    /// 网络的流量），多出来的 `netN` 必须删掉——`pct set` 不传就等于保留，
-    /// 于是容器里会留着一块谁都不认的网卡，镜像脚本还在往上灌流量。
-    pub async fn ct_nets(&self, vmid: u32, cancel: &CancellationToken) -> Result<Vec<u32>, PveError> {
+    /// 容器现有的网卡配置（`net0` → `name=eth0,bridge=lablab,…`）。
+    ///
+    /// 两处要用：
+    /// 1. 网卡列表变短了（监控机不再抓某个网络）→ 多出来的 `netN` 必须删掉，
+    ///    否则容器里留着一块谁都不认的口，镜像脚本还在往上灌流量。
+    /// 2. 判断"这次到底有没有变"——见 `ensure_ct`：不变就不下发 `--netN`，
+    ///    因为对运行中的容器改网卡是**热插拔**，会把容器里的 eth 换成新接口。
+    pub async fn ct_net_specs(
+        &self,
+        vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<(u32, String)>, PveError> {
         let out = self
             .runner
             .run(
@@ -855,8 +966,8 @@ fi
                 // `net0: name=eth0,bridge=lablab,hwaddr=...`
                 let l = l.trim_start();
                 let rest = l.strip_prefix("net")?;
-                let (idx, _) = rest.split_once(':')?;
-                idx.parse::<u32>().ok()
+                let (idx, val) = rest.split_once(':')?;
+                Some((idx.parse::<u32>().ok()?, val.trim().to_string()))
             })
             .collect())
     }
@@ -994,25 +1105,36 @@ fi
                 .await?;
             }
             Some(row) => {
-                // 运行时网口数：`pct set --netN` 对**运行中**的容器只改配置，
-                // 新网卡要等重启才会出现在 netns 里。不比较这个，"网关 eth1
-                // 上联"就永远只是配置文件里的一行——容器里没有 eth1，整段
-                // 内网没有出口，apt bootstrap 每次都退出码 100，run 一跑就是
-                // 好几分钟且永远不收敛。
+                // 运行时网口数：改 netN 会热插拔容器网卡，改完要核对口数对不对。
                 let runtime_nics = self.ct_running_nics(vmid, cancel).await.unwrap_or(0);
+                let have = self.ct_net_specs(vmid, cancel).await.unwrap_or_default();
                 // 已存在：只更新会漂移的字段，一条命令合并，避免 N 次 pct set 打 pmxcfs
                 let mut args: Vec<String> = vec!["set".into(), vmid.to_string()];
                 args.extend(["--cores".into(), cores.to_string()]);
                 args.extend(["--memory".into(), memory.to_string()]);
                 args.extend(["--hostname".into(), hostname.into()]);
+                // 网卡只在**真的变了**的时候才下发。对运行中的容器改 netN 是
+                // 热插拔：容器里的 eth 会被换成新接口，原有地址与路由当场消失。
+                // 以前这里无条件下发，于是"什么都没改的一次 apply"也能把网关
+                // 配瘫——而 net 步骤状态还是已完成，没人会去补地址。
+                let mut net_changed = false;
                 for (i, (name, br, ip)) in nets.iter().enumerate() {
+                    let same = have
+                        .iter()
+                        .find(|(n, _)| *n == i as u32)
+                        .map(|(n, cur)| net_spec_matches(cur, *n, name, br, ip))
+                        .unwrap_or(false);
+                    if same {
+                        continue;
+                    }
+                    net_changed = true;
                     args.push(format!("--net{i}"));
                     args.push(format!("name={name},bridge={br},ip={ip},type=veth"));
                 }
                 // 多出来的网卡删掉。改短（监控机少抓一个网络）时不做这一步，
                 // 容器里会留一块仍然挂着旧抓包桥的口，而平台上已经看不见它。
-                let have = self.ct_nets(vmid, cancel).await.unwrap_or_default();
-                for i in have.iter().filter(|i| (**i as usize) >= nets.len()) {
+                for (i, _) in have.iter().filter(|(i, _)| (*i as usize) >= nets.len()) {
+                    net_changed = true;
                     args.push("--delete".into());
                     args.push(format!("net{i}"));
                 }
@@ -1029,11 +1151,40 @@ fi
                     self.ct_action(vmid, "start", cancel).await?;
                 } else if runtime_nics > 0 && runtime_nics != nets.len() {
                     // 网口数量对不上：配置里有的口容器里没有（或反过来）。
-                    // 重启一次让 netns 按新配置重建；net 步骤随后会重放地址脚本。
+                    // 重启一次让 netns 按新配置重建；开机时 labyard-net.service
+                    // 会把地址重放回来。
                     self.ct_action(vmid, "reboot", cancel).await?;
+                } else if net_changed {
+                    // 口数没变但配置变了：热插拔已经发生，容器里的地址没了。
+                    // 开机脚本不会再跑，只能立刻重放一次——否则这台容器从此
+                    // "配置看着对，就是连不上"。
+                    let _ = self.ct_replay_net(vmid, cancel).await;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// 重放容器内已写好的地址配置——就是开机时 `labyard-net.service` 跑的那个脚本。
+    ///
+    /// 用在改过 `netN` 之后：热插拔把 eth 换成了新接口，地址随之消失，而开机
+    /// 脚本只在上电时跑一次。脚本由 net 步骤落盘，还没写（首次 apply）时这里
+    /// 什么都不做，不会报错。
+    pub async fn ct_replay_net(
+        &self,
+        vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<(), PveError> {
+        let script = "if [ -r /usr/local/lib/labyard/labyard-net.sh ]; then \
+                      sh /usr/local/lib/labyard/labyard-net.sh; fi";
+        self.ct_exec(
+            "ct-net:replay",
+            vmid,
+            &["sh", "-c", script],
+            Duration::from_secs(60),
+            cancel,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1347,6 +1498,51 @@ WantedBy=multi-user.target
         Ok(true)
     }
 
+    /// 所有**运行中**容器的 IPv4，一次拿全：`vmid → ["10.77.0.1/24", …]`。
+    ///
+    /// 用一条命令顺序 `pct exec`，而不是每台各起一次调用：apply 开始时只查
+    /// 一遍，十几台容器也就一两秒。停着的容器不会出现在结果里——"没在跑"
+    /// 和"地址丢了"是两种状态，不能混成一个空列表。
+    ///
+    /// 查出来作什么：判断网络步骤是否真的还成立。地址是运行时配的，容器重启
+    /// 或网卡热插拔之后就没了，而步骤记录还写着 done——只信记录，平台会一直
+    /// 以为网络是好的。
+    pub async fn ct_addrs_all(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<std::collections::HashMap<u32, Vec<String>>, PveError> {
+        let script = r#"for c in $(pct list | awk 'NR>1 && $2=="running" {print $1}'); do
+  a=$(pct exec "$c" -- ip -4 -o addr show 2>/dev/null | awk '{print $4}' | paste -sd, -)
+  printf '%s|%s\n' "$c" "$a"
+done"#;
+        let out = self
+            .runner
+            .run(
+                "probe:ct-addrs",
+                &CommandSpec::new("sh", vec!["-c", script]).with_timeout(Duration::from_secs(60)),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        let mut map = std::collections::HashMap::new();
+        for line in out.stdout.lines() {
+            let Some((vmid, addrs)) = line.trim().split_once('|') else {
+                continue;
+            };
+            let Ok(vmid) = vmid.trim().parse::<u32>() else {
+                continue;
+            };
+            let list: Vec<String> = addrs
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            map.insert(vmid, list);
+        }
+        Ok(map)
+    }
+
     /// 容器某块网卡的实际 IPv4（从容器内部读，而不是查 spec）。
     ///
     /// 为什么不从规格算：终端这类"操作现成环境"的功能不该依赖 Web 保存的
@@ -1389,10 +1585,13 @@ WantedBy=multi-user.target
             .nth(1)
             .map(|cidr| cidr.split('/').next().unwrap_or(cidr).to_string())
             .ok_or_else(|| {
-                PveError::Run(crate::core::runner::RunError::NonZero {
-                    cmd: format!("ip -4 addr show {iface}"),
-                    code: None,
-                })
+                // 命令本身是成功的（退出码 0），只是网卡上没有 IPv4。以前这里
+                // 伪造一个 `code: None` 的 NonZero，界面显示"退出码 None"——
+                // 等于让人去查一个不存在的失败。真正该说的是：地址没配上。
+                PveError::Bad(format!(
+                    "容器 {vmid} 的 {iface} 上没有 IPv4 地址：地址可能还没配好\
+                     （刚重启的容器需要等网络配置重放），确认容器已启动后重试"
+                ))
             })
     }
 
@@ -1499,24 +1698,41 @@ WantedBy=multi-user.target
     }
 
     /// 删网桥 + 清掉 /etc/network/interfaces 里持久化的段。幂等：桥不存在
-    /// 只清配置段。用 begin/end 行匹配整段删除，段格式见 ensure_bridge。
+    /// 只清配置段。清理残留网桥也走这里——只 `ip link del` 的话，宿主重启
+    /// 或 `ifreload -a` 会把桥从配置里重建回来，症状是"删了又出现"。
+    ///
+    /// **刻意不调 `ifreload -a`**：它会把全机接口重载一遍，包括管理口 vmbr0；
+    /// 挂在被重载桥上的容器口会短暂失链，容器里的 dhclient 随即把租约丢掉
+    /// （真机见过：清桥之后网关容器 eth0/eth1 地址全空、整片实验网断掉）。
+    /// 内核已 `ip link del`、配置段已删，没有任何需要 reload 的东西。
     pub async fn destroy_bridge(
         &self,
         name: &str,
         cancel: &CancellationToken,
     ) -> Result<(), PveError> {
-        let script = format!(r#"set -e
-ip link del {name} 2>/dev/null && echo "bridge {name} deleted" || echo "bridge {name} absent"
-# 从 interfaces 里删掉持久化段（auto {name} 起到本段空行止）
-if grep -q "^iface {name} " /etc/network/interfaces 2>/dev/null; then
-  sed -i "/^auto {name}$/,+5d" /etc/network/interfaces
-  ifreload -a 2>/dev/null || true
+        let script = format!(
+            r#"set -e
+if ip link show {name} >/dev/null 2>&1; then
+  ip link del {name} || true
+  echo "bridge {name} deleted"
+else
+  echo "bridge {name} absent"
 fi
-echo done"#);
+# 删持久化段（auto <name> 起到段尾）。只删接口不删配置的话，重启会重建。
+if grep -q "^auto {name}$" /etc/network/interfaces 2>/dev/null; then
+  awk -v n="{name}" '{awk}' /etc/network/interfaces > /etc/network/interfaces.labyard.tmp
+  cat /etc/network/interfaces.labyard.tmp > /etc/network/interfaces
+  rm -f /etc/network/interfaces.labyard.tmp
+  echo "unpersisted {name}"
+fi
+echo done"#,
+            awk = BRIDGE_UNPERSIST_AWK
+        );
         self.runner
             .run(
                 &format!("bridge-destroy:{name}"),
-                &CommandSpec::new("sh", vec!["-c".into(), script]).with_timeout(Duration::from_secs(30)),
+                &CommandSpec::new("sh", vec!["-c".into(), script])
+                    .with_timeout(Duration::from_secs(30)),
                 None,
                 cancel,
                 true,
@@ -1631,6 +1847,109 @@ mod tests {
         let (i2, m2, s2, v2) = parse_mp_line("mp3: mp=/var/lib/x,local:3,size=512M").unwrap();
         assert_eq!((i2, m2.as_str(), s2, v2.as_str()), (3, "/var/lib/x", Some(1), "local:3"));
         assert!(parse_mp_line("rootfs: local-lvm:vm-100-disk-0,size=2G").is_none());
+    }
+
+    /// 真机踩过：`labmain` 用 `ip link del` 删了，重启后又回来，因为
+    /// `/etc/network/interfaces` 里 `auto labmain` 段还在。这段 awk 就是用来
+    /// 删那个段的——删错一格就会把别人的配置带走，所以直接跑一遍。
+    #[test]
+    fn unpersist_awk_removes_only_its_block() {
+        // 用真机的实际形状：labmain 有管理地址（多一行 up），labzt 没有。
+        let input = "\
+auto lo
+iface lo inet loopback
+
+auto labmain
+iface labmain inet manual
+\tbridge-ports
+\tbridge-stp off
+\tbridge-fd 0
+\tup ip addr replace 10.10.1.254/24 dev labmain
+
+auto labzt
+iface labzt inet manual
+\tbridge-ports
+\tbridge-stp off
+\tbridge-fd 0
+
+";
+        let expect = "\
+auto lo
+iface lo inet loopback
+
+auto labzt
+iface labzt inet manual
+\tbridge-ports
+\tbridge-stp off
+\tbridge-fd 0
+
+";
+        assert_eq!(run_unpersist_awk(input, "labmain"), expect);
+
+        // 没有 up 行、且两段之间不空行时，绝不能吃掉下一段的首行
+        // （这正是原来 sed 的 `+5d` 会出错的场景）
+        let tight = "auto laba\niface laba inet manual\n\tbridge-fd 0\nauto labb\niface labb inet manual\n\tbridge-fd 0\n";
+        let got = run_unpersist_awk(tight, "laba");
+        assert_eq!(got, "auto labb\niface labb inet manual\n\tbridge-fd 0\n");
+    }
+
+    /// 单测里真跑一次 awk，返回结果。awk 与系统无关（只用 POSIX 特性）。
+    fn run_unpersist_awk(input: &str, name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("labyard-awk-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("interfaces");
+        std::fs::write(&src, input).unwrap();
+        let out = std::process::Command::new("awk")
+            .arg("-v")
+            .arg(format!("n={name}"))
+            .arg(BRIDGE_UNPERSIST_AWK)
+            .arg(&src)
+            .output()
+            .expect("awk 应该存在");
+        assert!(out.status.success(), "awk 失败: {}", String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// `net_spec_matches` 决定"要不要下发 --netN"。判错的代价是热插拔掉容器
+    /// 网卡、地址全丢，所以三个方向都要钉住：该重写的必须判 false，不该动的
+    /// 必须判 true。
+    #[test]
+    fn net_spec_comparison_ignores_volatile_fields() {
+        // 只有 hwaddr/type/firewall 不同 → 相等，不该重写
+        assert!(net_spec_matches(
+            "name=eth0,bridge=lablab,ip=manual,hwaddr=BC:24:11:AA:BB:CC,type=veth,firewall=1",
+            0,
+            "eth0",
+            "lablab",
+            "manual"
+        ));
+        // 桥变了 → 必须重写
+        assert!(!net_spec_matches(
+            "name=eth0,bridge=lablab,type=veth",
+            0,
+            "eth0",
+            "wan",
+            "manual"
+        ));
+        // ip 从 manual 变 dhcp → 必须重写
+        assert!(!net_spec_matches(
+            "name=eth0,bridge=wan,ip=manual,type=veth",
+            0,
+            "eth0",
+            "wan",
+            "dhcp"
+        ));
+        // 缺省 name/ip：PVE 的默认是 eth<idx> 与 dhcp
+        assert!(net_spec_matches("bridge=wan,type=veth", 1, "eth1", "wan", "dhcp"));
+        // 名字对不上（槽位顺序变了）→ 必须重写
+        assert!(!net_spec_matches(
+            "name=eth1,bridge=lablab,type=veth",
+            0,
+            "eth0",
+            "lablab",
+            "manual"
+        ));
     }
 
     #[test]

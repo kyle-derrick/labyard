@@ -665,6 +665,8 @@ function GraphInner({
         <MiniMap
           pannable
           zoomable
+          nodeBorderRadius={3}
+          nodeStrokeWidth={2}
           nodeColor={(n) => {
             const d = n.data as Data;
             if (d?.kind === "network") return d.meta?.external ? "#a5b4fc" : "#ddd6fe";
@@ -673,7 +675,17 @@ function GraphInner({
             return "#e2e8f0";
           }}
           maskColor="rgba(245,246,248,0.72)"
-          style={{ background: "#ffffff", border: "1px solid var(--border)" }}
+          // 之前用的是 var(--border)，变量没定义就等于没有边框：缩略图贴在
+          // 画布右下角像一块脏色斑。这里写死颜色，并加圆角与投影。
+          style={{
+            background: "#ffffff",
+            border: "1px solid #e2e8f0",
+            borderRadius: 8,
+            boxShadow: "0 2px 8px rgba(15,23,42,.08)",
+            width: 168,
+            height: 104,
+            margin: 12,
+          }}
         />
       </ReactFlow>
     </div>

@@ -143,12 +143,18 @@ pub async fn list_specs(State(state): State<Arc<AppState>>, headers: axum::http:
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewSpec {
     pub name: String,
     #[serde(default)]
     pub yaml: Option<String>,
-    /// 从现有规格复制一份（做实验的变体最常见）
-    #[serde(default)]
+    /// 从现有规格复制一份（做实验的变体最常见）。
+    ///
+    /// `from` 是早期脚本与第三方集成用的写法，必须一起认：serde 会静默忽略
+    /// 不认识的字段，只传 `from` 时 `copy_of` 为 None，于是悄悄回落到
+    /// DEFAULT_TEMPLATE —— 用户以为复制了 lab，实际拿到一份含 `main` zone 的
+    /// 示例规格，接着一次 add_mirror 就会在真机上建 `labmain` 网桥。
+    #[serde(default, alias = "from")]
     pub copy_of: Option<String>,
 }
 
@@ -720,6 +726,9 @@ pub async fn gateway_status(
             "gateway": { "host": host.name, "vmid": vmid, "ipv4": host.ipv4 },
             "v4_cidr": z.v4_cidr,
             "nat": z.nat,
+            // 上联网络名（嵌套 zone 是父 zone，顶层是外网）。界面上写 `eth1`
+            // 是容器里的接口名，对用户没有意义——他要的是"这条线路接到哪"。
+            "uplink": z.uplink.clone().unwrap_or_else(|| "wan".to_string()),
             "egress": gw.egress,
             "pubs": gw.pubs.iter().map(|p| serde_json::json!({
                 "proto": p.proto.as_str(),

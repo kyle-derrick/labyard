@@ -10,7 +10,6 @@ import {
   App as AntApp,
   Button,
   Drawer,
-  Empty,
   Form,
   Input,
   InputNumber,
@@ -86,6 +85,13 @@ export default function GatewayPanel({
 
   const g: GatewayStatus | undefined = q.data;
 
+  // 示例跟着当前网段走：写死 10.10.1.20 会让人以为要填那个网段的地址
+  const sampleTarget = (() => {
+    const net = (g?.v4_cidr ?? "").split("/")[0];
+    const p = net.split(".");
+    return p.length === 4 ? `${p[0]}.${p[1]}.${p[2]}.20:22` : "内网IP:端口";
+  })();
+
   const addPub = async (v: { proto: string; port: number; to: string }) => {
     if (!zone) return;
     await run(() => api.addPub(zone, v), "端口映射已写入规格并下发");
@@ -141,7 +147,7 @@ export default function GatewayPanel({
             </Space>
             <div style={{ marginTop: 6 }}>
               <Text type="secondary" className="mono" style={{ fontSize: 12 }}>
-                {g.v4_cidr} · NAT {g.nat ? "开" : "关"} · 上联 eth1
+                {g.v4_cidr} · NAT {g.nat ? "开" : "关"} · 上联 {g.uplink ?? "wan"}
               </Text>
             </div>
           </section>
@@ -160,7 +166,12 @@ export default function GatewayPanel({
               dataSource={g.pubs}
               pagination={false}
               locale={{
-                emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有映射" />,
+                // 空表用一句话，不用整块插图：这里只是"还没配"，不是异常状态
+                emptyText: (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    还没有映射。需要从外网访问内网服务时，在下面加一条。
+                  </Text>
+                ),
               }}
               columns={[
                 {
@@ -222,7 +233,7 @@ export default function GatewayPanel({
                 rules={[{ required: true, message: "内网 ip:port" }]}
                 style={{ marginBottom: 6 }}
               >
-                <Input placeholder="10.10.1.20:22" style={{ width: 190 }} className="mono" />
+                <Input placeholder={sampleTarget} style={{ width: 190 }} className="mono" />
               </Form.Item>
               <Form.Item style={{ marginBottom: 6 }}>
                 <Button type="primary" htmlType="submit" icon={<PlusOutlined />} loading={busy}>

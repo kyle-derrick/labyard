@@ -264,16 +264,25 @@ export default function Hosts() {
   });
 
   const rows = hosts.data?.hosts ?? [];
+
+  /** 规格里已经没有的主机（vmid 记录还在）。默认不展示：它们是删掉的实验
+   *  留下的历史分配，混在当前环境里会让人以为"多了三个网络"。 */
+  const liveRows = useMemo(() => rows.filter((r) => !r.orphan), [rows]);
+  const orphanRows = useMemo(() => rows.filter((r) => r.orphan), [rows]);
+  const orphanCount = orphanRows.length;
+  /** 孤儿里容器还真实存在的：这些才是能销毁、也最该处理的 */
+  const orphanAlive = useMemo(() => orphanRows.filter((r) => r.exists), [orphanRows]);
+
   const zones = useMemo(
-    () => Array.from(new Set(rows.map((r) => r.zone))),
-    [rows],
+    () => Array.from(new Set(liveRows.map((r) => r.zone))),
+    [liveRows],
   );
 
   /** 全局搜索：主机名 / IP / CT 号 / zone 任意命中就保留 */
   const filtered = useMemo(() => {
     const s = search.trim().toLowerCase();
-    if (!s) return rows.filter((r) => r.host !== "*");
-    return rows.filter(
+    if (!s) return liveRows.filter((r) => r.host !== "*");
+    return liveRows.filter(
       (r) =>
         r.host !== "*" &&
         (r.host.toLowerCase().includes(s) ||
@@ -281,37 +290,37 @@ export default function Hosts() {
           (r.ipv4 ?? "").replace(/\/\d+$/, "").includes(s) ||
           String(r.vmid).includes(s)),
     );
-  }, [rows, search]);
+  }, [liveRows, search]);
 
   /** 选中行里"真的能操作"的：容器存在且未废弃。批量动作前先算好这个集合。 */
   const selectedRows = useMemo(
     () =>
       selected
-        .map((k) => rows.find((r) => `${r.zone}/${r.host}` === k))
+        .map((k) => liveRows.find((r) => `${r.zone}/${r.host}` === k))
         .filter((r): r is HostRow => !!r && r.exists && !r.retired),
-    [rows, selected],
+    [liveRows, selected],
   );
 
-  /** 统计卡片 */
+  /** 统计卡片：只算现存规格里的机器 */
   const stats = useMemo(() => {
-    const real = rows.filter((r) => r.host !== "*");
+    const real = liveRows.filter((r) => r.host !== "*");
     return {
       total: real.length,
       running: real.filter((r) => r.status === "running" && !r.retired).length,
       stopped: real.filter((r) => r.status === "stopped" && !r.retired).length,
       retired: real.filter((r) => r.retired).length,
     };
-  }, [rows]);
+  }, [liveRows]);
 
   // zone 整体废弃的判据：该 zone 下所有主机都 retired。
   // `/api/hosts` 只列有 vmid 的真实主机，`*` 这种"整 zone"标记不会出现在行里，
   // 所以不能直接找 host === "*"。
   const zoneRetired = useCallback(
     (z: string) => {
-      const zs = rows.filter((r) => r.zone === z);
+      const zs = liveRows.filter((r) => r.zone === z);
       return zs.length > 0 && zs.every((r) => r.retired);
     },
-    [rows],
+    [liveRows],
   );
 
   // 网络/网关概览：zone 层的网段、出网、VPN、监控机只能在拓扑接口里拿到，
@@ -330,7 +339,7 @@ export default function Hosts() {
       if (n.kind === "network" && n.zone) meta.set(n.zone, (n.meta ?? {}) as ZoneMeta);
     }
     return zones.map((z) => {
-      const list = rows.filter((r) => r.zone === z && r.host !== "*");
+      const list = liveRows.filter((r) => r.zone === z && r.host !== "*");
       return {
         zone: z,
         gw: list.find((r) => r.role === "gateway"),
@@ -340,7 +349,76 @@ export default function Hosts() {
         retired: zoneRetired(z),
       };
     });
-  }, [zones, rows, topo.data, zoneRetired]);
+  }, [zones, liveRows, topo.data, zoneRetired]);
+
+  /** 清掉"规格已删、容器也不存在"的 vmid 记录。容器还在的那些后端会保留。 */
+  const pruneOrphans = useCallback(async () => {
+    try {
+      const r = await api.pruneHosts();
+      if (r.removed === 0) {
+        message.info("没有可清理的记录");
+      } else {
+        message.success(
+          r.kept > 0
+            ? `已清理 ${r.removed} 条；另有 ${r.kept} 条容器还在，已保留`
+            : `已清理 ${r.removed} 条历史记录`,
+        );
+      }
+      await hosts.refetch();
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  }, [hosts, message]);
+
+  /** 宿主网桥现状：删规格不会删桥，残留的桥界面上原本完全看不见 */
+  const bridges = useQuery({
+    queryKey: ["bridges"],
+    queryFn: api.bridges,
+    staleTime: 30_000,
+  });
+  const orphanBridges = useMemo(
+    () => (bridges.data?.bridges ?? []).filter((b) => b.orphan),
+    [bridges.data],
+  );
+
+  /** 销毁"规格里已经没有、容器还在"的孤儿。没有这个入口就只能上机器手工删。 */
+  const purgeOrphans = useCallback(async () => {
+    try {
+      const r = await api.purgeOrphans();
+      if (r.destroyed.length) {
+        message.success(`已销毁 ${r.destroyed.length} 台：${r.destroyed.join("、")}`);
+      }
+      if (r.forgotten.length) {
+        message.info(`顺带清掉 ${r.forgotten.length} 条失效记录`);
+      }
+      if (r.errors.length) {
+        message.error(r.errors.join("；"));
+      }
+      await hosts.refetch();
+      await bridges.refetch();
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  }, [hosts, bridges, message]);
+
+  const pruneBridges = async () => {
+    try {
+      const r = await api.pruneBridges();
+      if (r.removed.length) {
+        message.success(`已删除 ${r.removed.length} 个残留网桥：${r.removed.join("、")}`);
+      } else {
+        message.info("没有可自动清理的网桥");
+      }
+      if (r.kept.length) {
+        message.warning(
+          `这些还挂着地址或成员口，需要你确认后手工处理：${r.kept.join("、")}`,
+        );
+      }
+      await bridges.refetch();
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  };
 
   const doPower = useCallback(
     async (r: HostRow, action: "start" | "stop" | "reboot") => {
@@ -639,6 +717,81 @@ export default function Hosts() {
         </Space>
       </Card>
 
+      {/* 已删除规格留下的记录：不删，但要让人知道它们存在、且可以清掉 */}
+      {orphanCount > 0 && (
+        <Alert
+          type={orphanAlive.length > 0 ? "warning" : "info"}
+          showIcon
+          style={{ marginBottom: 16 }}
+          message={
+            orphanAlive.length > 0
+              ? `已隐藏 ${orphanCount} 条记录，其中 ${orphanAlive.length} 台容器还在`
+              : `已隐藏 ${orphanCount} 条历史记录`
+          }
+          description={
+            <>
+              这些主机属于已删除的规格（
+              {Array.from(
+                new Set(
+                  orphanRows.map((r) =>
+                    // zone 还在（比如 lab 里的 probe）就具体到主机，
+                    // 否则只报 zone 名，免得让人以为整个 lab 都失效了
+                    zones.includes(r.zone) ? `${r.zone}/${r.host}` : r.zone,
+                  ),
+                ),
+              ).join("、")}
+              ）。
+              {orphanAlive.length > 0 ? (
+                <>
+                  容器本身还在宿主机上跑着，占用 CPU/内存，也占着桥——
+                  「销毁容器」会停机后删除（磁盘一起删，不可恢复）；
+                  还可能挂着网桥残留，销毁完再清桥。
+                </>
+              ) : (
+                <>容器已不存在，但 vmid 分配记录还留在库里。</>
+              )}
+              上面的统计与网络列表只算现存规格。
+              {/* 按钮放在描述块里而不是 action 里：文案一长，antd 的 action
+                  会和文字挤在同一行，最后几个字被按钮压住看不清。 */}
+              <div style={{ marginTop: 10 }}>
+                <Space size={8}>
+                  <Popconfirm
+                    title="清理历史记录？"
+                    description="只删除「规格里没有、容器也不存在」的记录；容器还在的会保留。"
+                    okText="清理"
+                    cancelText="取消"
+                    onConfirm={pruneOrphans}
+                  >
+                    <Button size="small">清理记录</Button>
+                  </Popconfirm>
+                  {orphanAlive.length > 0 && (
+                    <Popconfirm
+                      title={`销毁 ${orphanAlive.length} 台孤儿容器？`}
+                      description={
+                        <div style={{ maxWidth: 320 }}>
+                          停机后执行 pct destroy（磁盘一起删，不可恢复）：
+                          <div style={{ marginTop: 6 }}>
+                            {orphanAlive.map((r) => `${r.zone}/${r.host}`).join("、")}
+                          </div>
+                        </div>
+                      }
+                      okText="销毁"
+                      okButtonProps={{ danger: true }}
+                      cancelText="取消"
+                      onConfirm={purgeOrphans}
+                    >
+                      <Button size="small" danger>
+                        销毁容器
+                      </Button>
+                    </Popconfirm>
+                  )}
+                </Space>
+              </div>
+            </>
+          }
+        />
+      )}
+
       <Card
         size="small"
         title="网络与网关"
@@ -740,14 +893,33 @@ export default function Hosts() {
             {
               title: "流量监控",
               width: 140,
-              render: (_: unknown, r) =>
-                r.meta.monitor ? (
-                  <Text className="mono" style={{ fontSize: 12 }}>
-                    {String(r.meta.monitor)}
-                  </Text>
-                ) : (
-                  <Text type="secondary">—</Text>
-                ),
+              render: (_: unknown, r) => {
+                const name = r.meta.monitor ? String(r.meta.monitor) : "";
+                if (!name) return <Text type="secondary">—</Text>;
+                // 监控机可能建在别的网络里（管理口挂外网时落在 wan）。
+                // 只写名字会让人以为本网络里多了一台机器，所以标出实际落点。
+                const actual = liveRows.find(
+                  (x) => x.host === name && x.role === "monitor",
+                )?.zone;
+                const elsewhere = actual && actual !== r.zone;
+                return (
+                  <Tooltip
+                    title={
+                      elsewhere ? `声明在 ${r.zone}，实际建在 ${actual}` : undefined
+                    }
+                  >
+                    <Text className="mono" style={{ fontSize: 12 }}>
+                      {name}
+                      {elsewhere && (
+                        <Text type="secondary" style={{ fontSize: 11 }}>
+                          {" → "}
+                          {actual}
+                        </Text>
+                      )}
+                    </Text>
+                  </Tooltip>
+                );
+              },
             },
             {
               title: "操作",
@@ -825,6 +997,102 @@ export default function Hosts() {
           ]}
         />
       </Card>
+
+      {/* 规格删了不等于桥删了：destroy 需要 zone 还在规格里，先删规格就留下孤儿桥 */}
+      {orphanBridges.length > 0 && (
+        <Card
+          size="small"
+          title={
+            <Space size={8}>
+              <span>宿主网桥残留</span>
+              <Tag color="orange">{orphanBridges.length}</Tag>
+            </Space>
+          }
+          style={{ marginBottom: 16 }}
+          extra={
+            <Popconfirm
+              title="清理残留网桥？"
+              description="只删「无地址、无成员口」的桥；有地址或有成员口的会保留并列出来。"
+              okText="清理"
+              cancelText="取消"
+              onConfirm={pruneBridges}
+            >
+              <Button size="small">清理可自动删除的</Button>
+            </Popconfirm>
+          }
+        >
+          <Table
+            size="small"
+            rowKey="name"
+            pagination={false}
+            dataSource={orphanBridges}
+            columns={[
+              {
+                title: "网桥",
+                dataIndex: "name",
+                width: 130,
+                render: (v: string) => <code>{v}</code>,
+              },
+              {
+                title: "原属网络",
+                dataIndex: "zone",
+                width: 110,
+                render: (v: string | null) => v ?? "—",
+              },
+              {
+                title: "地址",
+                dataIndex: "ips",
+                width: 190,
+                render: (v: string) =>
+                  v ? (
+                    <span className="mono">{v}</span>
+                  ) : (
+                    <Text type="secondary">无</Text>
+                  ),
+              },
+              {
+                title: "成员口",
+                dataIndex: "members",
+                width: 90,
+                render: (v: number) =>
+                  v > 0 ? <Text>{v} 个</Text> : <Text type="secondary">无</Text>,
+              },
+              {
+                title: "存在形态",
+                width: 130,
+                render: (_: unknown, r) =>
+                  r.kernel ? (
+                    <Text>内核 + 配置</Text>
+                  ) : (
+                    <Tooltip title="内核里已经没了，但 /etc/network/interfaces 里还留着 auto 段，宿主重启或 ifreload 会把它重建回来">
+                      <Tag>仅配置残留</Tag>
+                    </Tooltip>
+                  ),
+              },
+              {
+                title: "状态",
+                width: 130,
+                render: (_: unknown, r) =>
+                  r.safe ? (
+                    <Tag color="orange">可自动删除</Tag>
+                  ) : (
+                    <Tooltip title="还挂着地址或成员口，删掉可能断掉正在用的链路">
+                      <Tag color="red">需要人工确认</Tag>
+                    </Tooltip>
+                  ),
+              },
+            ]}
+          />
+          {orphanBridges.some((b) => !b.safe) && (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              标记「需要人工确认」的桥还挂着地址或成员口，删掉可能断掉正在用的链路。
+              确认不再使用后，可在宿主机执行 <code>ip link del 桥名</code>，并删掉
+              <code>/etc/network/interfaces</code> 里对应的{" "}
+              <code>auto 桥名</code> 段——只删接口不删配置，重启会被重建。
+            </Text>
+          )}
+        </Card>
+      )}
 
       <Space style={{ marginBottom: 12 }} size={12} wrap>
         <Input
