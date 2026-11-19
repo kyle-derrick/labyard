@@ -12,6 +12,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -873,7 +874,26 @@ pub async fn list_mirrors(
         authed(&state, &headers)?;
         let items = collect_mirrors(&state, q.spec.as_deref()).map_err(|e| e)?;
         let reconcile = state.reconcile.lock().await.clone();
-        Ok(Json(serde_json::json!({ "mirrors": items, "reconcile": reconcile })))
+        let units = mirror_unit_states(&state).await;
+        // 每行带上实例的现实状态：没查到 = 单元未安装
+        let items: Vec<_> = items
+            .into_iter()
+            .map(|mut row| {
+                let active = row
+                    .get("instance")
+                    .and_then(|v| v.as_str())
+                    .and_then(|i| units.get(i))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "missing".into());
+                row["active"] = serde_json::json!(active);
+                row
+            })
+            .collect();
+        Ok(Json(serde_json::json!({
+            "mirrors": items,
+            "reconcile": reconcile,
+            "units": units,
+        })))
     })
     .await
 }
@@ -912,6 +932,26 @@ fn collect_mirrors(state: &AppState, only: Option<&str>) -> ApiResult<Vec<serde_
             continue;
         };
         for m in &resolved.mirrors {
+            // 实例名要与执行器/巡检完全一致：{源zone}-{源vmid}-{目标vmid}。
+            // vmid 优先用规格里写死的；没写就用 DB 里的分配号（与 build_plan
+            // 同一条路径，幂等）——线上规格大多不写 vmid，全靠 DB。
+            let base = state.cfg.pve.vmid_base;
+            let vmid_of = |z: &str, h: &str| {
+                resolved
+                    .zones
+                    .iter()
+                    .find(|x| x.name == z)
+                    .and_then(|x| x.hosts.iter().find(|hh| hh.name == h))
+                    .map(|hh| hh.vmid.unwrap_or_else(|| state.db.vmid_for(z, h, base)))
+            };
+            let (src, dst) = (
+                vmid_of(&m.from_zone, &m.from_host),
+                vmid_of(&m.to_zone, &m.to_host),
+            );
+            let instance = match (src, dst) {
+                (Some(s), Some(d)) => Some(format!("{}-{s}-{d}", m.from_zone)),
+                _ => None,
+            };
             out.push(serde_json::json!({
                 "spec": meta.name,
                 "from": format!("{}:{}", m.from_zone, m.from_host),
@@ -920,10 +960,37 @@ fn collect_mirrors(state: &AppState, only: Option<&str>) -> ApiResult<Vec<serde_
                 "capture_bridge": m.capture_bridge,
                 "source_iface": "eth0",
                 "target_iface": m.to_iface,
+                "instance": instance,
             }));
         }
     }
     Ok(out)
+}
+
+/// 宿主上 `labmirror@` 实例的运行状态：实例名 → active / inactive / failed。
+///
+/// 前端用它是为了回答"网络里哪些口真的在抓、哪些掉了"——规格是意图，
+/// systemctl 是现实，两边都对得上才算健康。
+async fn mirror_unit_states(state: &Arc<AppState>) -> BTreeMap<String, String> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let spec = crate::core::runner::CommandSpec::new(
+        "sh",
+        ["-c", "for f in /etc/labyard/mirror/*.conf; do [ -e \"$f\" ] || continue; n=$(basename \"$f\" .conf); printf '%s\\t%s\\n' \"$n\" \"$(systemctl is-active \"labmirror@$n\" 2>/dev/null)\"; done"],
+    )
+    .with_timeout(std::time::Duration::from_secs(15));
+    let mut map = BTreeMap::new();
+    if let Ok(out) = state
+        .runner
+        .run("mirrors:unit-states", &spec, None, &cancel, true)
+        .await
+    {
+        for line in out.stdout.lines() {
+            if let Some((n, s)) = line.split_once('\t') {
+                map.insert(n.trim().to_string(), s.trim().to_string());
+            }
+        }
+    }
+    map
 }
 
 #[derive(Deserialize)]

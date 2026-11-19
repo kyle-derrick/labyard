@@ -69,6 +69,10 @@ type MonitorM = {
   name?: string;
   /** 新建时管理口挂哪：不写 = 本 zone 内网；wan = 外网桥（DHCP）；或别的 zone */
   mgmt?: string;
+  /** 自定义 IP：内网 = 主机位；外网 = 完整地址（留空 = DHCP/自动分配） */
+  ip?: string;
+  /** 自定义 CT 号；留空自动分配 */
+  vmid?: number;
   /** 只抓这些主机；不写 = 本网络全部主机 */
   targets?: string[];
   cores?: number;
@@ -521,7 +525,7 @@ export default function SpecVisual({
                         </Field>
                       </Col>
                       <Col span={7}>
-                        <Field label="管理口挂在" hint="监控机自己的管理网卡接哪：默认本网段，也可以挂到外网或别的网络（边界采集）。监控机自身的接口不会被镜像；它的 IP（默认 .10 起）与 CT 号都自动分配，不用填。">
+                        <Field label="管理口挂在" hint="监控机自己的管理网卡接哪：默认本网段，也可以挂到外网或别的网络（边界采集）。监控机自身的内网口也属于镜像范围（内网口 → 抓包口没有回环）。">
                           <Select
                             size="small"
                             style={{ width: "100%" }}
@@ -551,6 +555,49 @@ export default function SpecVisual({
                           </Field>
                         </Col>
                       ))}
+                      <Col span={24} style={{ marginTop: 8 }}>
+                        <Row gutter={8}>
+                          <Col span={8}>
+                            <Field
+                              label="IP（可选）"
+                              hint={
+                                (mon?.mgmt ?? "") === "wan"
+                                  ? "挂外网：填完整地址（如 10.77.0.55/24）就是静态，留空 = DHCP"
+                                  : "内网：填主机位（如 10，即网段的 .10）；留空按角色默认位自动分配"
+                              }
+                            >
+                              <Input
+                                size="small"
+                                className="mono"
+                                placeholder={
+                                  (mon?.mgmt ?? "") === "wan" ? "留空 = DHCP" : "留空 = 自动分配"
+                                }
+                                value={mon?.ip ?? ""}
+                                onChange={(e) =>
+                                  patchZone(zn, {
+                                    monitor: { ...mon!, ip: e.target.value || undefined },
+                                  })
+                                }
+                              />
+                            </Field>
+                          </Col>
+                          <Col span={8}>
+                            <Field label="CT 号（可选）" hint="指定容器编号；留空自动分配">
+                              <InputNumber
+                                size="small"
+                                min={100}
+                                max={999999999}
+                                style={{ width: "100%" }}
+                                placeholder="自动分配"
+                                value={mon?.vmid}
+                                onChange={(nv) =>
+                                  patchZone(zn, { monitor: { ...mon!, vmid: nv ?? undefined } })
+                                }
+                              />
+                            </Field>
+                          </Col>
+                        </Row>
+                      </Col>
                     </Row>
                   ) : (
                     <Field label="复用哪台监控机">

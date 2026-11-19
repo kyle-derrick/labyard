@@ -135,7 +135,16 @@ pub struct MonitorSpec {
     pub existing: Option<String>,
     /// 新建时挂到哪个网络：`wan` 或某个 zone 名。默认本 zone。
     pub mgmt: Option<String>,
-    /// 只抓这些主机；不写 = 本网络全部主机（监控机自己除外）
+    /// 自定义主机位（内网，1–254）。不写 = 按角色默认位自动找空的。
+    ///
+    /// 挂在外网（`mgmt: wan`）时这里要写**完整地址**（`10.77.0.55` 或带
+    /// 长度 `10.77.0.55/24`）；不写 = DHCP。
+    pub ip: Option<String>,
+    /// 自定义 CT 号（vmid）。不写 = 自动分配。
+    pub vmid: Option<u32>,
+    /// 只抓这些主机；不写 = 本网络全部主机（监控机自己的内网口也在内——
+    /// 内网口 → 抓包口没有回环：采集流量走 mir 桥进 eth1，不会再出现在
+    /// eth0 上）
     pub targets: Option<Vec<String>>,
     pub cores: Option<u32>,
     pub memory: Option<u32>,
@@ -785,10 +794,33 @@ fn resolve_zone(
         // 早先的实现直接用角色默认位，**同一个 zone 里两台 server 会拿到
         // 同一个 .20**，两台机器抢一个 IP，而 YAML 看起来完全正常。
         let ipv4 = if external {
-            // 外网上的主机没有内网网段可分配，地址由 wan 桥上的 DHCP 给。
-            // 写成 `dhcp` 而不是留空：留空会让 bootstrap 里的"地址"变成
-            // 空字符串，而 `pct create ... ip=` 是语法错误。
-            "dhcp".to_string()
+            // 外网上的主机默认 DHCP；写了完整地址（`10.77.0.55[/24]`）就是
+            // 静态。这里不认"末位"写法——外网没有本规格的网段可拼，末位
+            // 拼不出合法地址，宁可报错也不猜。
+            match &h.ip {
+                None => "dhcp".to_string(),
+                Some(s) => {
+                    let (addr, len) = match s.split_once('/') {
+                        Some((a, l)) => (a, Some(l)),
+                        None => (s.as_str(), None),
+                    };
+                    let v: std::net::Ipv4Addr = addr.parse().map_err(|_| {
+                        SpecError::BadCidr(
+                            zone_name.to_string(),
+                            format!("外网主机地址要写完整 IPv4（如 10.77.0.55/24），写了 {s}"),
+                        )
+                    })?;
+                    match len {
+                        None => v.to_string(),
+                        Some(l) => {
+                            let n: u8 = l.parse().map_err(|_| {
+                                SpecError::BadCidr(zone_name.to_string(), format!("前缀长度 {l}"))
+                            })?;
+                            format!("{v}/{n}")
+                        }
+                    }
+                }
+            }
         } else {
             let host_octet = match &h.ip {
                 Some(s) => s
@@ -995,6 +1027,8 @@ impl Spec {
                 return Err(SpecError::MonitorNameConflict(mgmt, name));
             }
             let h = HostSpec {
+                ip: m.ip.clone(),
+                vmid: m.vmid,
                 cores: m.cores,
                 memory: m.memory,
                 disk: m.disk,
@@ -1055,9 +1089,11 @@ impl Spec {
 
         // ── 第四步：开关 → 连线 ──
         //
-        // 语义就是"这个网络里每台主机的接口都复制一份给监控机"。监控机自己
-        // （以及别的监控机）不抓：抓自己会成环，抓另一台监控机说明这件事
-        // 应该由那台机器的 `monitor` 配置表达。
+        // 语义就是"这个网络里每台主机的接口都复制一份给监控机"——包括
+        // 监控机**自己的内网口**：内网口 → 抓包口没有回环，采集流量走 mir
+        // 桥进 eth1，不会再出现在 eth0 上，所以 eth0 的流量就是普通的本机
+        // 流量，抓了不重复、不放大。别的监控机不抓（那件事应该由那台机器
+        // 的 `monitor` 配置表达）。
         let mut forced: Vec<(String, String)> = Vec::new();
         let mut zone_monitor: BTreeMap<String, String> = BTreeMap::new();
         for (cz, targets, mz, mh) in &links {
@@ -1072,7 +1108,7 @@ impl Spec {
                         let h = z.hosts.iter().find(|h| &h.name == t).ok_or_else(|| {
                             SpecError::MonitorTargetUnknown(cz.clone(), t.clone())
                         })?;
-                        if h.role == Role::Monitor {
+                        if h.role == Role::Monitor && !(mz == cz && mh.as_str() == t.as_str()) {
                             continue;
                         }
                         forced.push((format!("{cz}:{}", h.name), to.clone()));
@@ -1080,7 +1116,8 @@ impl Spec {
                 }
                 None => {
                     for h in &z.hosts {
-                        if h.role == Role::Monitor {
+                        // 别的监控机跳过；本机的连线由下面的自环放行处理
+                        if h.role == Role::Monitor && !(mz == cz && mh.as_str() == h.name) {
                             continue;
                         }
                         forced.push((format!("{cz}:{}", h.name), to.clone()));
@@ -1176,20 +1213,25 @@ impl Spec {
          -> Result<(), SpecError> {
             let (fz, fh) = from;
             let (tz, th) = to;
-            // 自环：把某台主机镜像到它自己。单元名会变成 `lab-100-100`，
-            // 拿到的是一个"抓自己 eth 再灌回自己"的空转单元——静默装上也
-            // 只会浪费 CPU，不如在解析阶段就拦掉。
-            if fz == tz && fh == th {
-                return Err(SpecError::MirrorSelfLoop(
-                    format!("{fz}:{fh}"),
-                    format!("{tz}:{th}"),
-                ));
-            }
             let target = zones
                 .iter()
                 .find(|z| z.name == tz)
                 .and_then(|z| z.hosts.iter().find(|h| h.name == th))
                 .ok_or_else(|| SpecError::MirrorUnknownHost(format!("{tz}:{th}")))?;
+            // 自环：把某台主机镜像到它自己。单元名会变成 `lab-100-100`，
+            // 拿到的是一个"抓自己 eth 再灌回自己"的空转单元——静默装上也
+            // 只会浪费 CPU，不如在解析阶段就拦掉。
+            //
+            // **唯一例外**：目标是监控机（fz==tz && fh==th 只可能是监控机
+            // 监控本网段时"把自己的内网口也抓上"这一条）。这不是回环：源是
+            // 监控机的 eth0（内网口），汇是它的 eth1（抓包口），采集流量走
+            // mir 桥进 eth1，不会再被 eth0 上的规则复制。
+            if fz == tz && fh == th && target.role != Role::Monitor {
+                return Err(SpecError::MirrorSelfLoop(
+                    format!("{fz}:{fh}"),
+                    format!("{tz}:{th}"),
+                ));
+            }
             if target.role != Role::Monitor {
                 return Err(SpecError::MirrorTargetNotAnalysis(
                     format!("{fz}:{fh}"),
@@ -1840,20 +1882,99 @@ mirrors:
 
     #[test]
     fn a_host_cannot_be_mirrored_into_itself() {
+        // 普通主机抓自己毫无意义（也没有 ethN 能当汇），解析阶段就拦。
         let y = r#"
 defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
 zones:
   main:
     uplink: wan
     v4: 10.10.1.0/24
-    hosts: { gateway: { role: gateway }, analysis: { role: analysis } }
+    hosts: { gateway: { role: gateway }, web: { role: server } }
 mirrors:
-  - { from: analysis, to: analysis }
+  - { from: web, to: web }
 "#;
         assert!(matches!(
             Spec::parse(y).unwrap().resolve_all("vmbr0"),
             Err(SpecError::MirrorSelfLoop(_, _))
         ));
+    }
+
+    #[test]
+    fn monitor_captures_its_own_inner_iface() {
+        // 监控机自己的内网口也在镜像范围里（内网口 → 抓包口没有回环：
+        // 采集流量走 mir 桥进 eth1，不会再出现在 eth0 上）。
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    monitor: { name: mon }
+    hosts: { gateway: { role: gateway }, web: { role: server } }
+"#;
+        let r = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
+        let self_line = r
+            .mirrors
+            .iter()
+            .find(|m| m.from_host == "mon" && m.to_host == "mon");
+        assert!(self_line.is_some(), "监控机自己的内网口应被镜像");
+        // 网关也在镜像范围内
+        assert!(r.mirrors.iter().any(|m| m.from_host == "gateway"));
+    }
+
+    #[test]
+    fn monitor_custom_ip_and_vmid() {
+        // ip / vmid 都要能自定义；挂外网时 ip 是完整地址，留空 = DHCP
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    monitor: { name: mon, ip: 55, vmid: 900 }
+    hosts: { gateway: { role: gateway } }
+  dmz:
+    uplink: wan
+    v4: 10.10.2.0/24
+    monitor: { name: edge-mon, mgmt: wan }
+"#;
+        let r = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
+        let mon = &r
+            .zones
+            .iter()
+            .find(|z| z.name == "main")
+            .unwrap()
+            .hosts
+            .iter()
+            .find(|h| h.name == "mon")
+            .unwrap();
+        assert_eq!(mon.vmid, Some(900));
+        assert!(mon.ipv4.starts_with("10.10.1.55/"), "{}", mon.ipv4);
+        let edge = &r
+            .zones
+            .iter()
+            .find(|z| z.name == "wan")
+            .unwrap()
+            .hosts
+            .iter()
+            .find(|h| h.name == "edge-mon")
+            .unwrap();
+        assert_eq!(edge.ipv4, "dhcp");
+    }
+
+    #[test]
+    fn monitor_external_static_ip() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  dmz:
+    uplink: wan
+    v4: 10.10.2.0/24
+    monitor: { name: m, mgmt: wan, ip: "10.77.0.55/24" }
+"#;
+        let r = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
+        let m = &r.zones[0].hosts[0];
+        assert_eq!(m.ipv4, "10.77.0.55/24");
     }
 
     #[test]

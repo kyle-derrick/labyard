@@ -234,7 +234,7 @@ export const api = {
 
   // ── 镜像连线 ──
   mirrors: (spec?: string) =>
-    req<{ mirrors: MirrorRow[]; reconcile?: ReconcileInfo }>(
+    req<{ mirrors: MirrorRow[]; reconcile?: ReconcileInfo; units?: Record<string, string> }>(
       `/api/mirrors${spec ? `?spec=${encodeURIComponent(spec)}` : ""}`,
     ),
 
@@ -438,6 +438,10 @@ export type MirrorRow = {
   capture_bridge?: string;
   source_iface?: string;
   target_iface?: string;
+  /** labmirror@ 实例名（vmid 还没定的时候是 null） */
+  instance: string | null;
+  /** 宿主上的现实状态：active / inactive / failed / missing（未安装） */
+  active: string;
 };
 
 /** 后台镜像巡检的状态（/api/mirrors 带出）。 */

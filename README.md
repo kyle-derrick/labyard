@@ -198,6 +198,11 @@ docs/operations.md  安装、升级、备份恢复、排障
 **并发 3 不是拍脑袋。** 实测并发 1/2/3/4 的耗时是 200/105/70/95 秒，磁盘峰值
 30/60/120/240 MB/s——并发到 3 之后耗时不再降，磁盘还在线性涨。
 
+**`pct exec` 全局串行。** 单个 `pct exec`（lxc-attach）实测峰值 ~176 MB，全记在
+服务的 cgroup 上——编排批内并发 3 个就是 ~530 MB，真机被 cgroup OOM 杀过两次。
+所有容器内执行走 `Pve.exec_gate`（信号量容量 1）串行，峰值压到 1×176 MB + 常驻；
+代价是 bootstrap 阶段墙钟变长，换取内存上限从"赌并发"变成"算得清"。
+
 **背压丢中间不丢尾。** 子进程输出走有界 channel（500 行），满了丢中间并插入
 `[已省略 N 行]`。报错通常在尾部，尾部绝不丢。
 
@@ -205,9 +210,9 @@ docs/operations.md  安装、升级、备份恢复、排障
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | **102 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
+| ✅ 单元测试通过 | **105 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照、监控机自定义 IP/CT 号、监控机内网口自镜像 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
-| ✅ 真机逐接口回归 | 90 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 监控机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
+| ✅ 真机逐接口回归 | 92 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 监控机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
 | ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.7 MB，含 1.48 MB 前端）与内存（常驻 12.0 MiB / 峰值 44.8 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
 | ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` **14/14** 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、内网主机**无默认路由**、宿主入向被网关丢弃；幂等重跑全部跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、主机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）|
 | ✅ **Web 运维** | 主机表格（电源 start/stop/reboot）、快照（列/建/回滚/删）、run 历史与明细、retry、destroy（zone 名二次确认）。真机逐项验证通过 |

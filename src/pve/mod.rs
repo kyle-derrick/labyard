@@ -30,6 +30,11 @@ pub struct Pve {
     ///
     /// 存 `Value` 而不是 `T`：`get_json` 是泛型的，缓存不能按类型分装。
     cache: Mutex<HashMap<String, (Instant, Duration, serde_json::Value)>>,
+    /// `pct exec` 串行闸。单个 `pct exec`（lxc-attach）实测峰值 ~176 MB，全部
+    /// 记在 labpanel 的 cgroup 上；编排批内并发 3 个 + preview 的 pvesh 就是
+    /// OOM 的直接来源。所有 exec 走这一个闸，容量 1 = 全局串行：峰值从
+    /// 3×176+ 压到 1×176+，代价是 bootstrap 阶段墙钟时间变长（可接受）。
+    exec_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// 不同类型的读，新鲜度要求不一样。宁可短，也不要"看起来是新的"。
@@ -179,6 +184,8 @@ pub enum PveError {
     },
     #[error("PVE 版本 {0} 低于要求（9.0），拒绝继续")]
     TooOld(String),
+    #[error("`{cmd}` 被取消")]
+    Cancelled { cmd: String },
 }
 
 impl Pve {
@@ -188,6 +195,7 @@ impl Pve {
             runner,
             node: node.into(),
             cache: Mutex::new(HashMap::new()),
+            exec_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -665,12 +673,22 @@ fi
     ) -> Result<Output, PveError> {
         let mut args: Vec<String> = vec!["exec".into(), vmid.to_string(), "--".into()];
         args.extend(argv.iter().map(|s| s.to_string()));
-        self.cmd(
-            key,
-            CommandSpec::new("pct", args).with_timeout(timeout),
-            cancel,
-        )
-        .await
+        // 串行闸：排队等令牌。等闸期间也响应取消，避免 stop 后还挂着队列。
+        let permit = tokio::select! {
+            p = self.exec_gate.clone().acquire_owned() => p,
+            _ = cancel.cancelled() => {
+                return Err(PveError::Cancelled { cmd: format!("pct exec {vmid}") });
+            }
+        };
+        let out = self
+            .cmd(
+                key,
+                CommandSpec::new("pct", args).with_timeout(timeout),
+                cancel,
+            )
+            .await;
+        drop(permit);
+        out
     }
 
     /// 把一段脚本 push 进容器并执行。

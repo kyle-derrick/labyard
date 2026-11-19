@@ -2,18 +2,18 @@
  *
  * 后端给的是两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
  * 方向都是数据流方向。这里做四件事：
- *   1. 用 dagre 算层级（外网 → 网关 → 内网 → 主机），**只用 attach 边**——
- *      镜像线从主机指向监控机，参与布局的话监控机会被推到所有主机后面
- *      一档，看起来像"挂在别的机器下面"。镜像线只负责画，不负责布局。
- *   2. 主机节点底部画出**每个网口**（chip），所有边都锚到具体网口上：
- *      attach 边接主机的 eth0/eth1，镜像线从源主机的内网口出发、接到
- *      监控机上对应的抓包口。"线从哪块口出发"和"图上哪块口"是同一个东西。
+ *   1. 用 **elkjs**（Eclipse Layout Kernel，成熟布局引擎）算层级与位置，
+ *      只吃 attach 边——镜像线参与布局会把监控机推到所有主机后面一档。
+ *      方向 LR（左→右）：外网 → 网关 → 内网 → 主机。
+ *   2. 主机节点底部画出**每个网口**（chip），每枚 chip 左右各一对隐藏
+ *      handle；每条边按两端节点的相对方位选"朝向对端的那一侧"——
+ *      线永远从 chip 面向对端的一侧出来，不再绕圈、不再悬空。
  *   3. 把 kind / role / 状态映射成视觉
  *   4. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单
  *
  * **布局只在结构变化时重算**：轮询每 15 秒来一次数据，如果每次都重排，
- * 用户刚拖好的位置会被抹掉、图会跳一下——这也是"用起来卡"的观感来源之一。
- * 所以这里按"节点 id + 边集合"算一个结构签名，签名没变就只更新 data。
+ * 用户刚拖好的位置会被抹掉、图会跳一下。按"节点 id + 边集合"算结构签名，
+ * 签名没变就只更新 data / 样式，位置沿用。
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -25,18 +25,20 @@ import {
   MiniMap,
   Position,
   ReactFlow,
+  ReactFlowProvider,
   useEdgesState,
   useNodesState,
+  useReactFlow,
   type Edge,
   type Node,
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import dagre from "dagre";
+import ELK from "elkjs/lib/elk.bundled.js";
 import type { TopoEdge, TopoIface, TopoNode } from "./api";
 
 /** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。
- * host 高度含底部的网口 chip 行（单行 22px，两行也放得下）。 */
+ * host 高度含底部的网口 chip 行。 */
 const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
   network: { w: 190, h: 70 },
   host: { w: 196, h: 94 },
@@ -66,29 +68,32 @@ type Data = {
 
 type GNode = Node<Data, "lab">;
 
-/** 网口 chip。两枚不可见的 handle 叠在 chip 底部中点：
- * `s:{name}` 供出边（镜像线、网关内网口）用，`t:{name}` 供入边用。 */
+/** 网口 chip。左右各一对不可见 handle：`sl`/`sr` 供出边、`tl`/`tr` 供入边，
+ * 边按"对端在哪侧"选 handle，线贴着 chip 面向对端的那一侧进出。 */
 function IfaceChip({ f }: { f: TopoIface }) {
   const tip = f.capture
     ? `${f.name} · 抓包（${f.net} 的流量）`
     : `${f.name} · ${f.net}${f.ip ? ` ${f.ip.replace(/\/\d+$/, "")}` : ""}`;
+  const hs = (type: "source" | "target", side: "l" | "r") => (
+    <Handle
+      type={type}
+      id={`${type[0]}${side}:${f.name}`}
+      position={side === "l" ? Position.Left : Position.Right}
+      style={{
+        [side === "l" ? "left" : "right"]: -4,
+        top: "50%",
+        width: 6,
+        height: 6,
+        opacity: 0,
+      }}
+    />
+  );
   return (
-    <div
-      className={`iface${f.capture ? " iface-cap" : ""}`}
-      title={tip}
-    >
-      <Handle
-        type="source"
-        id={`s:${f.name}`}
-        position={Position.Bottom}
-        style={{ left: "50%", bottom: -4, width: 6, height: 6, opacity: 0 }}
-      />
-      <Handle
-        type="target"
-        id={`t:${f.name}`}
-        position={Position.Bottom}
-        style={{ left: "50%", bottom: -4, width: 6, height: 6, opacity: 0 }}
-      />
+    <div className={`iface${f.capture ? " iface-cap" : ""}`} title={tip}>
+      {hs("source", "l")}
+      {hs("source", "r")}
+      {hs("target", "l")}
+      {hs("target", "r")}
       <span className="iface-name">{f.name}</span>
       {f.capture && <span className="iface-net">{f.net}</span>}
     </div>
@@ -117,7 +122,7 @@ function LabNode({ data }: NodeProps<GNode>) {
 
   return (
     <>
-      {/* 网络节点的默认接入点：左边收、右边发 */}
+      {/* 网络节点（以及兜底）：左侧收、右侧发 */}
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
       <div className={cls} style={{ width: dim.w, height: dim.h }}>
         {data.kind === "network" && (
@@ -132,7 +137,9 @@ function LabNode({ data }: NodeProps<GNode>) {
                   <span className="tn-chip chip-pub">映射 {String(meta.pubs)}</span>
                 )}
                 {Array.isArray(meta.vpn) && meta.vpn.length > 0 && (
-                  <span className="tn-chip chip-vpn">VPN</span>
+                  <span className="tn-chip chip-vpn">
+                    {((meta.vpn as string[]) ?? []).join("/").toUpperCase()}
+                  </span>
                 )}
               </span>
             </div>
@@ -215,43 +222,70 @@ function edgeSpec(e: TopoEdge, hot: boolean): Partial<Edge> {
   };
 }
 
-function build(
+/** 跨规格同名的 zone 会撞 id（后端一套 key 空间），这里按先出现的留下 */
+function uniqNodes(nodes: TopoNode[]): Map<string, TopoNode> {
+  const uniq = new Map<string, TopoNode>();
+  for (const n of nodes) if (!uniq.has(n.id)) uniq.set(n.id, n);
+  return uniq;
+}
+
+/** ELK 分层布局，只吃 attach 边。返回节点 id → 左上角坐标。 */
+async function layoutPositions(
   nodes: TopoNode[],
   edges: TopoEdge[],
+): Promise<Map<string, { x: number; y: number }>> {
+  const uniq = uniqNodes(nodes);
+  const elk = new ELK();
+  const children = [...uniq.values()].map((n) => {
+    const d = DIM[n.kind] ?? DIM.host;
+    return { id: n.id, width: d.w, height: d.h };
+  });
+  const elEdges = edges
+    .filter((e) => e.kind === "attach" && e.from !== e.to && uniq.has(e.from) && uniq.has(e.to))
+    .map((e) => ({ id: `${e.from}->${e.to}`, sources: [e.from], targets: [e.to] }));
+
+  const res = await elk.layout({
+    id: "root",
+    layoutOptions: {
+      "elk.algorithm": "layered",
+      "elk.direction": "RIGHT",
+      "elk.spacing.nodeNode": "40",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "130",
+      "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+      "elk.layered.mergeEdges": "true",
+      "elk.padding": "[top=24,left=24,bottom=24,right=24]",
+    },
+    children,
+    edges: elEdges,
+  });
+
+  const out = new Map<string, { x: number; y: number }>();
+  for (const c of res.children ?? []) {
+    if (typeof c.x === "number" && typeof c.y === "number") {
+      out.set(c.id, { x: c.x, y: c.y });
+    }
+  }
+  return out;
+}
+
+function assemble(
+  nodes: TopoNode[],
+  edges: TopoEdge[],
+  pos: Map<string, { x: number; y: number }>,
   selected: Set<string>,
   hotMirror: Set<string>,
   dimmed: Set<string>,
 ): { nodes: GNode[]; edges: Edge[] } {
-  const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: "LR", nodesep: 30, ranksep: 112, marginx: 24, marginy: 24 });
-  g.setDefaultEdgeLabel(() => ({}));
-
-  // 跨规格同名的 zone 会撞 id（后端一套 key 空间），这里按先出现的留下
-  const uniq = new Map<string, TopoNode>();
-  for (const n of nodes) if (!uniq.has(n.id)) uniq.set(n.id, n);
-
-  for (const n of uniq.values()) {
-    const d = DIM[n.kind] ?? DIM.host;
-    g.setNode(n.id, { width: d.w, height: d.h });
-  }
-  // 布局只吃 attach 边：镜像线把主机连向监控机，参与布局会把监控机推到
-  // 所有主机后面一档——图上看就成了"监控机挂在别的机器后面"。镜像线在
-  // 一个网络里的语义是"平行存在于每台主机与监控机之间"，不该影响层级。
-  for (const e of edges) {
-    if (e.kind !== "attach") continue;
-    if (e.from === e.to || !uniq.has(e.from) || !uniq.has(e.to)) continue;
-    g.setEdge(e.from, e.to);
-  }
-  dagre.layout(g);
+  const uniq = uniqNodes(nodes);
 
   const rfNodes: GNode[] = [];
   for (const n of uniq.values()) {
     const d = DIM[n.kind] ?? DIM.host;
-    const p = g.node(n.id) as { x: number; y: number } | undefined;
+    const p = pos.get(n.id) ?? { x: 0, y: 0 };
     rfNodes.push({
       id: n.id,
       type: "lab",
-      position: { x: (p?.x ?? 0) - d.w / 2, y: (p?.y ?? 0) - d.h / 2 },
+      position: p,
       data: {
         kind: n.kind,
         label: n.label,
@@ -271,16 +305,33 @@ function build(
   }
 
   const rfEdges: Edge[] = edges
-    .filter((e) => uniq.has(e.from) && uniq.has(e.to) && e.from !== e.to)
+    .filter(
+      (e) =>
+        uniq.has(e.from) &&
+        uniq.has(e.to) &&
+        // 监控机自己的内网口 → 自己的抓包口：同节点自环线画出来只会是一团
+        // 乱麻，语义在 chip 的"抓包"标注与抽屉清单里已经完整，图上省略。
+        e.from !== e.to,
+    )
     .map((e, i) => {
       const id = `${e.kind}:${e.from}->${e.to}:${i}`;
+      // chip handle 按相对方位选：对端在右就用右侧 handle，在左用左侧。
+      // 这样线从节点面向对端的那一侧进出，不会横穿节点再绕回来。
+      const px = (id2: string) => pos.get(id2)?.x ?? 0;
+      const srcRight = px(e.to) >= px(e.from);
+      const tgtRight = px(e.from) >= px(e.to);
+      const sourceHandle = e.source_iface
+        ? `${srcRight ? "sr" : "sl"}:${e.source_iface}`
+        : undefined;
+      const targetHandle = e.target_iface
+        ? `${tgtRight ? "tr" : "tl"}:${e.target_iface}`
+        : undefined;
       return {
         id,
         source: e.from,
         target: e.to,
-        // 端点锚到具体网口：主机侧有网口名的边都走 chip 上的 handle
-        sourceHandle: e.source_iface ? `s:${e.source_iface}` : undefined,
-        targetHandle: e.target_iface ? `t:${e.target_iface}` : undefined,
+        sourceHandle,
+        targetHandle,
         type: "smoothstep",
         ...edgeSpec(e, hotMirror.has(id)),
       };
@@ -289,7 +340,7 @@ function build(
   return { nodes: rfNodes, edges: rfEdges };
 }
 
-export default function TopologyGraph({
+function GraphInner({
   nodes,
   edges,
   selected = [],
@@ -305,6 +356,7 @@ export default function TopologyGraph({
   onContextMenu?: (e: React.MouseEvent, n: TopoNode | null) => void;
 }) {
   const sel = useMemo(() => new Set(selected), [selected]);
+  const rf = useReactFlow();
 
   // 高亮靠 **hover** 而不是点击：点击节点要开抽屉，两个事件会撞在一起。
   // 悬停监控机节点 = 它的所有镜像线高亮；悬停某条镜像线 = 只高亮那条。
@@ -341,38 +393,72 @@ export default function TopologyGraph({
     return out;
   }, [edges, nodes, hoverNode, hoverEdge, mirrorIds]);
 
-  const built = useMemo(
-    () => build(nodes, edges, sel, hotMirror, dimmed),
-    [nodes, edges, sel, hotMirror, dimmed],
-  );
-
-  // 结构签名：id 与边集合不变时，只换 data，保留用户拖出来的位置
+  // ── ELK 布局：只在结构变化时异步重算 ──
   const structKey = useMemo(() => {
     const nk = nodes.map((n) => n.id).sort().join(",");
-    const ek = edges.map((e) => `${e.kind}:${e.from}>${e.to}`).sort().join(",");
+    const ek = edges
+      .map((e) => `${e.kind}:${e.from}>${e.to}`)
+      .sort()
+      .join(",");
     return `${nk}#${ek}`;
   }, [nodes, edges]);
 
-  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode>(built.nodes);
-  const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>(built.edges);
-  const lastKey = useRef("");
+  // 用户拖出来的位置单独记一笔：重算布局时不覆盖它，轮询重建时不丢
+  const dragPos = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const [pos, setPos] = useState<Map<string, { x: number; y: number }>>(new Map());
+  const fitted = useRef(false);
 
   useEffect(() => {
-    if (lastKey.current === structKey) {
-      // 同结构：只更新节点 data 与边样式，位置沿用当前值
-      setRfNodes((prev) =>
-        prev.map((p) => {
-          const b = built.nodes.find((x) => x.id === p.id);
-          return b ? { ...p, data: b.data } : p;
-        }),
-      );
-      setRfEdges(built.edges);
-      return;
-    }
-    lastKey.current = structKey;
+    // 结构变了：旧的拖动位置作废，等 ELK 给新布局
+    dragPos.current.clear();
+    let alive = true;
+    (async () => {
+      try {
+        const p = await layoutPositions(nodes, edges);
+        if (!alive) return;
+        setPos(p);
+        if (!fitted.current) {
+          fitted.current = true;
+          // 等一帧让节点真正落位，再取景
+          requestAnimationFrame(() => rf.fitView({ padding: 0.16, duration: 200 }));
+        }
+      } catch {
+        // 布局失败就保持旧位置：图乱一点总比消失好
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [structKey]);
+
+  const effPos = useMemo(
+    () => (dragPos.current.size ? new Map([...pos, ...dragPos.current]) : pos),
+    [pos],
+  );
+
+  const built = useMemo(
+    () => assemble(nodes, edges, effPos, sel, hotMirror, dimmed),
+    [nodes, edges, effPos, sel, hotMirror, dimmed],
+  );
+
+  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode>([]);
+  const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>([]);
+
+  useEffect(() => {
     setRfNodes(built.nodes);
     setRfEdges(built.edges);
-  }, [built, structKey, setRfNodes, setRfEdges]);
+  }, [built, setRfNodes, setRfEdges]);
+
+  // 拖动结束的位置落一笔，重算 data 时沿用
+  const handleNodesChange = (changes: Parameters<typeof onNodesChange>[0]) => {
+    for (const c of changes) {
+      if (c.type === "position" && c.dragging && c.position) {
+        dragPos.current.set(c.id, c.position);
+      }
+    }
+    onNodesChange(changes);
+  };
 
   const pick = (id: string | undefined) => {
     const orig = id ? (nodes.find((x) => x.id === id) ?? null) : null;
@@ -385,7 +471,7 @@ export default function TopologyGraph({
         nodes={rfNodes}
         edges={rfEdges}
         nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
+        onNodesChange={handleNodesChange}
         onEdgesChange={onEdgesChange}
         onSelectionChange={({ nodes: ns }) => onSelect?.(ns.map((n) => n.id))}
         // 普通拖动 = 平移画布，Shift + 拖动 = 框选。反过来的话（拖拽即框选）
@@ -394,8 +480,6 @@ export default function TopologyGraph({
         selectionKeyCode="Shift"
         multiSelectionKeyCode={["Meta", "Control"]}
         deleteKeyCode={null}
-        fitView
-        fitViewOptions={{ padding: 0.16 }}
         minZoom={0.15}
         maxZoom={1.6}
         nodesConnectable={false}
@@ -435,5 +519,13 @@ export default function TopologyGraph({
         />
       </ReactFlow>
     </div>
+  );
+}
+
+export default function TopologyGraph(props: Parameters<typeof GraphInner>[0]) {
+  return (
+    <ReactFlowProvider>
+      <GraphInner {...props} />
+    </ReactFlowProvider>
   );
 }

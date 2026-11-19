@@ -429,6 +429,8 @@ export default function TopologyPage() {
             gw={gw.data}
             loading={gw.isLoading}
             busy={busy}
+            mirrorRows={rows}
+            onRefreshMirrors={() => mirrors.refetch()}
             onEgress={toggleEgress}
             onAddPub={() => setPubOpen(true)}
             onDelPub={async (idx) => {
@@ -519,7 +521,9 @@ export default function TopologyPage() {
                 monitor={detail}
                 networks={networks}
                 edges={edges}
+                mirrorRows={rows}
                 busy={busy}
+                onRefresh={() => mirrors.refetch()}
                 onChange={afterChange}
                 onError={(e) => message.error(e)}
               />
@@ -616,9 +620,37 @@ export default function TopologyPage() {
             {
               title: "抓包桥",
               dataIndex: "capture_bridge",
-              width: 130,
+              width: 120,
               render: (v: string | undefined) =>
                 v ? <span className="mono">{v}</span> : <span className="mono">{""}</span>,
+            },
+            {
+              title: "状态",
+              dataIndex: "active",
+              width: 86,
+              render: (v: string) => (
+                <Tooltip
+                  title={
+                    v === "active"
+                      ? "宿主上采集单元运行中"
+                      : v === "failed"
+                        ? "采集单元已安装但运行失败，巡检/重启后会自动重试"
+                        : v === "missing"
+                          ? "宿主上还没有这个实例（容器未建或等巡检补装）"
+                          : "单元已安装但未运行"
+                  }
+                >
+                  <Tag color={v === "active" ? "green" : v === "failed" ? "red" : "default"}>
+                    {v === "active"
+                      ? "采集中"
+                      : v === "failed"
+                        ? "失败"
+                        : v === "missing"
+                          ? "未安装"
+                          : "停止"}
+                  </Tag>
+                </Tooltip>
+              ),
             },
             {
               title: "",
@@ -684,6 +716,8 @@ function MonitorNetworks({
   monitor,
   networks,
   edges,
+  mirrorRows,
+  onRefresh,
   busy,
   onChange,
   onError,
@@ -691,6 +725,10 @@ function MonitorNetworks({
   monitor: TopoNode;
   networks: TopoNode[];
   edges: TopoEdge[];
+  /** 全部镜像连线（带运行状态）：展开显示每个网络里"哪些口在抓、哪些没抓" */
+  mirrorRows: MirrorRow[];
+  /** 重新拉取镜像现状（宿主侧 systemctl 状态） */
+  onRefresh: () => void;
   busy: boolean;
   onChange: (msg: string) => void;
   onError: (msg: string) => void;
@@ -731,9 +769,19 @@ function MonitorNetworks({
       size="small"
       title="采集的网络"
       extra={
-        <Text type="secondary" style={{ fontSize: 11 }}>
-          开关即自动接线
-        </Text>
+        <Space size={6}>
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            onClick={onRefresh}
+            title="重新对账宿主上各采集实例的运行状态"
+          >
+            刷新
+          </Button>
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            开关即自动接线
+          </Text>
+        </Space>
       }
     >
       {networks.length === 0 ? (
@@ -747,6 +795,13 @@ function MonitorNetworks({
             const monitored = typeof m.monitor === "string" && m.monitor !== "";
             const mine = m.monitor === monitor.label;
             const info = captureInfo(net);
+            // 这台监控机在这个网络里逐主机的采集现状（来自 /api/mirrors 的
+            // 宿主侧状态，不是图上的意图）
+            const hostRows = mine
+              ? mirrorRows.filter(
+                  (r) => r.to === `${monitor.zone}:${monitor.label}` && r.from.startsWith(`host:${net.zone}:`),
+                )
+              : [];
             return (
               <div key={net.id} className="mon-net-row">
                 <div className="mon-net-text">
@@ -766,6 +821,33 @@ function MonitorNetworks({
                       {" "}
                       · 归 {String(m.monitor)}
                     </Text>
+                  )}
+                  {mine && hostRows.length > 0 && (
+                    <div style={{ marginTop: 2 }}>
+                      {hostRows.map((r) => {
+                        const host = r.from.replace(/^host:[^:]+:/, "");
+                        const ok = r.active === "active";
+                        return (
+                          <div key={r.from} style={{ fontSize: 11, lineHeight: "18px" }}>
+                            <span className="mono">
+                              {host} · {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
+                            </span>{" "}
+                            <Tag
+                              color={ok ? "green" : r.active === "failed" ? "red" : "default"}
+                              style={{ fontSize: 10, lineHeight: "16px", padding: "0 6px" }}
+                            >
+                              {ok
+                                ? "采集中"
+                                : r.active === "failed"
+                                  ? "失败"
+                                  : r.active === "missing"
+                                    ? "未安装"
+                                    : "停止"}
+                            </Tag>
+                          </div>
+                        );
+                      })}
+                    </div>
                   )}
                 </div>
                 <Switch
@@ -788,12 +870,14 @@ function MonitorNetworks({
   );
 }
 
-/** 网络节点的抽屉：这个网段怎么配的、网关开着什么。 */
+/** 网络节点的抽屉：这个网段怎么配的、网关开着什么、VPN 与流量监控的现状。 */
 function NetworkDetail({
   node,
   gw,
   loading,
   busy,
+  mirrorRows,
+  onRefreshMirrors,
   onEgress,
   onAddPub,
   onDelPub,
@@ -802,6 +886,9 @@ function NetworkDetail({
   gw?: GatewayStatus;
   loading: boolean;
   busy: boolean;
+  /** 全部镜像连线（带宿主上的运行状态），用于本网络的逐口对账 */
+  mirrorRows: MirrorRow[];
+  onRefreshMirrors: () => void;
   onEgress: (on: boolean) => void;
   onAddPub: () => void;
   onDelPub: (idx: number) => void;
@@ -809,6 +896,12 @@ function NetworkDetail({
   const m = node.meta as Record<string, unknown>;
   const external = m.external === true;
   const pubs = gw?.pubs ?? [];
+  const zone = node.zone ?? "";
+
+  /** 本网络各主机的镜像现状：源主机 → 实例状态。规格说该抓（有边）但
+   * 宿主上单元不在/挂了，就标红——"哪些口镜像了哪些没有"一眼可见。 */
+  const zoneMirrors = mirrorRows.filter((r) => r.from.startsWith(`host:${zone}:`));
+  const monitorName = typeof m.monitor === "string" ? m.monitor : "";
 
   return (
     <Space direction="vertical" size={14} style={{ width: "100%" }}>
@@ -847,6 +940,79 @@ function NetworkDetail({
         </Text>
       ) : (
         <>
+          {gw?.vpn && (gw.vpn.wireguard || gw.vpn.openvpn) && (
+            <Card size="small" title="VPN">
+              <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                {gw.vpn.wireguard && (
+                  <div>
+                    <Tag color={gw.vpn.wireguard_active ? "green" : "red"}>
+                      WireGuard {gw.vpn.wireguard_active ? "运行中" : "已停止"}
+                    </Tag>
+                    {gw.vpn.clients.length > 0 && (
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        客户端 {gw.vpn.clients.length} 个
+                      </Text>
+                    )}
+                  </div>
+                )}
+                {gw.vpn.openvpn && (
+                  <div>
+                    <Tag color={gw.vpn.openvpn_active ? "green" : "red"}>
+                      OpenVPN {gw.vpn.openvpn_active ? "运行中" : "已停止"}
+                    </Tag>
+                  </div>
+                )}
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  隧道配置在网关的抽屉里下载；VPN 开关在编排页。
+                </Text>
+              </Space>
+            </Card>
+          )}
+
+          {monitorName && zoneMirrors.length > 0 && (
+            <Card
+              size="small"
+              title="流量监控"
+              extra={
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  onClick={onRefreshMirrors}
+                  loading={busy}
+                  title="重新对账：规格意图 vs 宿主上真实在跑的采集实例"
+                >
+                  刷新
+                </Button>
+              }
+            >
+              <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                <div>
+                  <Tag color="blue">监控机 {monitorName}</Tag>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    每台主机的内网口双向复制到它的抓包口
+                  </Text>
+                </div>
+                {zoneMirrors.map((r) => {
+                  const host = r.from.replace(/^host:[^:]+:/, "");
+                  const ok = r.active === "active";
+                  return (
+                    <div key={`${r.from}->${r.to}`} className="mon-net-row">
+                      <span className="mono" style={{ fontSize: 12 }}>
+                        {host} · {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
+                      </span>
+                      <Tag color={ok ? "green" : r.active === "failed" ? "red" : "default"}>
+                        {ok ? "采集中" : r.active === "failed" ? "失败" : "未安装"}
+                      </Tag>
+                    </div>
+                  );
+                })}
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  后台巡检每 5 分钟自动对账：缺的补装、挂的拉起、孤儿清理。
+                </Text>
+              </Space>
+            </Card>
+          )}
+
           <Card
             size="small"
             title="出网"

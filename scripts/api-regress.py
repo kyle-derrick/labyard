@@ -273,8 +273,14 @@ if PW:
     check("重复加被拒", "POST", "/api/mirrors", {"from": "zt:s1", "to": "zt:a1"}, want=400)
     check("不存在的源主机被拒", "POST", "/api/mirrors",
           {"from": "zt:no-such-host", "to": "zt:a1"}, want=400)
-    check("自己镜像自己被拒", "POST", "/api/mirrors",
-          {"from": "zt:a1", "to": "zt:a1"}, want=400)
+    # 监控机（analysis）抓自己 = 自己的内网口 → 自己的抓包口，没有回环，合法；
+    # 普通 server 抓自己没有意义，解析阶段就拦。
+    check("监控机抓自己的内网口（合法）", "POST", "/api/mirrors",
+          {"from": "zt:a1", "to": "zt:a1"}, keys=["ok", "spec"])
+    self_link = "zt:a1->zt:a1"
+    check("删监控机自连线", "DELETE", f"/api/mirrors/{q(self_link)}", keys=["ok"])
+    check("普通主机抓自己被拒", "POST", "/api/mirrors",
+          {"from": "zt:s1", "to": "zt:s1"}, want=400)
     check("删镜像连线", "DELETE", f"/api/mirrors/{q(link)}", keys=["ok"])
     lst = call("GET", "/api/mirrors")[1]
     left = [m["from"] + "->" + m["to"] for m in lst.get("mirrors", [])] \
