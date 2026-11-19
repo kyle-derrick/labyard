@@ -4,7 +4,7 @@
 可以推倒重来的实验网络。
 
 **状态：功能完整，已在真实 PVE 9.2.2 上端到端验证。** 核心引擎、PVE 命令层、Web 界面
-（规格管理 / 拓扑图 / 网关面板 / 运维 / 终端）、幂等与并发控制全部实现，98 项单元测试、
+（可视化编排 / 拓扑图 / 网关面板 / 运维 / 终端）、幂等与并发控制全部实现，99 项单元测试、
 26 项 HTTP 冒烟、82 项真机逐接口回归全部通过（详见文末「已验证 / 未验证」）。
 
 ---
@@ -140,11 +140,12 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 12.0–12.1 MB（12024 → 12092 kB）。这也是登录必须串行化（`hash_gate`）的原因：
 并发 scrypt 会把工作区复制成 8 份。
 
-因此 `systemd` 的 `MemoryMax` 取 **192 MB**（32 + 12 + 页缓存与突发余量），
-`MemorySwapMax=256M` 兜住极端情况，并且密码哈希与规格解析都做了串行/限流。
-取 16 MB 会在第一次登录时被 OOM kill；**取 64 MB 也曾翻车**：宿主 cgroup 里还有页缓存，
-跑久了 `swap peak` 到 602 MB，scrypt 的 32 MB 工作区被换出去，登录开始稳定报
-"密码错误"（`verify` 返回 false），重启才恢复——详细过程写在 `docs/design.md` §7.5 与 §7.6.6。
+因此 `systemd` 的 `MemoryMax` 取 **384 MB**（3 × 70 的子进程 + 12 常驻 + 32 哈希 + 余量），
+`MemorySwapMax=128M` 兜住极端情况，并且密码哈希与规格解析都做了串行/限流。
+取 16 MB 会在第一次登录时被 OOM kill；**64 MB 与 192 MB 也都翻过车**：`pct`/`pvesh`
+是它的子进程、同属一个 cgroup，单个峰值 RSS 176 MB（`/usr/bin/time -v` 实测）。
+64 MB 时跑几小时就开始报"密码错误"（scrypt 工作区分配失败），192 MB 时 `doctor`
+四个 `pvesh` 并发直接 oom-kill。详细账本在 `docs/design.md` §7.5 第 1 条。
 
 **内存分配器**：实测**不用换**。glibc 默认 4.4 MB / churn 后 5.5 MB，jemalloc 是
 6.2 / 10.8，mimalloc 是 10.4 / 27.5。复现见 `bench/alloc/`。
@@ -203,7 +204,7 @@ docs/operations.md  安装、升级、备份恢复、排障
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | **98 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
+| ✅ 单元测试通过 | **99 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
 | ✅ 真机逐接口回归 | 82 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 分析机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
 | ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.7 MB，含 1.48 MB 前端）与内存（常驻 12.0 MiB / 峰值 44.8 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
@@ -214,7 +215,8 @@ docs/operations.md  安装、升级、备份恢复、排障
 | ✅ **VPN** | WireGuard：`wg0` 起来、公钥/peer/allowed-ips 正确、客户端 `.conf` 可下载；OpenVPN：`openvpn-server@labyard` active、监听 1194、`.ovpn` 可下载。**关闭也落地**（`disable --now` + 删 `wg0`），平台显示与实际一致 |
 | ✅ **retire / revive** | 主机级与整 zone 级都闭环：停机 → 摘镜像单元 → 拓扑折叠，保留 vmid/IP/磁盘/快照；revive 原样回来且 `gateway` / `mirror` 自动重跑恢复 |
 | ✅ **多规格管理** | 创建/复制（重名 409、非法名 400）、列表、zone 片段单独读写（往返只做块状序列化的风格归一，注释与其他 zone 不动）、增删 zone、删除规格 |
-| ✅ **拓扑** | `/api/topology` 输出已解析的 nodes + edges（真机 6 节点 6 边，含 `uplink` / `member` / `mirror` / `mirror-port`），前端 react-flow + dagre 只负责画，跨规格同名 zone 去重 |
+| ✅ **拓扑** | `/api/topology` 输出**两类节点两类边**：网络（外网 + 各 zone 内网）与主机，边是 `attach`（方向即数据流：外网→网关→内网→主机）与 `mirror`（网段→分析机虚线，按 (网段, 分析机) 聚合）。前端 react-flow + dagre 只负责画。图上可开抽屉改运行态、Shift 框选后右键加镜像、点分析机高亮其镜像虚线 |
+| ✅ **可视化编排** | `GET/PUT /api/specs/{name}/model` 做 YAML ↔ JSON 投影，前端用卡片 + 表格改结构，保存走与手工粘贴**同一条校验**（`Spec::parse` + `resolve_all`）；YAML 是可切换的高级选项。代价写在界面上：保存会重排 YAML 并丢注释 |
 | ✅ **重启自愈** | 地址与 nft 规则落成容器内开机单元（`labyard-net` / `labyard-nft`）：`pct reboot` 后地址、含端口映射的完整策略、关闭态的 egress 都原样恢复。这一步是真机发现的——早先只 `ip addr` 一次性下发，容器重启后整个 zone 静默失联，网关静默 fail-open |
 | ✅ **Web 终端** | ttyd 1.7.7 静态二进制注入容器（systemd 单元、绑容器内网地址）→ axum HTTP+WS 反代（hyper client + tokio-tungstenite）→ iframe 嵌入（ttyd 自带 xterm.js、CJK 输入、ZMODEM 传文件）。真机验证：页面 200（729 KB）、WS 握手 `101 Switching Protocols` |
 | ⚠️ 仅设计推演 | IPv6 出公网（宿主无 IPv6 上游，环境限制；区域内 ULA 互通与 NAT66 已实测）、厚 LVM 快照、`pct snapshot`、升级迁移（**从未发布，刻意不做**） |

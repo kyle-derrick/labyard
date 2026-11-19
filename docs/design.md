@@ -12,7 +12,7 @@
 
 四句话：
 
-1. **Web 是主界面，YAML 是真相源**。规格文件（`paths.specs/*.yaml`）是唯一权威状态，网页提供的是"编辑 YAML → 预览计划 → 应用 → 看拓扑/主机/日志"，而不是一层把 YAML 藏起来的下拉表单。理由：写进命令行的东西是一堆 `--storage local-lvm --template debian-13-standard_13.2-1_amd64.tar.zst`，容易写错版本号；而把同样的参数做成一堆下拉框，只会让"网页能表达什么"和"YAML 能表达什么"永久性地不一致。文件能 `cat`、能进 git、能手改回去，这是运维真正需要的东西。
+1. **Web 是主界面，YAML 是真相源**。规格文件（`paths.specs/*.yaml`）是唯一权威状态，网页提供的是"改结构 → 预览计划 → 应用 → 看拓扑/主机/日志"。**改结构默认可视化**（卡片 + 表格），YAML 是可切换的高级选项，两者写的是同一个文件。理由：写进命令行的东西是一堆 `--storage local-lvm --template debian-13-standard_13.2-1_amd64.tar.zst`，容易写错版本号；而只让用户手写 YAML，等于把这道门槛当成筛选器。文件仍然是真相：能 `cat`、能进 git、能手改回去。可视化前端只在改一棵 JSON 树，解析与校验全在后端（§8.1），所以不会长出"表单能表达、YAML 不能表达"的第二套语义。
 2. **但核心必须是库，不是网页的一部分**。`src/core` 不 import `axum`，Web 只是它的一个调用者。这样 E2E 测试可以驱动引擎（`labyard apply -f x.yaml --yes`），却不需要维护第二套用户界面。
 3. **全新实现，但继承经验**。旧目录（`lab-net/` 等）全部废弃，不进依赖链。旧实现里踩过的六个坑（空 set、0 字节密钥、`enabled-runtime`、tun 必须 bind mount、veth 名漂移、reset 清状态）直接变成回归测试项——这些比代码值钱。新实现连"搬运旧脚本"这一步都省了：网关策略与 VPN 是由 Rust 按规格**生成** nft 规则与 shell 脚本，再作为开机单元落进容器（§8.6.1、§8.6.6），仓库里不再有 `assets/gateway/` 这种待搬运的脚本目录。
 4. **幂等的单位是"步骤 + 输入哈希"，不是"跑没跑过"**。每次都先 probe 实际状态、再 diff、再 apply；配置没变就 skip，脚本改了哈希变了就重跑。这是"更新"和"重复执行"能同时成立的唯一办法。
@@ -57,7 +57,7 @@
 ### 2.1 做
 
 - 一份 YAML 一次性建出：桥（内网 / 镜像网）、LXC（网关 / 分析 / 服务端 / 客户端）、容器内网络、基础系统配置、镜像接线
-- 多规格管理、全局拓扑图、YAML 编辑 + 计划预览、任务日志、运行时操作（出网 / 端口映射 / VPN / retire）
+- 多规格管理、全局拓扑图、可视化编排（YAML 为高级选项）+ 计划预览、任务日志、运行时操作（出网 / 端口映射 / VPN / retire）
 - 重跑安全：已完成的跳过，改过的更新，失败的中断点续跑
 - 自由组合：`main` 上挂 `suba`、`subc`，`subb` 再挂 `suba`；每个 zone 的网关 WAN 接上一级的内网桥
 - 统一命名与地址分配（v4 + v6），分配结果持久化，重跑不重排
@@ -732,7 +732,7 @@ PVE 的 `PUT /nodes/{n}/lxc/{id}/config` 只接受它认识的那些 key（`net0
 | TLS | **`openssl req`** 生成自签 + **`axum-server` 的 rustls** | — | openssl 本就在系统里；rustls 是纯 Rust 实现，不链接 OpenSSL，没有版本与 CVE 牵连 | 内嵌证书生成（要给二进制塞密钥生成逻辑）、`native-tls`（又回到 OpenSSL 依赖） |
 | 结构化日志 | **tracing** + **tracing-subscriber** | 0.1 / 0.3 | JSON layer 输出结构化行；span 能自动带上 `run_id` 与 `step_key`，这正是 run 日志要的东西 | `log` + `env_logger`（没有 span，手写上下文） |
 | ttyd 反代 | **axum 的 WebSocket**（`ws` feature） | 内置 | 下游用 `WebSocketUpgrade`，上游用 `tokio-tungstenite` 连，双向搬运。**已实现**：真机验证页面 200、WS 握手 `101 Switching Protocols`（见 §7.4） | 手写 ws 帧解析（没必要） |
-| 测试 | `#[cfg(test)]` + 真机回归 | — | 纯函数（脚本生成、哈希、YAML 编辑、拓扑）在同模块里单测，不需要 PVE；需要 PVE 的一律上真机（`scripts/api-regress.py` 逐接口跑）。**没有**"录制回放假 `pct`"这一层：fixture 不保真、会腐烂 | cargo-nextest（当前 98 项不值得多一层工具）、proptest（脚本生成的输入空间不大） |
+| 测试 | `#[cfg(test)]` + 真机回归 | — | 纯函数（脚本生成、哈希、YAML 编辑、拓扑）在同模块里单测，不需要 PVE；需要 PVE 的一律上真机（`scripts/api-regress.py` 逐接口跑）。**没有**"录制回放假 `pct`"这一层：fixture 不保真、会腐烂 | cargo-nextest（当前 99 项不值得多一层工具）、proptest（脚本生成的输入空间不大） |
 
 ### 7.2 前端
 
@@ -888,9 +888,27 @@ ttyd 自己不做认证，因为它只监听内网地址——外部伪造不了
 
 **这个发现改了三件事**（都是实测推翻了估算）：
 
-1. `MemoryMax` 不能按"常驻 × 2"取，也不能只按"峰值 + 一点余量"取——**cgroup 的账里有页缓存**。最初按"32 MB 哈希 + 7 MB 常驻 + 25 MB 余量"定成 64 MB，同一份预算在容器里的基线测算是够的；放到宿主上跑了整晚（多轮 apply + 4 MB 的 DB WAL + `pct exec` 输出堆出来的页缓存）之后，`journalctl` 里出现 `64M memory peak, 602.5M memory swap peak`——**cgroup 内存顶到上限、swap 被大量使用**，随后登录开始稳定返回"密码错误"，重启即恢复。现在取 **192 MB**，并加 `MemorySwapMax=256M`；192 MB 相对宿主仍是零头，但足够让一次哈希全程待在内存里。
+1. `MemoryMax` 不能按"常驻 × 2"取，也不能只按 labyard 自己的峰值取——**账里还有子进程**。
+   `pct` / `pvesh` 是 perl 进程，`/usr/bin/time -v` 实测：
 
-   > 因果链要说清楚哪一段是确证的：**现象**（长跑后 401、重启恢复、`MemoryPeak` 顶到 64 M、swap 峰值 602 M）是日志与实测里的事实；**"scrypt 工作区分配失败导致 verify 返回 false"是推断**——最直接的旁证是提高上限、重启之后连续 40 次登录全通过（`MemoryPeak` 34 MB），但没抓到失败那一次的内核或分配器证据。写在这里，免得下次有人把它当成结论。
+   ```
+   pvesh get /version    Maximum resident set size: 176 336 kB
+   pct list              Maximum resident set size: 151 532 kB
+   pct exec 101 -- true  Maximum resident set size: 150 644 kB
+   ```
+
+   它们是 labyard 的子进程，**同属一个 cgroup**，所以 `MemoryMax` 管得住它们，
+   也必须为它们留额度。这条搞错过两次：
+
+   - 取 64 MB 时：单是一次 `pvesh` 就能把 cgroup 顶爆，内核疯狂 reclaim + 换页，
+     scrypt 的 32 MB 工作区分配不到，`verify_password` 挂掉返回 false。表现是
+     **"密码没记错但一直提示密码错误"，重启就好**（重启后第一个请求之前，
+     cgroup 还没被页缓存占满）。当时猜过"swap thrash"，真正的原因是账本算错了。
+   - 取 192 MB 时：把 `doctor` 里四个 `pvesh` 改成并发取数（本来是想把 6.7 秒压下去），
+     四个 perl 进程一起 charged，`Failed with result 'oom-kill'`，15 秒内重启一轮。
+     所以 `doctor` 现在是**串行**的，快的部分靠缓存和"storages 只问一次"补。
+
+   现在取 **384 MB**：`3 × 70`（apply 批内并发 3）+ `12`（常驻）+ `32`（scrypt）+ 余量。
 2. **密码哈希必须串行**。两个并发登录 = 64 MB 工作区，正好顶穿限制。已实现 `hash_gate`（容量 1）+ `spawn_blocking`，避免卡住 runtime worker。
 3. **preview 也要限流**。虽然实测显示它只涨 0.7 MB，但那是 6 台机的规格；规格放大到 50 台机时，解析 + 规划的对象量会线性增长。闸门固定 4。
 
@@ -1060,15 +1078,15 @@ Rust 默认使用系统 malloc（Linux 上是 glibc 的 ptmalloc2）。它在**�
 | 7 | 拓扑轮询 ≥ 10 秒 + 页面隐藏时暂停 | **部分实现**。轮询间隔：拓扑 15 s、运行历史 10 s、概览 10 s、主机 8 s、网关 6 s；`visibilitychange` 暂停**没做** |
 | 8 | 日志 + DB > 5 GB 自动清理 | **不适用**。没有日志文件；DB 只有 `step_state` / `vmids` / `runs` / `run_steps` / `retired` 五张小表，每步一行，增长以 KB 计 |
 
-唯一"不依赖代码正确性"的兜底是 `systemd` 的资源上限（`MemoryMax=192M` / `MemorySwapMax=256M` /
+唯一"不依赖代码正确性"的兜底是 `systemd` 的资源上限（`MemoryMax=384M` / `MemorySwapMax=128M` /
 `CPUQuota=50%` / `IOWeight=50` / `TasksMax=256`），由 `installer/install.sh` 写进 unit，见 §7.6.6。
 
 #### 7.6.6 用 systemd 兜底（唯一不依赖代码正确性的措施）
 
 ```ini
 [Service]
-MemoryMax=192M
-MemorySwapMax=256M
+MemoryMax=384M
+MemorySwapMax=128M
 CPUQuota=50%
 IOWeight=50
 TasksMax=256
@@ -1076,7 +1094,16 @@ TasksMax=256
 
 代码可能写错（比如某天忘了给某个 channel 设容量）。有了这几行，内核会先杀 labyard，而不是拖死宿主——**保宿主优先于保服务**，这是一个管理平台应有的默认值。Rust 没有 GC 可以调，所以只有 `MemoryMax` 这一层。
 
-**192 MB 这个值是调出来的，而且调过两次。** 第一版按"32 MB（scrypt 工作区）+ 7 MB（常驻）+ 25 MB 余量"取 64 MB，在容器里跑压测没问题；但那是干净基线——宿主的 cgroup 里还挂着页缓存，跑久了之后 journal 里出现 `602.5M memory swap peak`，scrypt 的工作区被换出去，登录开始报"密码错误"。第二版取 192 MB 并限制 `MemorySwapMax=256M`：**允许一点换页兜底，但不让 32 MB 的热工作区被整体换出**。这个教训写在 §7.5 的内存段里。
+**384 MB 这个值是调出来的，而且调过三次，每次都是因为算漏了子进程。**
+
+| 取值 | 结果 | 原因 |
+|---|---|---|
+| 64 MB | 跑几小时后登录稳定报"密码错误"，重启恢复 | 单个 `pvesh`/`pct` 子进程 charged 60–80 MB，顶穿上限后 cgroup 极端回收，scrypt 的 32 MB 工作区分配失败 |
+| 192 MB | `doctor` 改成四个 `pvesh` 并发后直接 `oom-kill` | 4 × 70 MB 超出额度 |
+| **384 MB** | 串行取数 + 读缓存，`MemoryPeak` 实测 152 MB | 3 × 70（apply 并发 3）+ 12 + 32 + 余量 |
+
+配 `MemorySwapMax=128M` 兜极端情况，但不给热工作区留"整块被换出去"的空间。
+详细推理在 §7.5 第 1 条。
 
 #### 7.6.7 apply 前的资源预检
 
@@ -1094,7 +1121,7 @@ TasksMax=256
 
 | 维度 | 常规 | 峰值 | 硬上限 |
 |---|---|---|---|
-| labyard RSS | 12 MB（VmRSS） | ~45 MB（`VmHWM` 44.8 MB，登录瞬间的 scrypt 工作区） | 192 MB（`MemoryMax`，含页缓存口径） |
+| labyard RSS | 12 MB（VmRSS） | ~45 MB（`VmHWM`，登录瞬间的 scrypt 工作区）；**外加一个 `pct`/`pvesh` 子进程 ~176 MB** | 384 MB（`MemoryMax`，含子进程与页缓存口径） |
 | labyard CPU | < 1% | ~5%（日志序列化密集时） | 50%（`CPUQuota`） |
 | 磁盘写 | 可忽略 | 全在子进程 | `ionice` 降级 |
 | 磁盘空间 | ~200 MB | 日志累积 | 5 GB 触发清理 |
@@ -1141,14 +1168,34 @@ TasksMax=256
 
 | 入口 | 组件 | 做什么 |
 |---|---|---|
-| **编排** | `Editor.tsx` | YAML 编辑（CodeMirror 风格高亮）→「预览计划」出步骤表 →「应用」起 run；网关面板（出网 / 端口映射 / VPN）也挂在这里 |
+| **编排** | `Editor.tsx` + `SpecVisual.tsx` | 默认**可视化**：默认配置 + 每个 zone 一张卡（上联/网段/NAT/出网 + 主机表格），增删 zone 与主机都是点出来的；`YAML` 是同一张卡上可切换的高级选项。两种模式都走「预览计划 → 应用」 |
 | **规格** | `Specs.tsx` | 多份规格的文件级 CRUD（新建 / 复制 / 改 / 删），以及文件内 zone 片段的增删改；片段编辑走 CST 就地改写，保留注释与缩进 |
-| **拓扑** | `TopologyPage.tsx` | 全局拓扑图（React Flow + dagre 自动布局），懒加载 |
+| **拓扑** | `TopologyPage.tsx` | 全局拓扑图（React Flow + dagre），**可操作**：点节点开抽屉改运行态、Shift 框选后右键加镜像、点分析机高亮它的镜像虚线。懒加载 |
 | **主机** | `Hosts.tsx` | 主机表（角色、IP、规格归属、电源、retired）+ 单机操作（开/关/重启、快照、retire/revive、终端） |
 | **运行历史** | `Runs.tsx` | run 列表 + 步骤明细 + SSE 实时日志 + retry / cancel |
 | **概览** | `Dashboard.tsx` | PVE 健康、`doctor` 结果统计、规格与主机计数 |
 
 **全局拓扑图是主视图**，不是每个 zone 一张。因为 zone 之间的关系（`suba` 挂在 `main-inner` 上）只有放到一张图里才看得出来；单看一个 zone，它和别人的连接就丢了。`/api/topology` 已经把"谁挂谁""哪条镜像线"解析成 nodes + edges，前端只负责画。
+
+**拓扑的模型（v2，改过一次）**。第一版把 `zone` 当作节点、把 `mirror` 当作一个假节点
+`mirr`，边有 `uplink` / `member` / `mirror-port` / `mirror` 四种。画出来"像那么回事但
+不对"：人看图问的是**"这台机接在哪个网段上"**，而图回答的是"这个对象属于哪个 zone"。
+zone 不是网络，它是一个配置作用域。现在只有两类节点：
+
+| 节点 | 是什么 | 图上显示 |
+|---|---|---|
+| `net:wan` / `net:{zone}` | 外网桥、各 zone 的内网桥 | 紫虚线框；网段、桥名、NAT/出网/映射数 |
+| `host:{zone}:{host}` | 容器 | 网关绿底、分析机蓝底、靶机白底；IP、配置、CT 号、运行状态点 |
+
+边只有两条语义，**方向都是数据流方向**：
+
+- `attach`：谁插在谁上面。网关因此有两条——`net_up → gw`（上联口 eth0）与
+  `gw → net_zone`（内网口 eth1）。正是这一对边让 dagre 顺着排出了
+  `外网 → 网关A → 内网A → 网关B → 内网B` 这条链，不需要额外指定 rank。
+- `mirror`：`net → 分析机` 的虚线单向箭头。同一个 (网段, 分析机) 上多个源主机
+  **聚合成一条**，label 里列出被抓的主机名——否则三条虚线完全重合，看起来只有一条。
+
+
 
 **终端内嵌在主机页的抽屉里**（`<iframe src="/terminal/{z}/{h}/">`），不是新标签页。
 选择内嵌的理由是"点哪台看哪台"的连续感——真开一堆标签页反而找不回来。
@@ -1156,25 +1203,56 @@ TasksMax=256
 ttyd 里的 `lrzsz`（`sz`/`rz` + ZMODEM）就是文件通道，`/terminal/{z}/{h}/{*path}`
 反代已经把 ZMODEM 控制序列一并通过。原因见 §7.4。
 
-> 早期版本这里写过 `/zones/{z}`、`/observed`、`/settings`、`/mirrors` 等一整套路由，
-> 以及"表单向导"。实际实现时发现：**规格文件是唯一真相源**，再叠一层表单只会
-> 制造"表单和 YAML 谁能表达什么"的第二套语义。所以改成"直接编辑 YAML +
-> 拓扑图看效果"，`/observed`（外来成员）也并进了主机表。
+> 中间有一版是"只能直接写 YAML"，理由是怕表单和 YAML 长出两套语义。
+> 那个担心是对的，但结论错了：真正的问题是**表单要自己解析 YAML**。
+> 现在的做法是让后端提供 `YAML → JSON 投影`（`/api/specs/{name}/model`），
+> 解析规则仍然只有一份，表单只是在改一棵 JSON 树，保存时再变回 YAML 并走
+> **同一条校验**（`Spec::parse` + `resolve_all`）。于是"图形化能存、应用却失败"
+> 这种事不会发生。
+>
+> 代价必须说清楚：**可视化保存会重排 YAML 并丢掉注释**（YAML 库不保留注释）。
+> 要留注释就切到 YAML 模式手工改，或者用「规格」页的 zone 片段编辑（那是 CST
+> 就地改写，注释不动）。界面上直接写了这句话，而不是让人踩一次才知道。
 
 ### 8.2 关键交互
 
-**编排页是"写 YAML → 看计划 → 应用"三段式**，中间不做参数表单：
+**编排页是"改结构 → 看计划 → 应用"三段式**，改结构有两种入口：
 
 ```
-① 写/贴 YAML（空文件时给一份带注释的示例）
+① 可视化（默认）              ①' YAML（高级，同一张卡右上角切换）
+   默认配置 + zone 卡片           直接编辑原文
+   主机表格点着改
 ② 预览计划：POST /api/preview，出一张步骤表（不落库、不执行）
 ③ 应用：POST /api/apply，起 run，SSE 里看每一步的实时输出
 ```
 
-第①步直接落在 YAML 上，是"网页不绑架你"的保证——页面上做出来的东西随时能
-存进 git 或贴进 issue，反过来手写的 YAML 也能直接贴回来。
-规格页的 zone 片段编辑用的是 CST 就地改写（`yaml-edit` / rowan），
-**注释和缩进会原样保留**，不会因为"在网页上改了一个 IP"就把整份文件重排。
+①和①' 写的是**同一个文件**，随时可以来回切：可视化保存后会自动把生成的 YAML
+灌进 YAML 模式，切过去就能看。两条路都落在规格文件上，是"网页不绑架你"的保证
+——页面上做出来的东西随时能存进 git 或贴进 issue。
+
+规格页的 zone **片段**编辑走的是第三条路：CST 就地改写（`yaml-edit` / rowan），
+**注释和缩进原样保留**，不会因为"在网页上改了一个 IP"就把整份文件重排。
+三种入口的分工是刻意的：
+
+| 入口 | 适合 | 注释 |
+|---|---|---|
+| 可视化卡片 | 从零搭、批量加主机 | 会丢（整份重写） |
+| YAML 全文 | 精细调整、复制粘贴 | 会丢（整份重写） |
+| zone 片段 | 只改一个 zone | **保留**（就地改写） |
+
+**拓扑图上的操作**（都在图上，不跳页）：
+
+| 操作 | 结果 |
+|---|---|
+| 点节点 | 右侧抽屉：主机可开机/关机/重启/终端/retire/revive；网络可看出网、加删端口映射 |
+| 点分析机 | 它的镜像虚线高亮成实色、其余节点淡化，一眼看出"这台抓了哪几个网段" |
+| Shift + 拖动 | 框选多台主机 |
+| 右键（多选后） | "把 N 台加入镜像 →"列出所有分析机，一次写 N 条 `mirrors:` |
+| 右键（单节点） | 打开详情、终端、开/关机、复制网段 |
+| 拖动节点 | 只改画布位置，**不写回规格**；结构没变时轮询刷新不会重置位置 |
+
+镜像的"加"从底部表单挪到了右键：底部表单只解决了"加一条"，而常见的是
+"这几台一起加"，框选比在下拉框里一台台挑快得多。底部表格保留，作为总账。
 
 **Plan 表的呈现**：
 
@@ -1212,6 +1290,10 @@ POST   /api/specs                        新建规格（可复制自另一份）
 GET    /api/specs/{name}                 读指定规格
 PUT    /api/specs/{name}                 保存指定规格
 DELETE /api/specs/{name}                 删规格文件（不动 PVE 资源）
+
+                      —— 规格：结构化视图（可视化编排）——
+GET    /api/specs/{name}/model           YAML 的 JSON 投影；不存在 exists:false
+PUT    /api/specs/{name}/model           按 JSON 保存：生成 YAML → 校验 → 原子写
 
                       —— 规格：zone 级（编辑框的种子）——
 POST   /api/specs/{name}/zones           新增一个 zone
@@ -1321,9 +1403,9 @@ GET    /api/openapi.json                 上面这份清单
 ### 8.5 页面上每个选项的数据来源
 
 早期设想的是一套"表单向导"：每个字段都从 PVE 查出来变成下拉框。实际做下来
-改成了**直接编辑 YAML**（理由见 §8.1 末尾的注），所以这一节描述的是"信息从哪来"，
-而不是"下拉框的选项从哪来"。原则没变：**能查到的事实不要让用户手打**，能在
-写之前发现的冲突不要留到 apply 才报。
+是**可视化表单 + YAML 双入口**（理由见 §8.1），但表单只改结构，不做"PVE 能力下拉"，
+所以这一节描述的是"信息从哪来"，而不是"下拉框的选项从哪来"。原则没变：
+**能查到的事实不要让用户手打**，能在写之前发现的冲突不要留到 apply 才报。
 
 | 信息 | 出现在哪 | 数据来源 |
 |---|---|---|
@@ -1656,7 +1738,7 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 **C. 我按默认执行，随时可改（纯参数）**
 
 - 并发：apply 批内 3（`--concurrency`）、计划闸 4、scrypt 闸 1（§7.6.4）
-- `systemd`：`MemoryMax=192M`、`MemorySwapMax=256M`、`CPUQuota=50%`、`IOWeight=50`、`TasksMax=256`
+- `systemd`：`MemoryMax=384M`、`MemorySwapMax=128M`、`CPUQuota=50%`、`IOWeight=50`、`TasksMax=256`
 - 前端轮询：拓扑 15 s、运行历史 10 s、概览 10 s、主机 8 s、网关 6 s
 
 ---

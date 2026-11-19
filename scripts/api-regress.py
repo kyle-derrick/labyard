@@ -145,6 +145,9 @@ check("步骤状态", "GET", "/api/state", keys=["steps"])
 check("默认规格", "GET", "/api/spec", keys=["yaml", "exists"])
 check("规格列表", "GET", "/api/specs", keys=["specs"])
 check("单份规格", "GET", f"/api/specs/{q(ZONE)}", keys=["yaml", "exists", "name"])
+# 可视化编排的数据源：YAML 的 JSON 投影，不是补全过默认值的那份
+check("结构化视图", "GET", f"/api/specs/{q(ZONE)}/model",
+      keys=["model", "exists", "name"])
 check("zone 片段", "GET", f"/api/specs/{q(ZONE)}/zones/{q(ZONE)}",
       keys=["zone", "yaml", "exists"])
 gone = check("zone 片段-不存在也返回 200", "GET",
@@ -219,6 +222,13 @@ if PW:
     tmp = check("读回临时规格", "GET", f"/api/specs/{q(TMP)}", keys=["yaml", "exists"])
     if isinstance(tmp, dict) and tmp.get("yaml"):
         check("原样保存", "PUT", f"/api/specs/{q(TMP)}", {"yaml": tmp["yaml"]}, keys=["ok"])
+    mv = check("读回结构化视图", "GET", f"/api/specs/{q(TMP)}/model",
+               keys=["model", "exists"])
+    if isinstance(mv, dict) and mv.get("model"):
+        model = mv["model"]
+        model.setdefault("defaults", {})["cores"] = 3
+        check("按结构化视图保存", "PUT", f"/api/specs/{q(TMP)}/model",
+              {"model": model}, keys=["ok", "yaml"])
     check("加 zone", "POST", f"/api/specs/{q(TMP)}/zones",
           {"zone": "tmp1",
            "yaml": "uplink: wan\nv4: 10.99.1.0/24\nhosts:\n  gw: { role: gateway }\n"},

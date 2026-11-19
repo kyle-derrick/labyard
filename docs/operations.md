@@ -155,8 +155,8 @@ Web 是唯一操作界面，但**不是唯一执行路径**：
 | 镜像不生效 | `tc filter show dev <bridge> egress`；`systemctl status 'labmirror@*'` | analysis 重建后 veth 名变了（apply 会重算）；`SRC_BRIDGE` 写成了 zone 名而不是桥名 |
 | retire 后镜像还在跑 | `systemctl list-units 'labmirror@*'` | 单元名是 `{zone}-{源vmid}-{目标vmid}`，废弃 analysis 时按后缀匹配。老版本只做前缀，升级后重跑一次 retire |
 | 无外网靶机装包失败 | `pct exec <cache> -- systemctl status apt-cacher-ng` | 缓存没起来，或靶机的 `apt_mirror` 指向了还没就绪的缓存（plan 里已经有隐式依赖，报错说明缓存真的起不来） |
-| 密码明明没记错，页面一直说"密码错误" | `systemctl show labyard -p MemorySwapPeak`；`journalctl -u labyard \| grep -i "swap peak"` | 老版本 `MemoryMax=64M` 的典型症状：scrypt 的 32 MB 工作区被换进 swap，分配失败后 `verify_password` 返回 false（接口如实报"密码错误"，不区分原因）。现在的 192 MB + `MemorySwapMax=256M` 就是为这个改的；遇到时先 `systemctl restart labyard`，再用 `systemctl show labyard -p MemoryMax` 确认上限没被人改小 |
-| 服务被 OOM kill | `systemctl show labyard -p MemoryPeak -p MemorySwapPeak`；`grep VmHWM /proc/$(systemctl show labyard -p MainPID --value)/status` | `MemoryMax=192M`：登录那一瞬间 scrypt 要 32 MB 工作区，叠加常驻 12 MB（`VmHWM` 44.8 MB）。**注意 cgroup 口径会把页缓存算进去**，`MemoryCurrent` 贴着上限是正常且可回收的，判断是否真危险看 `VmHWM` |
+| 密码明明没记错，页面一直说"密码错误" | `systemctl show labyard -p MemoryMax -p MemoryPeak`；`grep -i "oom" <(journalctl -u labyard --no-pager)` | 老版本 `MemoryMax=64M` 的典型症状：`pct`/`pvesh` 子进程 charged 60–80 MB 顶穿上限，cgroup 极端回收后 scrypt 的 32 MB 工作区分配不到，`verify_password` 返回 false（接口如实报"密码错误"，不区分原因）。现在 384 MB + `MemorySwapMax=128M` 就是为这个改的；遇到时先 `systemctl restart labyard`，再用 `systemctl show labyard -p MemoryMax` 确认上限没被人改小 |
+| 服务被 OOM kill | `systemctl show labyard -p MemoryPeak -p MemorySwapPeak`；`grep VmHWM /proc/$(systemctl show labyard -p MainPID --value)/status`；`journalctl -u labyard \| grep -i "oom-kill"` | `MemoryMax=384M`：**账里不只有 labyard 自己**——`pct`/`pvesh` 是它的子进程、同属一个 cgroup，单个峰值 RSS 176 MB（charged 60–80 MB）。所以要按"最大同时几个 pct"算，不是按"常驻 × 2"算。**注意 cgroup 口径会把页缓存算进去**，`MemoryCurrent` 贴着上限是正常且可回收的，判断是否真危险看 `VmHWM` |
 | PVE 页面变卡 | `journalctl -u labyard \| grep pmxcfs` | `/etc/pve` 是单线程 FUSE，平台状态一律一次 `GET /cluster/resources` 批量取，不逐台查 |
 | 容器起不来 | `pct status <vmid>` / `pct config <vmid>` | 桥不存在（先 `bridge` 步骤）；存储满；`memory` 太小 |
 
