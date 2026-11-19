@@ -1,16 +1,23 @@
-/** 主机运维：电源、快照、Web 终端、网关策略、retire/revive。
+/** 主机运维：电源、快照、Web 终端、网关策略、retire/revive、批量操作。
  *
  * 主机身份的唯一权威是后端的 vmids 分配表（`/api/hosts`），不是 PVE 的
  * 全量 VM 列表——列表里可能有别的实验留下的容器，混进来只会误导。
  *
  * retire 是"停机保号"：vmid、IP、磁盘、快照全留着，只是容器停掉、镜像实例
  * 摘掉、拓扑里折叠。它和 destroy 是两件不同的事，这里分开放，别让人点错。
+ *
+ * 批量操作走逐台调用：后端刻意没有批量端点——每台电源操作就是一个编排
+ * run（有全局串行闸），一次提交几十台前端逐台排队打请求，进度可见、
+ * 单台失败不影响别的。批量动作前先过滤掉不可操作的主机（不存在的、
+ * 已废弃的），剩下的才进 confirm。
  */
 import { useCallback, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Alert,
   App as AntApp,
   Button,
+  Card,
   Dropdown,
   Empty,
   Input,
@@ -18,12 +25,14 @@ import {
   Popconfirm,
   Select,
   Space,
+  Statistic,
   Table,
   Tag,
   Tooltip,
   Typography,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
+import type { Key } from "react";
 import {
   CloudServerOutlined,
   CodeOutlined,
@@ -33,6 +42,7 @@ import {
   PoweroffOutlined,
   ReloadOutlined,
   SafetyOutlined,
+  SearchOutlined,
   SyncOutlined,
   UndoOutlined,
 } from "@ant-design/icons";
@@ -241,6 +251,10 @@ export default function Hosts() {
   const [gw, setGw] = useState<string | null>(null);
   const [destroyZone, setDestroyZone] = useState<string | null>(null);
   const [confirmName, setConfirmName] = useState("");
+  const [selected, setSelected] = useState<Key[]>([]);
+  const [search, setSearch] = useState("");
+  const [snapBatch, setSnapBatch] = useState<HostRow[] | null>(null);
+  const [snapName, setSnapName] = useState("");
 
   const hosts = useQuery({
     queryKey: ["hosts"],
@@ -253,6 +267,41 @@ export default function Hosts() {
     () => Array.from(new Set(rows.map((r) => r.zone))),
     [rows],
   );
+
+  /** 全局搜索：主机名 / IP / CT 号 / zone 任意命中就保留 */
+  const filtered = useMemo(() => {
+    const s = search.trim().toLowerCase();
+    if (!s) return rows.filter((r) => r.host !== "*");
+    return rows.filter(
+      (r) =>
+        r.host !== "*" &&
+        (r.host.toLowerCase().includes(s) ||
+          r.zone.toLowerCase().includes(s) ||
+          (r.ipv4 ?? "").replace(/\/\d+$/, "").includes(s) ||
+          String(r.vmid).includes(s)),
+    );
+  }, [rows, search]);
+
+  /** 选中行里"真的能操作"的：容器存在且未废弃。批量动作前先算好这个集合。 */
+  const selectedRows = useMemo(
+    () =>
+      selected
+        .map((k) => rows.find((r) => `${r.zone}/${r.host}` === k))
+        .filter((r): r is HostRow => !!r && r.exists && !r.retired),
+    [rows, selected],
+  );
+
+  /** 统计卡片 */
+  const stats = useMemo(() => {
+    const real = rows.filter((r) => r.host !== "*");
+    return {
+      total: real.length,
+      running: real.filter((r) => r.status === "running" && !r.retired).length,
+      stopped: real.filter((r) => r.status === "stopped" && !r.retired).length,
+      retired: real.filter((r) => r.retired).length,
+    };
+  }, [rows]);
+
   // zone 整体废弃的判据：该 zone 下所有主机都 retired。
   // `/api/hosts` 只列有 vmid 的真实主机，`*` 这种"整 zone"标记不会出现在行里，
   // 所以不能直接找 host === "*"。
@@ -277,6 +326,78 @@ export default function Hosts() {
       }
     },
     [hosts, message],
+  );
+
+  /** 批量电源：逐台排队（后端 run 有全局闸，请求会自然串行），逐台报进度 */
+  const doBatchPower = useCallback(
+    (action: "start" | "stop" | "reboot", list: HostRow[]) => {
+      if (list.length === 0) return;
+      const label = action === "start" ? "启动" : action === "stop" ? "停止" : "重启";
+      modal.confirm({
+        title: `批量${label} ${list.length} 台？`,
+        content: list.map((r) => `${r.zone}/${r.host}`).join("、"),
+        okText: `批量${label}`,
+        cancelText: "取消",
+        onOk: async () => {
+          let ok = 0;
+          const fail: string[] = [];
+          for (const r of list) {
+            try {
+              await api.power(r.zone, r.host, action);
+              ok += 1;
+            } catch (e) {
+              fail.push(`${r.zone}/${r.host}: ${(e as Error).message}`);
+            }
+          }
+          message[fail.length ? "warning" : "success"](
+            `批量${label}：${ok}/${list.length} 台成功` + (fail.length ? `，失败：${fail.join("；")}` : ""),
+          );
+          setSelected([]);
+          await hosts.refetch();
+        },
+      });
+    },
+    [message, modal, hosts],
+  );
+
+  /** 批量废弃：和单台一样走确认框，只是列表更长 */
+  const doBatchRetire = useCallback(
+    (list: HostRow[]) => {
+      if (list.length === 0) return;
+      modal.confirm({
+        title: `批量废弃 ${list.length} 台？`,
+        content: (
+          <Space direction="vertical" size={4}>
+            <Text>{list.map((r) => `${r.zone}/${r.host}`).join("、")}</Text>
+            <Text type="secondary">
+              容器停机、镜像实例摘掉；vmid/IP/磁盘/快照全保留，可随时恢复。
+            </Text>
+          </Space>
+        ),
+        okText: "批量废弃",
+        okButtonProps: { danger: true },
+        cancelText: "取消",
+        onOk: async () => {
+          let ok = 0;
+          const fail: string[] = [];
+          for (const r of list) {
+            try {
+              await api.retireHost(r.zone, r.host);
+              ok += 1;
+            } catch (e) {
+              fail.push(`${r.zone}/${r.host}: ${(e as Error).message}`);
+            }
+          }
+          message[fail.length ? "warning" : "success"](
+            `批量废弃：${ok}/${list.length} 台成功` + (fail.length ? `，失败：${fail.join("；")}` : ""),
+          );
+          setSelected([]);
+          await hosts.refetch();
+          qc.invalidateQueries({ queryKey: ["topology"] });
+        },
+      });
+    },
+    [message, modal, hosts, qc],
   );
 
   /** 废弃：停机但保留一切。比 destroy 轻得多，所以不要求手打名字确认。 */
@@ -471,7 +592,34 @@ export default function Hosts() {
 
   return (
     <>
-      <Space style={{ marginBottom: 16 }} size={12} wrap>
+      {/* 状态总览：一眼看出机群规模，不用数表格 */}
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <Space size={32} wrap>
+          <Statistic title="主机总数" value={stats.total} />
+          <Statistic
+            title="运行中"
+            value={stats.running}
+            valueStyle={{ color: "#52c41a" }}
+          />
+          <Statistic title="已停止" value={stats.stopped} />
+          <Statistic
+            title="已废弃"
+            value={stats.retired}
+            valueStyle={stats.retired ? { color: "#faad14" } : undefined}
+          />
+        </Space>
+      </Card>
+
+      <Space style={{ marginBottom: 12 }} size={12} wrap>
+        <Input
+          allowClear
+          size="small"
+          prefix={<SearchOutlined style={{ color: "rgba(0,0,0,.25)" }} />}
+          placeholder="搜主机名 / IP / CT 号 / zone"
+          style={{ width: 240 }}
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
         <Button
           icon={<ReloadOutlined />}
           size="small"
@@ -480,6 +628,7 @@ export default function Hosts() {
         >
           刷新
         </Button>
+
         {zones.map((z) => (
           <Space.Compact key={z} size="small">
             <Button size="small" icon={<SafetyOutlined />} onClick={() => setGw(z)}>
@@ -548,22 +697,67 @@ export default function Hosts() {
         ))}
       </Space>
 
+      {/* 批量操作条：选中才出现，动作前先按可操作性过滤 */}
+      {selectedRows.length > 0 && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={
+            <Space size={8} wrap>
+              <span>
+                已选 <Text strong>{selectedRows.length}</Text> 台可操作
+                {selected.length > selectedRows.length
+                  ? `（另有 ${selected.length - selectedRows.length} 台不可操作，将被跳过）`
+                  : ""}
+              </span>
+              <Button size="small" onClick={() => doBatchPower("start", selectedRows)}>
+                批量启动
+              </Button>
+              <Button size="small" onClick={() => doBatchPower("stop", selectedRows)}>
+                批量停止
+              </Button>
+              <Button size="small" onClick={() => doBatchPower("reboot", selectedRows)}>
+                批量重启
+              </Button>
+              <Button size="small" icon={<CameraOutlined />} onClick={() => setSnapBatch(selectedRows)}>
+                批量快照
+              </Button>
+              <Button size="small" danger onClick={() => doBatchRetire(selectedRows)}>
+                批量废弃
+              </Button>
+              <Button size="small" type="text" onClick={() => setSelected([])}>
+                取消选择
+              </Button>
+            </Space>
+          }
+        />
+      )}
+
       <Table
         rowKey={(r) => `${r.zone}/${r.host}`}
         loading={hosts.isLoading}
-        dataSource={rows.filter((r) => r.host !== "*")}
+        dataSource={filtered}
         columns={columns}
         size="small"
-        pagination={false}
+        pagination={filtered.length > 20 ? { pageSize: 20, showSizeChanger: false } : false}
         rowClassName={(r) => (r.retired ? "row-retired" : "")}
+        rowSelection={{
+          selectedRowKeys: selected,
+          onChange: setSelected,
+          // 整 zone 行（host === "*"）不参与勾选：它不是一台真主机
+          getCheckboxProps: (r) => ({ disabled: r.host === "*" }),
+        }}
         locale={{
           emptyText: (
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
               description={
-                <span>
-                  <CloudServerOutlined /> 还没有主机——先在「编排」里 apply 一份规格
-                </span>
+                search ? "没有匹配的主机" : (
+                  <span>
+                    <CloudServerOutlined /> 还没有主机——先在「编排」里 apply 一份规格
+                  </span>
+                )
               }
             />
           ),
@@ -573,6 +767,49 @@ export default function Hosts() {
       <TerminalModal target={term} onClose={() => setTerm(null)} />
       <SnapshotModal target={snap} onClose={() => setSnap(null)} />
       <GatewayPanel zone={gw} onClose={() => setGw(null)} />
+
+      {/* 批量快照：一个名字，逐台创建——方便之后用同一个还原点对比 */}
+      <Modal
+        open={!!snapBatch}
+        title={`为 ${snapBatch?.length ?? 0} 台主机创建快照`}
+        okText="创建"
+        cancelText="取消"
+        okButtonProps={{ disabled: !snapName }}
+        onCancel={() => {
+          setSnapBatch(null);
+          setSnapName("");
+        }}
+        onOk={async () => {
+          const list = snapBatch ?? [];
+          let ok = 0;
+          const fail: string[] = [];
+          for (const r of list) {
+            try {
+              await api.snapshotOp(r.zone, r.host, "create", snapName);
+              ok += 1;
+            } catch (e) {
+              fail.push(`${r.zone}/${r.host}: ${(e as Error).message}`);
+            }
+          }
+          message[fail.length ? "warning" : "success"](
+            `快照：${ok}/${list.length} 台成功` + (fail.length ? `，失败：${fail.join("；")}` : ""),
+          );
+          setSnapBatch(null);
+          setSnapName("");
+          setSelected([]);
+        }}
+      >
+        <Input
+          placeholder="快照名（字母数字 -_）"
+          value={snapName}
+          onChange={(e) => setSnapName(e.target.value)}
+          onPressEnter={() => {}}
+          style={{ marginTop: 8 }}
+        />
+        <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 8 }}>
+          {snapBatch?.map((r) => `${r.zone}/${r.host}`).join("、")}
+        </Text>
+      </Modal>
     </>
   );
 }

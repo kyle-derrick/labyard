@@ -43,7 +43,11 @@ pub struct AppState {
     pub runner: Arc<dyn Runner>,
     pub cfg: Arc<Config>,
     pub secret: Arc<Vec<u8>>,
-    pub password_hash: Arc<String>,
+    /// 管理员密码的 scrypt 哈希。改密码时原地换——登录/校验共用这一把锁，
+    /// 用 std RwLock（读极多、写一辈子一次，tokio 锁是浪费）。
+    pub password_hash: Arc<std::sync::RwLock<String>>,
+    /// 哈希落盘路径：改密码要写回，重启后新密码才生效。
+    pub password_hash_path: std::path::PathBuf,
     pub runs: Arc<Mutex<HashMap<String, RunHandle>>>,
     pub concurrency: usize,
     /// 解析 + 规划的并发闸。
@@ -79,6 +83,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/auth/password", post(change_password))
         .route("/api/state", get(state_of_world))
         .route("/api/spec", get(get_spec).put(put_spec))
         // 多份规格：文件级 CRUD + 文件内的 zone 级 CRUD
@@ -199,7 +204,7 @@ async fn login(
     };
 
     let pw = req.password;
-    let hash = state.password_hash.to_string();
+    let hash = state.password_hash.read().unwrap().clone();
     // scrypt 是 CPU + 内存密集的同步计算，放 spawn_blocking，
     // 否则会占住一个 runtime worker 几十毫秒
     let ok = tokio::task::spawn_blocking(move || auth::verify_password(&pw, &hash))
@@ -231,8 +236,82 @@ async fn login(
     resp
 }
 
-async fn logout(State(state): State<Arc<AppState>>) -> Response {
+#[derive(Deserialize)]
+struct ChangePwReq {
+    old_password: String,
+    new_password: String,
+}
+
+/// 改管理员密码。链路：验旧密码（防躺椅上的猫改掉密码）→ scrypt 新哈希
+/// → 原子写文件（临时文件 + rename，断电不出半截哈希）→ 换内存里的哈希。
+/// 成功后立刻签发新 cookie，让"改密码"这件事在当前会话里无感继续。
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Json(req): Json<ChangePwReq>,
+) -> Response {
+    let _guard = state.hash_gate.acquire().await;
+
+    let old_hash = state.password_hash.read().unwrap().clone();
+    let old = req.old_password;
+    let verified = tokio::task::spawn_blocking(move || auth::verify_password(&old, &old_hash))
+        .await
+        .unwrap_or(false);
+    if !verified {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "旧密码不正确"})),
+        )
+            .into_response();
+    }
+    if req.new_password.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "新密码至少 8 位"})),
+        )
+            .into_response();
+    }
+
+    let new_pw = req.new_password;
+    let new_hash = tokio::task::spawn_blocking(move || auth::hash_password(&new_pw))
+        .await
+        .unwrap_or_default();
+
+    // 原子写盘：写临时文件再 rename
+    let tmp = state.password_hash_path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp, format!("{new_hash}\n")) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("写入失败：{e}")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::rename(&tmp, &state.password_hash_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("写入失败：{e}")})),
+        )
+            .into_response();
+    }
+    *state.password_hash.write().unwrap() = new_hash.clone();
+
+    // 重新签 cookie：旧 token 继续有效（签名没变），但新签的会刷新过期时间
+    let exp = chrono::Utc::now().timestamp() + state.cfg.server.session_hours * 3600;
+    let token = auth::sign(&state.secret, &format!("admin|{exp}"));
     let secure = if state.cfg.tls_enabled() { "; Secure" } else { "" };
+    let cookie = format!(
+        "labyard_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age={}",
+        state.cfg.server.session_hours * 3600
+    );
+    let mut resp = Json(serde_json::json!({"ok": true})).into_response();
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        cookie.parse().unwrap_or_else(|_| "".parse().unwrap()),
+    );
+    resp
+}
+
+async fn logout(State(state): State<Arc<AppState>>) -> Response {    let secure = if state.cfg.tls_enabled() { "; Secure" } else { "" };
     let mut resp = Json(serde_json::json!({"ok": true})).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
@@ -1462,6 +1541,10 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
     ("/api/auth/login", &[("post", "登录，成功返回 Set-Cookie")]),
     ("/api/auth/logout", &[("post", "登出，清 cookie")]),
     ("/api/auth/me", &[("get", "当前用户")]),
+    (
+        "/api/auth/password",
+        &[("post", "改管理员密码：{old_password, new_password}（≥8 位）")],
+    ),
     ("/api/state", &[("get", "已登记步骤的状态（幂等判定的输入）")]),
     ("/api/spec", &[
         ("get", "读取默认规格"),

@@ -86,6 +86,11 @@ export const api = {
     }),
 
   logout: () => req<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
+  changePassword: (old_password: string, new_password: string) =>
+    req<{ ok: boolean }>("/api/auth/password", {
+      method: "POST",
+      body: JSON.stringify({ old_password, new_password }),
+    }),
 
   state: () =>
     req<{ steps: StepState[]; retired?: [string, string, string, string][] }>(

@@ -2,24 +2,23 @@
  *
  * 后端给的是两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
  * 方向都是数据流方向。这里做四件事：
- *   1. 用 **elkjs**（Eclipse Layout Kernel，成熟布局引擎）算层级与位置，
- *      只吃 attach 边——镜像线参与布局会把监控机推到所有主机后面一档。
- *      方向 LR（左→右）：外网 → 网关 → 内网 → 主机。
- *   2. 主机节点底部画出**每个网口**（chip），每枚 chip 左右各一对隐藏
- *      handle；每条边按两端节点的相对方位选"朝向对端的那一侧"——
- *      线永远从 chip 面向对端的一侧出来，不再绕圈、不再悬空。
- *   3. 把 kind / role / 状态映射成视觉
- *   4. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单
- *
- * **布局只在结构变化时重算**：轮询每 15 秒来一次数据，如果每次都重排，
- * 用户刚拖好的位置会被抹掉、图会跳一下。按"节点 id + 边集合"算结构签名，
- * 签名没变就只更新 data / 样式，位置沿用。
+ *   1. 用 **elkjs**（Eclipse Layout Kernel）算层级与位置，只吃 attach 边——
+ *      镜像线参与布局会把监控机推到所有主机后面一档。
+ *      方向 LR：外网 → 网关 → 内网 → 主机。
+ *   2. **网口分侧**：外网口贴左缘、内网口贴右缘、抓包口贴下缘，均略突出
+ *      节点框——线从哪个口进出一眼可见。attach 边交给 ELK 的正交路由
+ *      （`elk.edgeRouting: ORTHOGONAL`）输出折线，绕开节点，不穿模。
+ *   3. 拖动不闪：数据轮询重建节点时**保留 RF 内部当前位置**，只换数据；
+ *      拖动位置由 React Flow 自己管理，不经过重建路径。
+ *   4. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单。
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   BackgroundVariant,
+  BaseEdge,
   Controls,
+  EdgeProps,
   Handle,
   MarkerType,
   MiniMap,
@@ -38,10 +37,10 @@ import ELK from "elkjs/lib/elk.bundled.js";
 import type { TopoEdge, TopoIface, TopoNode } from "./api";
 
 /** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。
- * host 高度含底部的网口 chip 行。 */
+ * host 高度含底部的抓包口 chip 行；左右缘的网口 chip 是突出的，不算宽。 */
 const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
   network: { w: 190, h: 70 },
-  host: { w: 196, h: 94 },
+  host: { w: 200, h: 118 },
 };
 
 export const ROLE_LABEL: Record<string, string> = {
@@ -68,32 +67,49 @@ type Data = {
 
 type GNode = Node<Data, "lab">;
 
-/** 网口 chip。左右各一对不可见 handle：`sl`/`sr` 供出边、`tl`/`tr` 供入边，
- * 边按"对端在哪侧"选 handle，线贴着 chip 面向对端的那一侧进出。 */
+/** 网口在哪一侧：wan 口在左（外面从左边来），普通口在右（内网在右边），
+ * 抓包口在下（镜像线从下面进监控机）。 */
+function sideOf(f: TopoIface): "l" | "r" | "b" {
+  if (f.capture) return "b";
+  if (f.net === "wan") return "l";
+  return "r";
+}
+
+/** handle id 约定：`{t|s}{l|r|b}:{iface}`。assemble 与节点渲染共用这条规则。 */
+function handleId(type: "s" | "t", side: string, iface: string) {
+  return `${type}${side}:${iface}`;
+}
+
+const SIDE_POS: Record<string, Position> = {
+  l: Position.Left,
+  r: Position.Right,
+  b: Position.Bottom,
+};
+
+/** 网口 chip：按 side 吸在节点边缘（略突出 8px），handle 就在突出点上。 */
 function IfaceChip({ f }: { f: TopoIface }) {
+  const side = sideOf(f);
   const tip = f.capture
     ? `${f.name} · 抓包（${f.net} 的流量）`
     : `${f.name} · ${f.net}${f.ip ? ` ${f.ip.replace(/\/\d+$/, "")}` : ""}`;
-  const hs = (type: "source" | "target", side: "l" | "r") => (
+  const isB = side === "b";
+  const style: React.CSSProperties = isB
+    ? { bottom: -9 }
+    : side === "l"
+      ? { left: -9 }
+      : { right: -9 };
+  const handles = (["s", "t"] as const).map((t) => (
     <Handle
-      type={type}
-      id={`${type[0]}${side}:${f.name}`}
-      position={side === "l" ? Position.Left : Position.Right}
-      style={{
-        [side === "l" ? "left" : "right"]: -4,
-        top: "50%",
-        width: 6,
-        height: 6,
-        opacity: 0,
-      }}
+      key={t}
+      type={t === "s" ? "source" : "target"}
+      id={handleId(t, side, f.name)}
+      position={SIDE_POS[side]}
+      style={{ width: 6, height: 6, opacity: 0, ...style }}
     />
-  );
+  ));
   return (
-    <div className={`iface${f.capture ? " iface-cap" : ""}`} title={tip}>
-      {hs("source", "l")}
-      {hs("source", "r")}
-      {hs("target", "l")}
-      {hs("target", "r")}
+    <div className={`iface${f.capture ? " iface-cap" : ""}`} title={tip} style={{ position: "relative" }}>
+      {handles}
       <span className="iface-name">{f.name}</span>
       {f.capture && <span className="iface-net">{f.net}</span>}
     </div>
@@ -120,105 +136,170 @@ function LabNode({ data }: NodeProps<GNode>) {
     .filter(Boolean)
     .join(" ");
 
-  return (
-    <>
-      {/* 网络节点（以及兜底）：左侧收、右侧发 */}
-      <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
-      <div className={cls} style={{ width: dim.w, height: dim.h }}>
-        {data.kind === "network" && (
-          <>
-            <div className="tn-row">
-              <span className="tn-neticon" data-external={flag("external") ? "1" : "0"} />
-              <span className="tn-title">{data.label}</span>
-              <span className="tn-chips">
-                {flag("nat") && <span className="tn-chip chip-nat">NAT</span>}
-                {flag("egress") && <span className="tn-chip chip-egress">出网</span>}
-                {(meta.pubs as number) > 0 && (
-                  <span className="tn-chip chip-pub">映射 {String(meta.pubs)}</span>
-                )}
-                {Array.isArray(meta.vpn) && meta.vpn.length > 0 && (
-                  <span className="tn-chip chip-vpn">
-                    {((meta.vpn as string[]) ?? []).join("/").toUpperCase()}
-                  </span>
-                )}
-              </span>
-            </div>
-            <div className="tn-sub mono">{m("cidr") ?? "—"}</div>
-            <div className="tn-sub tn-faint mono">
-              {m("bridge")}
-              {m("gateway_host") ? ` · 网关 ${m("gateway_host")}` : ""}
-            </div>
-          </>
-        )}
-
-        {data.kind === "host" && (
-          <>
-            <div className="tn-row">
-              <span className="tn-dot" data-st={data.retired ? "retired" : data.status} />
-              <span className="tn-title">{data.label}</span>
-              <span className="tn-chip">{ROLE_LABEL[data.role ?? ""] ?? data.role}</span>
-            </div>
-            <div className="tn-sub mono">
-              {(data.ipv4 ?? "").replace(/\/\d+$/, "")}
-              {typeof meta.memory === "number" && (
-                <span className="tn-faint">
-                  {" "}
-                  · {String(meta.cores)}C/{String(meta.memory)}M
+  if (data.kind !== "host") {
+    // 网络节点（以及兜底）：左侧收、右侧发
+    return (
+      <>
+        <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
+        <div className={cls} style={{ width: dim.w, height: dim.h }}>
+          <div className="tn-row">
+            <span className="tn-neticon" data-external={flag("external") ? "1" : "0"} />
+            <span className="tn-title">{data.label}</span>
+            <span className="tn-chips">
+              {flag("nat") && <span className="tn-chip chip-nat">NAT</span>}
+              {flag("egress") && <span className="tn-chip chip-egress">出网</span>}
+              {(meta.pubs as number) > 0 && (
+                <span className="tn-chip chip-pub">映射 {String(meta.pubs)}</span>
+              )}
+              {Array.isArray(meta.vpn) && meta.vpn.length > 0 && (
+                <span className="tn-chip chip-vpn">
+                  {((meta.vpn as string[]) ?? []).join("/").toUpperCase()}
                 </span>
               )}
-            </div>
-            <div className="tn-sub tn-faint mono">
-              {data.vmidLabel}
-              {data.vmidLabel && data.retired ? " · " : ""}
-              {data.retired ? "已废弃" : ""}
-            </div>
-            <div className="ifaces">
-              {data.ifaces.map((f) => (
-                <IfaceChip key={f.name} f={f} />
-              ))}
-            </div>
-          </>
-        )}
+            </span>
+          </div>
+          <div className="tn-sub mono">{m("cidr") ?? "—"}</div>
+          <div className="tn-sub tn-faint mono">
+            {m("bridge")}
+            {m("gateway_host") ? ` · 网关 ${m("gateway_host")}` : ""}
+          </div>
+        </div>
+        <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
+      </>
+    );
+  }
+
+  // 主机节点：网口分侧——wan 口贴左缘竖排、内网口贴右缘竖排、抓包口贴下缘横排
+  const left = data.ifaces.filter((f) => sideOf(f) === "l");
+  const right = data.ifaces.filter((f) => sideOf(f) === "r");
+  const bottom = data.ifaces.filter((f) => sideOf(f) === "b");
+  return (
+    <>
+      <div className={cls} style={{ width: dim.w, height: dim.h }}>
+        <div className="tn-row">
+          <span className="tn-dot" data-st={data.retired ? "retired" : data.status} />
+          <span className="tn-title">{data.label}</span>
+          <span className="tn-chip">{ROLE_LABEL[data.role ?? ""] ?? data.role}</span>
+        </div>
+        <div className="tn-sub mono">
+          {(data.ipv4 ?? "").replace(/\/\d+$/, "")}
+          {typeof meta.memory === "number" && (
+            <span className="tn-faint">
+              {" "}
+              · {String(meta.cores)}C/{String(meta.memory)}M
+            </span>
+          )}
+        </div>
+        <div className="tn-sub tn-faint mono">
+          {data.vmidLabel}
+          {data.vmidLabel && data.retired ? " · " : ""}
+          {data.retired ? "已废弃" : ""}
+        </div>
+        {/* 分侧网口：绝对定位在框边缘，chip 突出 9px 方便连线 */}
+        <div
+          style={{
+            position: "absolute",
+            left: -8,
+            top: 14,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          {left.map((f) => (
+            <IfaceChip key={f.name} f={f} />
+          ))}
+        </div>
+        <div
+          style={{
+            position: "absolute",
+            right: -8,
+            top: 14,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          {right.map((f) => (
+            <IfaceChip key={f.name} f={f} />
+          ))}
+        </div>
+        <div
+          style={{
+            position: "absolute",
+            bottom: -9,
+            left: 0,
+            right: 0,
+            display: "flex",
+            justifyContent: "center",
+            gap: 6,
+          }}
+        >
+          {bottom.map((f) => (
+            <IfaceChip key={f.name} f={f} />
+          ))}
+        </div>
       </div>
-      <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
     </>
   );
 }
 
 const nodeTypes = { lab: LabNode };
 
-/** 边的画法：attach 细灰实线（网关的上联口加粗成蓝），mirror 半透明虚线。 */
-function edgeSpec(e: TopoEdge, hot: boolean): Partial<Edge> {
-  if (e.kind === "mirror") {
-    return {
-      style: {
-        stroke: "#f59e0b",
-        strokeWidth: hot ? 2.2 : 1.4,
-        strokeDasharray: "5 4",
-        opacity: hot ? 1 : 0.45,
-      },
-      label: e.label ?? undefined,
-      labelStyle: { fontSize: 10.5, fill: "#b45309", opacity: hot ? 1 : 0.7 },
-      labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.92 },
-      labelBgPadding: [4, 2] as [number, number],
-      labelBgBorderRadius: 4,
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        color: "#f59e0b",
-        width: 14,
-        height: 14,
-      },
-      zIndex: hot ? 10 : 0,
-    };
-  }
-  // attach：上联口（数据从外网进来那一段）画粗一点，其余细灰
+/** ELK 正交路由的 attach 边：直接按 ELK 给的折点画 polyline——它绕开了节点。 */
+function OrthEdge({
+  data,
+  markerEnd,
+}: EdgeProps) {
+  const pts: [number, number][] = (data?.pts as [number, number][] | undefined) ?? [];
+  const d =
+    pts.length >= 2
+      ? pts.map((p, i) => `${i ? "L" : "M"}${p[0]},${p[1]}`).join(" ")
+      : "";
+  return (
+    <BaseEdge
+      path={d}
+      markerEnd={markerEnd}
+      style={{
+        stroke: (data?.stroke as string) ?? "#b9c4d4",
+        strokeWidth: (data?.strokeWidth as number) ?? 1.2,
+      }}
+    />
+  );
+}
+
+const edgeTypes = { ortho: OrthEdge };
+
+/** 边的画法参数：attach 走 ELK 正交路由，mirror 半透明虚线（smoothstep）。 */
+function attachSpec(e: TopoEdge): { stroke: string; strokeWidth: number; marker?: boolean } {
   const uplink = e.port === "uplink";
-  const color = uplink ? "#2f6feb" : "#b9c4d4";
   return {
-    style: { stroke: color, strokeWidth: uplink ? 1.8 : 1.2 },
-    markerEnd: uplink
-      ? { type: MarkerType.ArrowClosed, color, width: 14, height: 14 }
-      : undefined,
+    stroke: uplink ? "#2f6feb" : "#b9c4d4",
+    strokeWidth: uplink ? 1.8 : 1.2,
+    marker: uplink,
+  };
+}
+
+function mirrorSpec(e: TopoEdge, hot: boolean): Partial<Edge> {
+  return {
+    style: {
+      stroke: "#f59e0b",
+      strokeWidth: hot ? 2.2 : 1.4,
+      strokeDasharray: "5 4",
+      opacity: hot ? 1 : 0.45,
+    },
+    label: e.label ?? undefined,
+    labelStyle: { fontSize: 10.5, fill: "#b45309", opacity: hot ? 1 : 0.7 },
+    labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.92 },
+    labelBgPadding: [4, 2] as [number, number],
+    labelBgBorderRadius: 4,
+    markerEnd: {
+      type: MarkerType.ArrowClosed,
+      color: "#f59e0b",
+      width: 14,
+      height: 14,
+    },
+    zIndex: hot ? 10 : 0,
   };
 }
 
@@ -229,11 +310,14 @@ function uniqNodes(nodes: TopoNode[]): Map<string, TopoNode> {
   return uniq;
 }
 
-/** ELK 分层布局，只吃 attach 边。返回节点 id → 左上角坐标。 */
-async function layoutPositions(
-  nodes: TopoNode[],
-  edges: TopoEdge[],
-): Promise<Map<string, { x: number; y: number }>> {
+type Layout = {
+  pos: Map<string, { x: number; y: number }>;
+  /** attach 边的正交折点（ELK ORTHOGONAL 路由输出，root 全局坐标） */
+  paths: Map<string, [number, number][]>;
+};
+
+/** ELK 分层布局 + 正交路由，只吃 attach 边。 */
+async function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Promise<Layout> {
   const uniq = uniqNodes(nodes);
   const elk = new ELK();
   const children = [...uniq.values()].map((n) => {
@@ -249,29 +333,42 @@ async function layoutPositions(
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
-      "elk.spacing.nodeNode": "40",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "130",
+      "elk.edgeRouting": "ORTHOGONAL",
+      "elk.spacing.nodeNode": "46",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "140",
       "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
       "elk.layered.mergeEdges": "true",
-      "elk.padding": "[top=24,left=24,bottom=24,right=24]",
+      "elk.padding": "[top=40,left=60,bottom=40,right=60]",
     },
     children,
     edges: elEdges,
   });
 
-  const out = new Map<string, { x: number; y: number }>();
+  const pos = new Map<string, { x: number; y: number }>();
   for (const c of res.children ?? []) {
     if (typeof c.x === "number" && typeof c.y === "number") {
-      out.set(c.id, { x: c.x, y: c.y });
+      pos.set(c.id, { x: c.x, y: c.y });
     }
   }
-  return out;
+  // 收集每条 attach 边的折线：ELK 的 edge 输出顺序与输入一致，
+  // id 是我们传的 `{from}->{to}`，sections 是 root 全局坐标
+  const paths = new Map<string, [number, number][]>();
+  for (const ee of res.edges ?? []) {
+    const pts: [number, number][] = [];
+    for (const s of (ee as { sections?: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; bendPoints?: { x: number; y: number }[] }[] }).sections ?? []) {
+      pts.push([s.startPoint.x, s.startPoint.y]);
+      for (const b of s.bendPoints ?? []) pts.push([b.x, b.y]);
+      pts.push([s.endPoint.x, s.endPoint.y]);
+    }
+    if (pts.length >= 2) paths.set(ee.id, pts);
+  }
+  return { pos, paths };
 }
 
 function assemble(
   nodes: TopoNode[],
   edges: TopoEdge[],
-  pos: Map<string, { x: number; y: number }>,
+  layout: Layout,
   selected: Set<string>,
   hotMirror: Set<string>,
   dimmed: Set<string>,
@@ -281,7 +378,7 @@ function assemble(
   const rfNodes: GNode[] = [];
   for (const n of uniq.values()) {
     const d = DIM[n.kind] ?? DIM.host;
-    const p = pos.get(n.id) ?? { x: 0, y: 0 };
+    const p = layout.pos.get(n.id) ?? { x: 0, y: 0 };
     rfNodes.push({
       id: n.id,
       type: "lab",
@@ -304,6 +401,12 @@ function assemble(
     });
   }
 
+  /** 某个节点上某块网口的 handle side（不在清单里就兜底右侧） */
+  const sideOfOn = (nodeId: string, iface: string): string => {
+    const f = uniq.get(nodeId)?.ifaces?.find((x) => x.name === iface);
+    return f ? sideOf(f) : "r";
+  };
+
   const rfEdges: Edge[] = edges
     .filter(
       (e) =>
@@ -315,26 +418,37 @@ function assemble(
     )
     .map((e, i) => {
       const id = `${e.kind}:${e.from}->${e.to}:${i}`;
-      // chip handle 按相对方位选：对端在右就用右侧 handle，在左用左侧。
-      // 这样线从节点面向对端的那一侧进出，不会横穿节点再绕回来。
-      const px = (id2: string) => pos.get(id2)?.x ?? 0;
-      const srcRight = px(e.to) >= px(e.from);
-      const tgtRight = px(e.from) >= px(e.to);
-      const sourceHandle = e.source_iface
-        ? `${srcRight ? "sr" : "sl"}:${e.source_iface}`
-        : undefined;
-      const targetHandle = e.target_iface
-        ? `${tgtRight ? "tr" : "tl"}:${e.target_iface}`
-        : undefined;
+      if (e.kind === "attach") {
+        // attach：ELK 正交路由的折点直接画，handle 只作锚（正交边忽略它）
+        const spec = attachSpec(e);
+        return {
+          id,
+          source: e.from,
+          target: e.to,
+          type: "ortho",
+          data: {
+            pts: layout.paths.get(`${e.from}->${e.to}`),
+            stroke: spec.stroke,
+            strokeWidth: spec.strokeWidth,
+          },
+          markerEnd: spec.marker
+            ? { type: MarkerType.ArrowClosed, color: spec.stroke, width: 14, height: 14 }
+            : undefined,
+          zIndex: e.port === "uplink" ? 2 : 1,
+        } as Edge;
+      }
+      // mirror：从源口所在侧出、进目标口所在侧（抓包口在监控机下缘）
+      const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "r";
+      const ts = e.target_iface ? sideOfOn(e.to, e.target_iface) : "b";
       return {
         id,
         source: e.from,
         target: e.to,
-        sourceHandle,
-        targetHandle,
+        sourceHandle: handleId("s", ss, e.source_iface ?? "eth0"),
+        targetHandle: handleId("t", ts, e.target_iface ?? "eth1"),
         type: "smoothstep",
-        ...edgeSpec(e, hotMirror.has(id)),
-      };
+        ...mirrorSpec(e, hotMirror.has(id)),
+      } as Edge;
     });
 
   return { nodes: rfNodes, edges: rfEdges };
@@ -408,20 +522,16 @@ function GraphInner({
     return `${nk}#${ek}`;
   }, [nodes, edges]);
 
-  // 用户拖出来的位置单独记一笔：重算布局时不覆盖它，轮询重建时不丢
-  const dragPos = useRef<Map<string, { x: number; y: number }>>(new Map());
-  const [pos, setPos] = useState<Map<string, { x: number; y: number }>>(new Map());
+  const [layout, setLayout] = useState<Layout>({ pos: new Map(), paths: new Map() });
   const fitted = useRef(false);
 
   useEffect(() => {
-    // 结构变了：旧的拖动位置作废，等 ELK 给新布局
-    dragPos.current.clear();
     let alive = true;
     (async () => {
       try {
-        const p = await layoutPositions(nodes, edges);
+        const l = await layoutPositions(nodes, edges);
         if (!alive) return;
-        setPos(p);
+        setLayout(l);
       } catch {
         // 布局失败就保持旧位置：图乱一点总比消失好
       }
@@ -432,39 +542,37 @@ function GraphInner({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [structKey]);
 
-  const effPos = useMemo(
-    () => (dragPos.current.size ? new Map([...pos, ...dragPos.current]) : pos),
-    [pos],
-  );
-
   const built = useMemo(
-    () => assemble(nodes, edges, effPos, sel, hotMirror, dimmed),
-    [nodes, edges, effPos, sel, hotMirror, dimmed],
+    () => assemble(nodes, edges, layout, sel, hotMirror, dimmed),
+    [nodes, edges, layout, sel, hotMirror, dimmed],
   );
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode>([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
+  // 布局引用记一笔：ELK 异步算完返回**新 Layout 对象** → 全量采用它的
+  // 位置；引用没变（同结构下的轮询刷新 / hover 高亮重建）→ 保留 RF 内部
+  // 当前位置（用户拖过的）。初始 layout 是空地图，第一次 built 的节点全
+  // 在 (0,0)，若不区分，ELK 结果会被这批 (0,0) 盖住——所有节点叠成一坨，
+  // 就是"取景只有一台机器"的根因。
+  const layoutRef = useRef<Layout | null>(null);
+
   useEffect(() => {
-    setRfNodes(built.nodes);
+    const fresh = layoutRef.current !== layout;
+    layoutRef.current = layout;
+    setRfNodes((prev) => {
+      if (fresh || prev.length === 0) return built.nodes;
+      const have = new Map(prev.map((n) => [n.id, n.position]));
+      return built.nodes.map((n) => ({ ...n, position: have.get(n.id) ?? n.position }));
+    });
     setRfEdges(built.edges);
     // 首次拿到布局后取景：此时 setState 已在本轮 flush，rAF 回调能看到
-    // 带坐标的节点。放在布局 effect 里会赶在节点落位前跑，fitView 变空操作。
-    if (!fitted.current && built.nodes.length > 0 && pos.size > 0) {
+    // 带坐标的节点。
+    if (!fitted.current && built.nodes.length > 0 && layout.pos.size > 0) {
       fitted.current = true;
       requestAnimationFrame(() => rf.fitView({ padding: 0.16, duration: 200 }));
     }
-  }, [built, setRfNodes, setRfEdges, pos, rf]);
-
-  // 拖动结束的位置落一笔，重算 data 时沿用
-  const handleNodesChange = (changes: Parameters<typeof onNodesChange>[0]) => {
-    for (const c of changes) {
-      if (c.type === "position" && c.dragging && c.position) {
-        dragPos.current.set(c.id, c.position);
-      }
-    }
-    onNodesChange(changes);
-  };
+  }, [built, setRfNodes, setRfEdges, layout, rf]);
 
   const pick = (id: string | undefined) => {
     const orig = id ? (nodes.find((x) => x.id === id) ?? null) : null;
@@ -477,7 +585,8 @@ function GraphInner({
         nodes={rfNodes}
         edges={rfEdges}
         nodeTypes={nodeTypes}
-        onNodesChange={handleNodesChange}
+        edgeTypes={edgeTypes}
+        onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onSelectionChange={({ nodes: ns }) => onSelect?.(ns.map((n) => n.id))}
         // 普通拖动 = 平移画布，Shift + 拖动 = 框选。反过来的话（拖拽即框选）

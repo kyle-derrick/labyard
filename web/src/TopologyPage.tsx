@@ -85,20 +85,84 @@ export default function TopologyPage() {
   const monitors = useMemo(() => hosts.filter((n) => n.role === "monitor"), [hosts]);
 
   /** 总账分组：监控机 → 被采集网络 → 逐口行。 */
-  const mirrorGroups = useMemo(() => {
+  /** 镜像总账的树形数据源：监控机 → 网络 → 逐口行。antd Table 直接吃。 */
+  type LedgerRow = {
+    key: string;
+    name: React.ReactNode;
+    bridge?: React.ReactNode;
+    iface?: React.ReactNode;
+    spec?: string;
+    active?: string;
+    row?: MirrorRow;
+    children?: LedgerRow[];
+  };
+  const ledger = useMemo<LedgerRow[]>(() => {
     const byMon = new Map<string, MirrorRow[]>();
     for (const r of rows) {
       (byMon.get(r.to) ?? byMon.set(r.to, []).get(r.to)!).push(r);
     }
-  return [...byMon.entries()].map(([mon, rs]) => ({
-    mon,
-    rows: rs,
-    nets: [...new Set(rs.map((r) => r.from.split(":")[0]))].map((zone) => ({
-      zone,
-      rows: rs.filter((r) => r.from.startsWith(`${zone}:`)),
-    })),
-  }));
-  }, [rows]);
+    return [...byMon.entries()].map(([mon, rs]) => {
+      const byZone = new Map<string, MirrorRow[]>();
+      for (const r of rs) {
+        const zone = r.from.split(":")[0];
+        (byZone.get(zone) ?? byZone.set(zone, []).get(zone)!).push(r);
+      }
+      return {
+        key: `mon:${mon}`,
+        name: (
+          <Space size={8}>
+            <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+              监控机 {mon}
+            </Tag>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {rs.length} 条连线 · {byZone.size} 个网络
+            </Text>
+          </Space>
+        ),
+        children: [...byZone.entries()].map(([zone, zrs]) => {
+          const netNode = nodes.find((n) => n.id === `net:${zone}`);
+          const nm = netNode?.meta as Record<string, unknown> | undefined;
+          return {
+            key: `net:${mon}:${zone}`,
+            name: (
+              <Space size={6}>
+                <Text strong style={{ fontSize: 12 }}>
+                  {netNode?.label ?? `${zone} 内网`}
+                </Text>
+                <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
+                  {String(nm?.cidr ?? "")}
+                </Text>
+              </Space>
+            ),
+            bridge: (
+              <span className="mono" style={{ fontSize: 11 }}>
+                {zrs[0]?.capture_bridge ?? "—"}
+              </span>
+            ),
+            children: zrs.map((r) => {
+              const host = r.from.replace(/^host:[^:]+:/, "");
+              return {
+                key: `row:${mon}:${r.from}`,
+                name: (
+                  <span className="mono" style={{ fontSize: 12 }}>
+                    {host}
+                  </span>
+                ),
+                iface: (
+                  <span className="mono" style={{ fontSize: 12 }}>
+                    {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
+                  </span>
+                ),
+                spec: r.spec,
+                active: r.active,
+                row: r,
+              };
+            }),
+          };
+        }),
+      };
+    });
+  }, [rows, nodes]);
   const networks = useMemo(
     () => nodes.filter((n) => n.kind === "network" && !(n.meta as Record<string, unknown>).external),
     [nodes],
@@ -604,89 +668,80 @@ export default function TopologyPage() {
         {rows.length === 0 && !mirrors.isLoading ? (
           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有镜像连线" />
         ) : (
-          mirrorGroups.map((g) => (
-            <div key={g.mon} style={{ marginBottom: g === mirrorGroups[mirrorGroups.length - 1] ? 0 : 16 }}>
-              {/* 一级：监控机 */}
-              <div className="mon-net-row" style={{ marginBottom: 6 }}>
-                <Space size={8}>
-                  <Tag color="blue">监控机 {g.mon}</Tag>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    {g.rows.length} 条连线 · {g.nets.length} 个网络
-                  </Text>
-                </Space>
-              </div>
-              {/* 二级：被采集的网络 */}
-              {g.nets.map((net) => {
-                const netNode = nodes.find((n) => n.id === `net:${net.zone}`);
-                const nm = netNode?.meta as Record<string, unknown> | undefined;
-                return (
-                  <div key={net.zone} style={{ marginLeft: 12, marginBottom: 8 }}>
-                    <div style={{ marginBottom: 4 }}>
-                      <Text strong style={{ fontSize: 12 }}>
-                        {netNode?.label ?? `${net.zone} 内网`}
-                      </Text>
-                      <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
-                        {" "}
-                        {String(nm?.cidr ?? "")}
-                      </Text>
-                      <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
-                        {" "}
-                        · 抓包桥 {net.rows[0]?.capture_bridge ?? "—"}
-                      </Text>
-                    </div>
-                    {net.rows.map((r) => {
-                      const host = r.from.replace(/^host:[^:]+:/, "");
-                      const v = r.active;
-                      return (
-                        <div key={`${r.from}->${r.to}`} className="mon-net-row" style={{ padding: "2px 0" }}>
-                          <Space size={8}>
-                            <span className="mono" style={{ fontSize: 12 }}>
-                              {host} · {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
-                            </span>
-                            <Tag className="mono" style={{ fontSize: 10, lineHeight: "16px", padding: "0 6px" }}>
-                              {r.spec}
-                            </Tag>
-                          </Space>
-                          <Space size={8}>
-                            <Tooltip
-                              title={
-                                v === "active"
-                                  ? "宿主上采集单元运行中"
-                                  : v === "failed"
-                                    ? "采集单元已安装但运行失败，巡检/重启后会自动重试"
-                                    : v === "missing"
-                                      ? "宿主上还没有这个实例（容器未建或等巡检补装）"
-                                      : "单元已安装但未运行"
-                              }
-                            >
-                              <Tag color={v === "active" ? "green" : v === "failed" ? "red" : "default"}>
-                                {v === "active"
-                                  ? "采集中"
-                                  : v === "failed"
-                                    ? "失败"
-                                    : v === "missing"
-                                      ? "未安装"
-                                      : "停止"}
-                              </Tag>
-                            </Tooltip>
-                            <Popconfirm
-                              title="删除这条镜像？"
-                              description="规格里会一并删掉，监控机上的采集实例也会停。"
-                              okText="删除"
-                              okButtonProps={{ danger: true }}
-                              onConfirm={() => delMirror(r)}
-                            >
-                              <Button size="small" danger type="text" icon={<DeleteOutlined />} />
-                            </Popconfirm>
-                          </Space>
-                        </div>
-                      );
-                    })}
-                  </div>
-                );
-              })}
-            </div>
-          ))
+          <Table<LedgerRow>
+            rowKey="key"
+            size="small"
+            dataSource={ledger}
+            pagination={false}
+            defaultExpandAllRows
+            indentSize={18}
+            columns={[
+              { title: "监控机 / 网络 / 主机", dataIndex: "name" },
+              {
+                title: "抓包桥",
+                dataIndex: "bridge",
+                width: 130,
+                render: (v?: React.ReactNode) => v ?? "",
+              },
+              { title: "网口", dataIndex: "iface", width: 140 },
+              {
+                title: "规格",
+                dataIndex: "spec",
+                width: 110,
+                render: (v?: string) =>
+                  v ? <Tag className="mono">{v}</Tag> : "",
+              },
+              {
+                title: "状态",
+                dataIndex: "active",
+                width: 90,
+                render: (v?: string) =>
+                  v === undefined ? (
+                    ""
+                  ) : (
+                    <Tooltip
+                      title={
+                        v === "active"
+                          ? "宿主上采集单元运行中"
+                          : v === "failed"
+                            ? "采集单元已安装但运行失败，巡检/重启后会自动重试"
+                            : v === "missing"
+                              ? "宿主上还没有这个实例（容器未建或等巡检补装）"
+                              : "单元已安装但未运行"
+                      }
+                    >
+                      <Tag color={v === "active" ? "green" : v === "failed" ? "red" : "default"}>
+                        {v === "active"
+                          ? "采集中"
+                          : v === "failed"
+                            ? "失败"
+                            : v === "missing"
+                              ? "未安装"
+                              : "停止"}
+                      </Tag>
+                    </Tooltip>
+                  ),
+              },
+              {
+                title: "",
+                width: 50,
+                render: (_: unknown, r) =>
+                  r.row ? (
+                    <Popconfirm
+                      title="删除这条镜像？"
+                      description="规格里会一并删掉，监控机上的采集实例也会停。"
+                      okText="删除"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => delMirror(r.row!)}
+                    >
+                      <Button size="small" danger type="text" icon={<DeleteOutlined />} />
+                    </Popconfirm>
+                  ) : (
+                    ""
+                  ),
+              },
+            ]}
+          />
         )}
       </Card>
     </Space>

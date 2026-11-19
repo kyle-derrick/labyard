@@ -6,26 +6,36 @@ import {
   Button,
   Card,
   Col,
+  Drawer,
+  Empty,
+  Form,
   Input,
+  Modal,
+  Popconfirm,
   Row,
   Segmented,
   Select,
   Space,
   Switch,
+  Table,
   Tag,
   Tooltip,
   Typography,
 } from "antd";
+import type { ColumnsType } from "antd/es/table";
 import {
   CaretRightOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  CopyOutlined,
   EyeOutlined,
+  FileAddOutlined,
   StopOutlined,
   ReloadOutlined,
   SaveOutlined,
+  UnorderedListOutlined,
 } from "@ant-design/icons";
-import { api, streamRun, type PreviewStep, type RunEvent } from "./api";
+import { api, streamRun, type PreviewStep, type RunEvent, type SpecMeta } from "./api";
 import Topology, { type Zone } from "./Topology";
 import SpecVisual from "./SpecVisual";
 
@@ -73,6 +83,181 @@ mirrors:
 
 type LogLine = { cls: string; text: string };
 
+/** 规格文件管理（原独立「规格」页的核心部分，并进编排页的抽屉）。
+ *
+ * 文件级 CRUD：新建（可复制现有规格做变体）、删除、切换。zone 级编辑
+ * 由可视化编排承担——同一份规格在两处打开只会互相覆盖，没必要。 */
+function SpecManager({
+  open,
+  onClose,
+  current,
+  onPick,
+  specs,
+  onChanged,
+}: {
+  open: boolean;
+  onClose: () => void;
+  current: string;
+  onPick: (name: string) => void;
+  specs: SpecMeta[];
+  onChanged: () => void;
+}) {
+  const { message } = AntApp.useApp();
+  const [busy, setBusy] = useState(false);
+  const [newOpen, setNewOpen] = useState(false);
+  const [form] = Form.useForm();
+
+  const create = async (v: { name: string; copy_of?: string }) => {
+    setBusy(true);
+    try {
+      await api.createSpec({
+        name: v.name,
+        copy_of: v.copy_of || undefined,
+      });
+      message.success(`已创建 ${v.name}.yaml`);
+      setNewOpen(false);
+      form.resetFields();
+      onChanged();
+      onPick(v.name);
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const del = async (name: string) => {
+    try {
+      await api.deleteSpec(name);
+      message.success(`已删除 ${name}.yaml`);
+      onChanged();
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  };
+
+  const columns: ColumnsType<SpecMeta> = [
+    {
+      title: "规格",
+      dataIndex: "name",
+      render: (v: string, r) => (
+        <Space size={6}>
+          <a onClick={() => { onPick(v); onClose(); }}>
+            <Text strong={v === current}>{v}.yaml</Text>
+          </a>
+          {v === current && <Tag color="blue" style={{ marginInlineEnd: 0 }}>当前</Tag>}
+          {!r.valid && (
+            <Tooltip title={r.error ?? "解析失败"}>
+              <Tag color="red" style={{ marginInlineEnd: 0 }}>解析失败</Tag>
+            </Tooltip>
+          )}
+        </Space>
+      ),
+      sorter: (a, b) => a.name.localeCompare(b.name),
+    },
+    { title: "网络", dataIndex: "zones", width: 70, sorter: (a, b) => a.zones - b.zones },
+    { title: "主机", dataIndex: "hosts", width: 70, sorter: (a, b) => a.hosts - b.hosts },
+    {
+      title: "修改时间",
+      dataIndex: "modified",
+      width: 160,
+      render: (v: string | null) => (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {v ?? "—"}
+        </Text>
+      ),
+      sorter: (a, b) => (a.modified ?? "").localeCompare(b.modified ?? ""),
+    },
+    {
+      title: "操作",
+      width: 150,
+      render: (_: unknown, r) => (
+        <Space size={4}>
+          <Tooltip title="复制一份做变体">
+            <Button
+              size="small"
+              icon={<CopyOutlined />}
+              onClick={() => {
+                setNewOpen(true);
+                form.setFieldsValue({ copy_of: r.name });
+              }}
+            />
+          </Tooltip>
+          <Popconfirm
+            title={`删除 ${r.name}.yaml？`}
+            description="只删规格文件，不影响已经在跑的容器。"
+            okText="删除"
+            okButtonProps={{ danger: true }}
+            disabled={r.name === current}
+            onConfirm={() => del(r.name)}
+          >
+            <Button size="small" danger type="text" disabled={r.name === current} icon={<CloseCircleOutlined />} />
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
+
+  return (
+    <Drawer
+      title="规格文件"
+      width={640}
+      open={open}
+      onClose={onClose}
+      extra={
+        <Button type="primary" size="small" icon={<FileAddOutlined />} onClick={() => setNewOpen(true)}>
+          新建
+        </Button>
+      }
+    >
+      <Table
+        rowKey="name"
+        size="small"
+        dataSource={specs}
+        columns={columns}
+        pagination={false}
+        loading={busy}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有规格文件" /> }}
+      />
+      <Modal
+        title="新建规格"
+        open={newOpen}
+        onCancel={() => setNewOpen(false)}
+        onOk={() => form.submit()}
+        confirmLoading={busy}
+        okText="创建"
+        width={420}
+        destroyOnClose
+      >
+        <Form form={form} layout="vertical" onFinish={create} style={{ marginTop: 12 }}>
+          <Form.Item
+            name="name"
+            label="规格名"
+            rules={[
+              { required: true, message: "请输入名字" },
+              { pattern: /^[a-z][a-z0-9-]*$/, message: "小写字母开头，只含小写字母数字与 -" },
+            ]}
+          >
+            <Input placeholder="如 lab2" />
+          </Form.Item>
+          <Form.Item
+            name="copy_of"
+            label="从现有规格复制（可选）"
+            extra="选一份现有规格作为起点，改改就能用"
+          >
+            <Select
+              allowClear
+              placeholder="空白规格"
+              options={specs.map((s) => ({ value: s.name, label: `${s.name}.yaml` }))}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
+    </Drawer>
+  );
+}
+
+
 const PHASE_ORDER = [
   "bridge",
   "template",
@@ -99,6 +284,7 @@ export default function Editor() {
   const [snapshot, setSnapshot] = useState(false);
   // 服务端保存的那一份。null = 从未保存过（此时以内置样例为基准判断是否改动）
   const [saved, setSaved] = useState<string | null>(null);
+  const [specMgrOpen, setSpecMgrOpen] = useState(false);
   const stopRef = useRef<null | (() => void)>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
@@ -301,6 +487,13 @@ export default function Editor() {
           size="small"
           extra={
             <Space>
+              <Button
+                size="small"
+                icon={<UnorderedListOutlined />}
+                onClick={() => setSpecMgrOpen(true)}
+              >
+                规格管理
+              </Button>
               <Tooltip title="执行后为每台机器打快照">
                 <Space size={4}>
                   <Text type="secondary" style={{ fontSize: 12 }}>
@@ -470,6 +663,15 @@ export default function Editor() {
           )}
         </Card>
       </Col>
+
+      <SpecManager
+        open={specMgrOpen}
+        onClose={() => setSpecMgrOpen(false)}
+        current={specName}
+        onPick={setSpecName}
+        specs={specs.data?.specs ?? []}
+        onChanged={() => specs.refetch()}
+      />
     </Row>
   );
 }

@@ -154,7 +154,9 @@ async fn serve_with(cfg: Config, concurrency: usize) -> Result<(), Box<dyn std::
         println!("  只显示这一次，请立即保存");
         println!("────────────────────────────────────────");
     }
-    let password_hash = Arc::new(std::fs::read_to_string(&hash_path)?.trim().to_string());
+    let password_hash = Arc::new(std::sync::RwLock::new(
+        std::fs::read_to_string(&hash_path)?.trim().to_string(),
+    ));
 
     for d in [&cfg.paths.locks, &cfg.paths.tmp, &cfg.paths.specs] {
         let _ = std::fs::create_dir_all(d);
@@ -171,6 +173,7 @@ async fn serve_with(cfg: Config, concurrency: usize) -> Result<(), Box<dyn std::
         runner,
         secret,
         password_hash,
+        password_hash_path: hash_path,
         cfg: Arc::new(cfg),
         runs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         concurrency,

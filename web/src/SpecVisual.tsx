@@ -139,6 +139,10 @@ export default function SpecVisual({
   const [hostFor, setHostFor] = useState<string | null>(null);
   const [zoneForm] = Form.useForm();
   const [hostForm] = Form.useForm();
+  /** 草稿恢复提示：上次没保存成功的编辑还留在 localStorage 里 */
+  const [draftHint, setDraftHint] = useState(false);
+
+  const draftKey = `labyard-draft-${name}`;
 
   useEffect(() => {
     let alive = true;
@@ -147,9 +151,22 @@ export default function SpecVisual({
       .specModel(name)
       .then((r) => {
         if (!alive) return;
-        setModel((r.model ?? {}) as Model);
+        // 有草稿就恢复草稿——保存失败/误关页面不再白干。恢复与否都给提示。
+        const draft = localStorage.getItem(draftKey);
+        if (draft) {
+          try {
+            const parsed = JSON.parse(draft) as Model;
+            setModel(parsed);
+            setDirty(true);
+            setDraftHint(true);
+          } catch {
+            localStorage.removeItem(draftKey);
+            setModel((r.model ?? {}) as Model);
+          }
+        } else {
+          setModel((r.model ?? {}) as Model);
+        }
         setExists(r.exists);
-        setDirty(false);
         setErr(null);
       })
       .catch((e) => alive && setErr((e as Error).message))
@@ -162,14 +179,35 @@ export default function SpecVisual({
     return () => {
       alive = false;
     };
-  }, [name]);
+  }, [name, draftKey]);
 
   const zones = model?.zones ?? {};
   const zoneNames = Object.keys(zones);
 
   const patch = (fn: (m: Model) => Model) => {
-    setModel((prev) => fn(prev ?? {}));
+    setModel((prev) => {
+      const next = fn(prev ?? {});
+      // 每次编辑都暂存草稿：保存失败、误关标签页都能恢复
+      try {
+        localStorage.setItem(draftKey, JSON.stringify(next));
+      } catch {
+        // 存储满了之类的小事故不值得打断编辑
+      }
+      return next;
+    });
     setDirty(true);
+  };
+
+  const discardDraft = () => {
+    localStorage.removeItem(draftKey);
+    setDraftHint(false);
+    setDirty(false);
+    // 重新拉磁盘上的版本
+    setBusy(true);
+    api
+      .specModel(name)
+      .then((r) => setModel((r.model ?? {}) as Model))
+      .finally(() => setBusy(false));
   };
 
   const patchZone = (zn: string, p: Partial<ZoneM>) =>
@@ -214,12 +252,20 @@ export default function SpecVisual({
     setErr(null);
     try {
       const r = await api.putSpecModel(name, model);
+      localStorage.removeItem(draftKey);
+      setDraftHint(false);
       setDirty(false);
       setExists(true);
       message.success(`已保存 ${name}.yaml`);
       onSaved(r.yaml);
     } catch (e) {
-      setErr((e as Error).message);
+      // 保存失败不清 model：草稿还在 localStorage，编辑成果都在
+      const msg = (e as Error).message;
+      setErr(msg);
+      message.error({
+        content: `保存失败（内容未丢失，草稿已暂存）：${msg}`,
+        duration: 6,
+      });
     } finally {
       setBusy(false);
     }
@@ -233,7 +279,9 @@ export default function SpecVisual({
   const roleOf = (z: ZoneM) =>
     Object.values(z.hosts ?? {}).find((h) => h.role === "gateway") ?? null;
 
-  /** 全部规格里 role=monitor 的主机（zone:host），供"复用已有"下拉用 */
+  /** 全部规格里 role=monitor 的主机（zone:host），供"复用已有"下拉用。
+   * 本 zone 的"将新建"声明不能进这个列表——use 指向自己等于什么都没指，
+   * 会产生一个永远解析不过的规格（正是这个坑让用户白配了半天）。 */
   const monitorChoices = useMemo(() => {
     const out: { value: string; label: string }[] = [];
     for (const zn of zoneNames) {
@@ -248,6 +296,9 @@ export default function SpecVisual({
     }
     return out;
   }, [zones, zoneNames]);
+
+  /** 某个 zone 选"复用已有"时的候选：排除该 zone 自己的任何条目 */
+  const reuseChoices = (zn: string) => monitorChoices.filter((c) => !c.value.startsWith(`${zn}:`));
 
   // ── 下拉数据源 ──
   const templateOptions = (catalog?.templates ?? []).map((t) => ({
@@ -283,6 +334,30 @@ export default function SpecVisual({
         />
       )}
       {err && <Alert type="error" showIcon message={err} />}
+      {draftHint && dirty && (
+        <Alert
+          type="warning"
+          showIcon
+          message="检测到上次未保存成功的编辑，已自动恢复草稿"
+          description={
+            <Space size={8}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                确认无误后点「保存」写回；也可以丢弃草稿回到磁盘上的版本。
+              </Text>
+              <Button size="small" danger onClick={discardDraft}>
+                丢弃草稿
+              </Button>
+            </Space>
+          }
+        />
+      )}
+      {dirty && !draftHint && (
+        <Alert
+          type="warning"
+          showIcon
+          message="有未保存的修改（已自动暂存草稿，误关页面也能恢复）"
+        />
+      )}
 
       <Card
         size="small"
@@ -497,12 +572,18 @@ export default function SpecVisual({
                     value={monMode}
                     onChange={(e) => {
                       const v = e.target.value as "new" | "use";
-                      patchZone(zn, {
-                        monitor:
-                          v === "new"
-                            ? { name: mon?.name || "monitor", mgmt: mon?.mgmt, cores: mon?.cores, memory: mon?.memory, disk: mon?.disk }
-                            : { use: monitorChoices.find((c) => !c.value.startsWith(`${zn}:`))?.value ?? monitorChoices[0]?.value },
-                      });
+                      if (v === "new") {
+                        patchZone(zn, {
+                          monitor: { name: mon?.name || "monitor", mgmt: mon?.mgmt, cores: mon?.cores, memory: mon?.memory, disk: mon?.disk },
+                        });
+                      } else {
+                        const c = reuseChoices(zn)[0];
+                        if (!c) {
+                          message.warning("当前没有别的监控机可复用——请先在其它 zone 新建，或改选「新建一台」");
+                          return;
+                        }
+                        patchZone(zn, { monitor: { use: c.value } });
+                      }
                     }}
                     options={[
                       { value: "new", label: "新建一台" },
@@ -600,14 +681,22 @@ export default function SpecVisual({
                       </Col>
                     </Row>
                   ) : (
-                    <Field label="复用哪台监控机">
+                    <Field
+                      label="复用哪台监控机"
+                      hint={
+                        reuseChoices(zn).length === 0
+                          ? "当前没有其它 zone 的监控机可复用——先在别的 zone 新建一台，或改选「新建一台」"
+                          : undefined
+                      }
+                    >
                       <Select
                         size="small"
                         style={{ width: "100%", maxWidth: 360 }}
                         placeholder="选择已有的流量监控机"
                         value={mon?.use}
-                        options={monitorChoices}
+                        options={reuseChoices(zn)}
                         onChange={(v) => patchZone(zn, { monitor: { use: v } })}
+                        notFoundContent="没有可复用的监控机（本 zone 的新建声明不能选给自己）"
                       />
                     </Field>
                   )}

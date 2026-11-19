@@ -591,8 +591,8 @@ pub enum SpecError {
     MonitorBoth(String),
     #[error("zone `{0}` 的监控机 `{1}` 与已有主机重名——给它换个名字（monitor.name）")]
     MonitorNameConflict(String, String),
-    #[error("监控机 `{0}` 不存在（monitor.use 要写 `zone:host`）")]
-    MonitorUnknown(String),
+    #[error("监控机 `{0}` 不存在。可用的监控机：{1}。注意：`use` 只能指向 role 为 monitor 的主机或某个 zone 的新建声明（monitor.name）；不能引用本 zone 自己的新建声明，那等价于直接写 `name`")]
+    MonitorUnknown(String, String),
     #[error("监控机 `{0}` 有歧义：多个 zone 里都有这个主机名，请写成 zone:host")]
     MonitorAmbiguous(String),
     #[error("`{0}` 的 role 是 {1}，不是 monitor（流量监控）——不能当抓包目标")]
@@ -630,12 +630,12 @@ fn lookup_monitor(zones: &[ResolvedZone], r: &str) -> Result<(String, String), S
         let zz = zones
             .iter()
             .find(|x| x.name == z)
-            .ok_or_else(|| SpecError::MonitorUnknown(r.to_string()))?;
+            .ok_or_else(|| monitor_unknown(r, zones))?;
         let hh = zz
             .hosts
             .iter()
             .find(|x| x.name == h)
-            .ok_or_else(|| SpecError::MonitorUnknown(r.to_string()))?;
+            .ok_or_else(|| monitor_unknown(r, zones))?;
         (zz.name.clone(), hh.name.clone(), hh.role)
     } else {
         let hits: Vec<(&ResolvedZone, &ResolvedHost)> = zones
@@ -643,7 +643,7 @@ fn lookup_monitor(zones: &[ResolvedZone], r: &str) -> Result<(String, String), S
             .flat_map(|z| z.hosts.iter().filter(|h| h.name == r).map(move |h| (z, h)))
             .collect();
         match hits.len() {
-            0 => return Err(SpecError::MonitorUnknown(r.to_string())),
+            0 => return Err(monitor_unknown(r, zones)),
             1 => (
                 hits[0].0.name.clone(),
                 hits[0].1.name.clone(),
@@ -659,6 +659,28 @@ fn lookup_monitor(zones: &[ResolvedZone], r: &str) -> Result<(String, String), S
         ));
     }
     Ok((mz, mh))
+}
+
+/// "监控机不存在"的报错要把**现在到底有哪些**列出来——用户看到 `lab:monitor`
+/// 不存在时往往手里正攥着一台 monitor 名字的机器，不列清单他就以为系统瞎了。
+/// 清单来源：各 zone 里 role 为 monitor 的主机 + 新建声明（monitor.name）。
+fn monitor_unknown(r: &str, zones: &[ResolvedZone]) -> SpecError {
+    let mut found: Vec<String> = Vec::new();
+    for z in zones {
+        for h in &z.hosts {
+            if h.role == Role::Monitor {
+                found.push(format!("{}:{}", z.name, h.name));
+            }
+        }
+    }
+    SpecError::MonitorUnknown(
+        r.to_string(),
+        if found.is_empty() {
+            "（一台都没有——先在某台 zone 的 monitor 里新建或声明一台）".to_string()
+        } else {
+            found.join("、")
+        },
+    )
 }
 
 /// 单个 zone 的三层合并。抽成函数是因为"合成 zone"（监控机挂在外网）要
