@@ -162,12 +162,16 @@ RestartSec=3
 WorkingDirectory=/var/lib/labyard
 
 # 保宿主优先于保服务：内存到顶先杀自己。
-# 192M = 32M(scrypt 工作区) + 12M(常驻) + 页缓存/突发余量。
-# 曾经取 64M，真机上把 scrypt 的 32M 工作区挤进了 swap
-# （journal 里 swap peak 602M），跑几小时后登录开始回"密码错误"
-# （工作区分配失败 → verify 返 false），重启才恢复。SwapMax 兜住极端情况。
-MemoryMax=192M
-MemorySwapMax=256M
+#
+# 但账里不只有 labyard 自己：`pct` / `pvesh` 是 perl 进程，实测单个峰值
+# RSS 176 MB（charged 约 60–80 MB），而且是它的子进程，**同属这个 cgroup**。
+# 所以这里的上限要按"最大同时几个 pct"来算，不是按"常驻 12 MB × 2"：
+#   3 × 70（apply 批内并发 3）+ 12（常驻）+ 32（scrypt）+ 余量 ≈ 384 MB
+# 取 64M 那版在真机上的表现是：登录开始稳定回"密码错误"（scrypt 的 32 MB
+# 工作区分配不到，verify 返 false），而 doctor 并发四个 pvesh 则直接
+# oom-kill。SwapMax 给一点兜底，但不让热工作区整体换出。
+MemoryMax=384M
+MemorySwapMax=128M
 CPUQuota=50%
 IOWeight=50
 TasksMax=256

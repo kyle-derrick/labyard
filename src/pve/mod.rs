@@ -11,14 +11,50 @@
 //! 绝不在循环里 `pct config` —— `/etc/pve` 是单线程 FUSE，N+1 次读会把整个节点拖慢。
 
 use crate::core::runner::{CommandSpec, Output, RunError, Runner};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 pub struct Pve {
     runner: Arc<dyn Runner>,
     pub node: String,
+    /// `path + args` → (取到的时间, 有效期, 原始 JSON)。
+    ///
+    /// 为什么要缓存：`/etc/pve` 是单线程 FUSE，每次 `pvesh get` 都是 fork 一个
+    /// 进程 + 一次 FUSE 往返（实测 0.3–1.7 秒）。而**同一次页面刷新**里
+    /// `/api/hosts`、`/api/topology`、`/api/doctor` 问的是同一批东西，
+    /// 各跑一遍纯属浪费——真机上量出来的 1.0 秒、1.0 秒、6.7 秒全在这儿。
+    ///
+    /// 存 `Value` 而不是 `T`：`get_json` 是泛型的，缓存不能按类型分装。
+    cache: Mutex<HashMap<String, (Instant, Duration, serde_json::Value)>>,
+}
+
+/// 不同类型的读，新鲜度要求不一样。宁可短，也不要"看起来是新的"。
+///
+/// - 容器/VM 状态：8 秒。写操作（电源、apply、retire）之后会显式
+///   `clear_cache()`，所以"点了没反应"不会发生；而 8 秒能让拓扑页与主机页
+///   在同一次浏览里共用一次查询——这两个页面问的是同一份 `cluster/resources`。
+/// - 版本、节点、网桥：5 分钟。这些是改 PVE 配置才会变的东西。
+/// - 存储：2 分钟（可能会挂/卸存储，别太懒）。
+/// - 模板清单：5 分钟（`pveam` 要解析本地索引，是这堆读里最慢的一项）。
+///
+/// 每个 `pvesh` 都是 1 个 perl 进程、约 1 秒、charged 60–80 MB，所以缓存
+/// 不只是省时间，也是在少压 `/etc/pve` 这个单线程 FUSE。
+fn cache_ttl(path: &str) -> Duration {
+    if path.starts_with("/cluster/resources") {
+        Duration::from_secs(8)
+    } else if path.ends_with("/storage") {
+        Duration::from_secs(120)
+    } else if path == "/version" || path == "/nodes" || path.ends_with("/network") {
+        Duration::from_secs(300)
+    } else if path.ends_with("/aplinfo") {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(15)
+    }
 }
 
 /// `pvesh get /version`
@@ -151,16 +187,40 @@ impl Pve {
         Self {
             runner,
             node: node.into(),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 丢掉全部读缓存。写操作（建/删/关机）之后调一次，免得界面拿着
+    /// 4 秒前的状态说"还没变"。
+    pub fn clear_cache(&self) {
+        if let Ok(mut m) = self.cache.lock() {
+            m.clear();
         }
     }
 
     /// `pvesh get ... --output-format json`
-    async fn get_json<T: for<'de> Deserialize<'de>>(
+    async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
         extra: &[&str],
         cancel: &CancellationToken,
     ) -> Result<T, PveError> {
+        let key = format!("{path} {}", extra.join(" "));
+        // 锁不跨 await：命中判断在一段同步代码里做完，拿不到锁就当作没缓存
+        // （缓存坏了不该让请求失败）。
+        let hit = self.cache.lock().ok().and_then(|m| {
+            m.get(&key)
+                .filter(|(at, ttl, _)| at.elapsed() < *ttl)
+                .map(|(_, _, v)| v.clone())
+        });
+        if let Some(v) = hit {
+            return serde_json::from_value(v).map_err(|source| PveError::Json {
+                cmd: format!("pvesh get {path}"),
+                source,
+            });
+        }
+
         let mut args: Vec<String> = vec![
             "get".into(),
             path.into(),
@@ -171,7 +231,19 @@ impl Pve {
         let spec = CommandSpec::new("pvesh", args).with_timeout(Duration::from_secs(60));
         let out = self.runner.run("pvesh", &spec, None, cancel, true).await?;
         let text = out.stdout.trim();
-        serde_json::from_str(text).map_err(|source| PveError::Json {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|source| PveError::Json {
+                cmd: format!("pvesh get {path}"),
+                source,
+            })?;
+        if let Ok(mut m) = self.cache.lock() {
+            // 键空间是"路径 + 参数"，正常只有几十条；给个上限防病态增长
+            if m.len() >= 128 {
+                m.clear();
+            }
+            m.insert(key, (Instant::now(), cache_ttl(path), value.clone()));
+        }
+        serde_json::from_value(value).map_err(|source| PveError::Json {
             cmd: format!("pvesh get {path}"),
             source,
         })

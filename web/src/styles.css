@@ -244,38 +244,47 @@ body {
   background: #f59e0b;
 }
 
-/* 四种节点各一个底色，与图例对应 */
-.tn-wan {
+/* 网络节点：虚线紫框，与"主机"一眼分开 */
+.tn-net {
+  background: #faf5ff;
+  border: 1.5px dashed #a78bfa;
+}
+
+.tn-net-wan {
   background: #eef2ff;
-  border-color: #a5b4fc;
+  border-color: #8b5cf6;
 }
 
-.tn-zone {
-  background: #f0f7ff;
-  border-color: #93b8f7;
+/* 图里那个小圆点/方块：外网是圆的，内网是方的 */
+.tn-neticon {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #8b5cf6;
+  flex: none;
 }
 
-.tn-mirr {
-  background: #fffbeb;
-  border-color: #fbbf24;
-  border-style: dashed;
+.tn-neticon[data-external="0"] {
+  border-radius: 2px;
+  background: #a78bfa;
 }
 
-/* 主机按角色给左边框，一眼看出哪台是网关、哪台是分析机 */
+/* 主机按角色上色：网关绿、分析机蓝、靶机白（与用户心里的"网关/分析机"对应） */
 .tn-role-gateway {
-  border-left: 3px solid #2f6feb;
-}
-
-.tn-role-analysis {
-  border-left: 3px solid #d97706;
-}
-
-.tn-role-server {
+  background: #f0fdf4;
+  border-color: #86efac;
   border-left: 3px solid #16a34a;
 }
 
+.tn-role-analysis {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  border-left: 3px solid #2563eb;
+}
+
+.tn-role-server,
 .tn-role-client {
-  border-left: 3px solid #64748b;
+  background: #ffffff;
 }
 
 .tn-retired {
@@ -286,6 +295,56 @@ body {
 
 .tn-idle {
   opacity: 0.85;
+}
+
+/* 选中与"看某个分析机"时的淡化 */
+.tn-sel {
+  outline: 2px solid #2f6feb;
+  outline-offset: 1px;
+  box-shadow: 0 0 0 4px rgba(47, 111, 235, 0.12);
+}
+
+.tn-dim {
+  opacity: 0.26;
+}
+
+/* 右键菜单（自绘：react-flow 的节点右键要拦住默认菜单） */
+.ctx-menu {
+  position: fixed;
+  z-index: 1200;
+  min-width: 176px;
+  max-width: 300px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+  padding: 4px;
+  font-size: 13px;
+}
+
+.ctx-item {
+  padding: 6px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ctx-item:hover {
+  background: #f1f5f9;
+}
+
+.ctx-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
+}
+
+.ctx-title {
+  padding: 2px 10px 4px;
+  font-size: 11px;
+  color: #94a3b8;
 }
 
 /* 图例 */

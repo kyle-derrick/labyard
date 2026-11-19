@@ -176,6 +176,65 @@ pub async fn get_spec_named(
     })())
 }
 
+/// 结构化视图：给「可视化编排」用的 JSON 形态。
+///
+/// 为什么不把 YAML 丢给前端解析：解析规则（哪层是 zone、`{ role: gateway }`
+/// 这种简写、默认值从哪继承）只应该有一份，在后端。前端拿到的是
+/// `zones.<名字>.hosts[...]` 这种朴素结构。
+///
+/// 也不返回解析后的 `ResolvedSpec`：那份是**补全过默认值**的形态，拿它生成
+/// YAML 会把用户没写的字段全写出来，`v6: auto` 还会被展开成具体前缀。
+/// 所以这里给的是原文的 JSON 投影——没写的字段仍然不存在。
+pub async fn get_model(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    render((|| {
+        authed(&state, &headers)?;
+        let yaml = specs::read(&spec_dir(&state), &name).map_err(bad)?;
+        let Some(text) = yaml else {
+            return Ok(Json(serde_json::json!({
+                "exists": false, "model": null, "yaml": null, "name": name
+            })));
+        };
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).map_err(bad)?;
+        let model = serde_json::to_value(&v)
+            .map_err(|e| bad(format!("规格里有无法转成 JSON 的结构: {e}")))?;
+        Ok(Json(serde_json::json!({
+            "exists": true, "model": model, "yaml": text, "name": name
+        })))
+    })())
+}
+
+#[derive(Deserialize)]
+pub struct ModelBody {
+    pub model: serde_json::Value,
+}
+
+/// 可视化模式保存：JSON → YAML → 与手工粘贴走同一条校验 → 原子写。
+///
+/// 注释会丢（YAML 库不保留注释），所以响应里把生成的 YAML 一起返回，
+/// 前端可以立刻切到 YAML 模式看一眼。"丢注释"这件事在界面上也明说了。
+pub async fn put_model(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<ModelBody>,
+) -> Response {
+    render((|| {
+        authed(&state, &headers)?;
+        let v = serde_yaml_ng::to_value(&body.model).map_err(bad)?;
+        let text = serde_yaml_ng::to_string(&v).map_err(bad)?;
+        // 与 `/api/specs/{name}` 的 PUT 同一条路：先解析、再展开，
+        // 任何一处报错都不落盘。所以"图形化能存进去、应用却失败"不会发生。
+        let sp = Spec::parse(&text).map_err(bad)?;
+        sp.resolve_all(&state.cfg.pve.wan_bridge).map_err(bad)?;
+        specs::write(&spec_dir(&state), &name, &text).map_err(bad)?;
+        Ok(Json(serde_json::json!({ "ok": true, "yaml": text })))
+    })())
+}
+
 #[derive(Deserialize)]
 pub struct SpecBody {
     pub yaml: String,
@@ -927,6 +986,8 @@ async fn do_retire(
     host: String,
 ) -> ApiResult<Json<serde_json::Value>> {
     authed(&state, &headers)?;
+    // 起停容器会改状态，先清读缓存；失败路径也清，免得留着半截状态
+    state.pve.clear_cache();
     let (spec_name, cur) = locate_zone(&state, &zone)?;
     let sp = Spec::parse(&cur).map_err(|e| bad(e))?;
     let z = sp
@@ -1034,6 +1095,7 @@ async fn do_revive(
     host: String,
 ) -> ApiResult<Json<serde_json::Value>> {
     authed(&state, &headers)?;
+    state.pve.clear_cache();
     let (_, cur) = locate_zone(&state, &zone)?;
     let sp = Spec::parse(&cur).map_err(|e| bad(e))?;
     let z = sp

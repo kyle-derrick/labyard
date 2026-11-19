@@ -8,6 +8,7 @@ import {
   Col,
   Input,
   Row,
+  Segmented,
   Select,
   Space,
   Switch,
@@ -26,6 +27,7 @@ import {
 } from "@ant-design/icons";
 import { api, streamRun, type PreviewStep, type RunEvent } from "./api";
 import Topology, { type Zone } from "./Topology";
+import SpecVisual from "./SpecVisual";
 
 const { Text, Paragraph } = Typography;
 
@@ -82,6 +84,8 @@ const PHASE_ORDER = [
 export default function Editor() {
   const { message } = AntApp.useApp();
   const [specName, setSpecName] = useState("lab");
+  // 默认可视化：改结构不该先学 YAML。YAML 是"高级选项"，不是主路径。
+  const [mode, setMode] = useState<"visual" | "yaml">("visual");
   const [yaml, setYaml] = useState(SAMPLE);
   const [steps, setSteps] = useState<PreviewStep[]>([]);
   const [zones, setZones] = useState<unknown[]>([]);
@@ -256,6 +260,15 @@ export default function Editor() {
                       }]
                 }
               />
+              <Segmented
+                size="small"
+                value={mode}
+                onChange={(v) => setMode(v as "visual" | "yaml")}
+                options={[
+                  { value: "visual", label: "可视化" },
+                  { value: "yaml", label: "YAML" },
+                ]}
+              />
               {dirty ? (
                 <Tag color="orange" style={{ marginInlineEnd: 0 }}>
                   未保存
@@ -278,25 +291,38 @@ export default function Editor() {
                   <Switch size="small" checked={snapshot} onChange={setSnapshot} />
                 </Space>
               </Tooltip>
-              <Tooltip title="恢复到内置样例（不覆盖已保存的那份）">
-                <Button
-                  size="small"
-                  icon={<ReloadOutlined />}
-                  onClick={() => setYaml(SAMPLE)}
-                >
-                  重置
-                </Button>
-              </Tooltip>
+              {mode === "yaml" && (
+                <Tooltip title="恢复到内置样例（不覆盖已保存的那份）">
+                  <Button
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    onClick={() => setYaml(SAMPLE)}
+                  >
+                    重置
+                  </Button>
+                </Tooltip>
+              )}
             </Space>
           }
         >
-          <Input.TextArea
-            value={yaml}
-            onChange={(e) => setYaml(e.target.value)}
-            autoSize={{ minRows: 22, maxRows: 32 }}
-            style={{ fontFamily: "var(--mono)", fontSize: 12 }}
-            spellCheck={false}
-          />
+          {mode === "yaml" ? (
+            <Input.TextArea
+              value={yaml}
+              onChange={(e) => setYaml(e.target.value)}
+              autoSize={{ minRows: 22, maxRows: 32 }}
+              style={{ fontFamily: "var(--mono)", fontSize: 12 }}
+              spellCheck={false}
+            />
+          ) : (
+            <SpecVisual
+              name={specName}
+              onSaved={(y) => {
+                setYaml(y);
+                setSaved(y);
+                setErr(null);
+              }}
+            />
+          )}
           <Space style={{ marginTop: 12 }} wrap>
             <Button
               icon={<EyeOutlined />}

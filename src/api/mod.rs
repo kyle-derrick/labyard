@@ -80,6 +80,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .put(ops::put_spec_named)
                 .delete(ops::delete_spec),
         )
+        .route(
+            "/api/specs/{name}/model",
+            get(ops::get_model).put(ops::put_model),
+        )
         .route("/api/specs/{name}/zones", post(ops::add_zone))
         .route(
             "/api/specs/{name}/zones/{z}",
@@ -533,9 +537,12 @@ pub(crate) async fn spawn_plan(state: &Arc<AppState>, plan: &Plan, label: &str) 
                 let _ = btx2.send(ev);
             }
         });
-        let ex = Executor::new(pve, db.clone(), runner);
+        let ex = Executor::new(pve.clone(), db.clone(), runner);
         let summary = ex.execute(&plan, &rid, mtx, cancel.clone(), conc).await;
         let _ = fwd.await;
+        // 这一轮改过 PVE 状态，读缓存整体作废：否则用户点完"应用"切到拓扑，
+        // 4 秒内看到的还是旧图，会以为没生效。
+        pve.clear_cache();
         let final_status = if cancel.is_cancelled() {
             "cancelled"
         } else if summary.ok() {
@@ -705,7 +712,10 @@ async fn power(
     };
     let cancel = CancellationToken::new();
     match state.pve.ct_action(vmid, &req.action, &cancel).await {
-        Ok(()) => Json(serde_json::json!({"ok": true, "vmid": vmid})).into_response(),
+        Ok(()) => {
+            state.pve.clear_cache();
+            Json(serde_json::json!({"ok": true, "vmid": vmid})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1201,11 +1211,29 @@ struct DoctorItem {
 async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     require_auth!(state, headers);
     let cancel = CancellationToken::new();
+
+    // 这四件事互不依赖，但**不能并发**：`pvesh` 是 perl 进程，实测单个峰值
+    // RSS 176 MB，`pct` 也有 150 MB，而且它们与 labyard 同属一个 cgroup
+    // （systemd 的 MemoryMax 会一起算）。四个并发 = 700 MB，真机上直接
+    // 把服务 OOM 掉（`Failed with result 'oom-kill'`）。
+    //
+    // 所以这里串行，快的部分靠两件事补：`storages` 只取一次（以前问三遍），
+    // 以及 `get_json` 的读缓存（60 秒），第二次打开概览页是毫秒级。
+    let ver = state.pve.version(&cancel).await;
+    let nds = state.pve.nodes(&cancel).await;
+    let brs = state.pve.bridges(&cancel).await;
+    let sts = state.pve.storages(&cancel).await;
+
     let mut items = Vec::new();
 
-    match state.pve.version(&cancel).await {
+    match ver {
         Ok(v) => {
-            let major: u32 = v.version.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let major: u32 = v
+                .version
+                .split('.')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             items.push(DoctorItem {
                 name: "PVE 版本".into(),
                 ok: major >= 9,
@@ -1221,11 +1249,15 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 
     // 节点名写错是最难自查的一类失败：所有 `pct` 命令都还"能跑"，
     // 但会拿不到任何资源。这里直接对着 `/nodes` 核对，把名字列出来。
-    match state.pve.nodes(&cancel).await {
+    match nds {
         Ok(ns) => items.push(DoctorItem {
             name: "节点名".into(),
             ok: ns.iter().any(|n| n == &state.cfg.pve.node),
-            detail: format!("配置 `{}`；现有: {}", state.cfg.pve.node, ns.join(", ")),
+            detail: format!(
+                "配置 `{}`；现有: {}",
+                state.cfg.pve.node,
+                ns.join(", ")
+            ),
         }),
         Err(e) => items.push(DoctorItem {
             name: "节点名".into(),
@@ -1234,12 +1266,17 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         }),
     }
 
-    match state.pve.bridges(&cancel).await {        Ok(bs) => {
+    match brs {
+        Ok(bs) => {
             let names: Vec<&str> = bs.iter().map(|b| b.iface.as_str()).collect();
             items.push(DoctorItem {
                 name: "网桥".into(),
                 ok: names.contains(&state.cfg.pve.wan_bridge.as_str()),
-                detail: format!("现有: {}；wan 需要 {}", names.join(", "), state.cfg.pve.wan_bridge),
+                detail: format!(
+                    "现有: {}；wan 需要 {}",
+                    names.join(", "),
+                    state.cfg.pve.wan_bridge
+                ),
             });
         }
         Err(e) => items.push(DoctorItem {
@@ -1249,7 +1286,9 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         }),
     }
 
-    match state.pve.storages(&cancel).await {
+    // 存储的三件事（能不能放 rootfs / 能不能放模板 / 能不能快照）都从
+    // 同一次 `storages()` 结果里读。以前这三段各调一次 pvesh，同一个问题问三遍。
+    match sts {
         Ok(ss) => {
             let usable: Vec<String> = ss
                 .iter()
@@ -1265,20 +1304,10 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
                     usable.join(", ")
                 },
             });
-        }
-        Err(e) => items.push(DoctorItem {
-            name: "存储".into(),
-            ok: false,
-            detail: e.to_string(),
-        }),
-    }
 
-    // 模板（vztmpl）必须有可落地的存储。真机教训：rootfs 用 lvmthin 时
-    // `pveam download local-lvm` 直接 255——模板和 rootfs 是两种内容类型，
-    // 真实环境可能一体（dir/NFS）也可能分开（约定放 local），doctor 把
-    // 现状列出来，哪个存储能放模板一目了然。
-    match state.pve.storages(&cancel).await {
-        Ok(ss) => {
+            // 模板（vztmpl）必须有可落地的存储。真机教训：rootfs 用 lvmthin 时
+            // `pveam download local-lvm` 直接 255——模板和 rootfs 是两种内容类型，
+            // 真实环境可能一体（dir/NFS）也可能分开（约定放 local）。
             let tpl: Vec<String> = ss
                 .iter()
                 .filter(|s| s.supports("vztmpl"))
@@ -1290,21 +1319,15 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
                 detail: if tpl.is_empty() {
                     "没有支持 vztmpl 的存储——模板将无处下载，spec 里可用 template_storage 指定".into()
                 } else {
-                    format!("可放模板: {}；spec 默认跟随 rootfs 存储或用 template_storage 指定", tpl.join(", "))
+                    format!(
+                        "可放模板: {}；spec 默认跟随 rootfs 存储或用 template_storage 指定",
+                        tpl.join(", ")
+                    )
                 },
             });
-        }
-        Err(e) => items.push(DoctorItem {
-            name: "模板存储".into(),
-            ok: false,
-            detail: e.to_string(),
-        }),
-    }
 
-    // 快照能力单独列一条：厚 LVM 的 `pct snapshot` 会失败，而"执行时打快照"
-    // 是可选开关——用户勾了才发现不行，比事先知道要糟得多。
-    match state.pve.storages(&cancel).await {
-        Ok(ss) => {
+            // 快照能力单独列一条：厚 LVM 的 `pct snapshot` 会失败，而"执行时打快照"
+            // 是可选开关——用户勾了才发现不行，比事先知道要糟得多。
             let yes: Vec<&str> = ss
                 .iter()
                 .filter(|s| s.supports_snapshot())
@@ -1320,16 +1343,28 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
                 ok: !yes.is_empty(),
                 detail: format!(
                     "可快照: {}；不支持: {}",
-                    if yes.is_empty() { "无".into() } else { yes.join(", ") },
-                    if no.is_empty() { "无".into() } else { no.join(", ") }
+                    if yes.is_empty() {
+                        "无".to_string()
+                    } else {
+                        yes.join(", ")
+                    },
+                    if no.is_empty() {
+                        "无".to_string()
+                    } else {
+                        no.join(", ")
+                    }
                 ),
             });
         }
-        Err(e) => items.push(DoctorItem {
-            name: "快照能力".into(),
-            ok: false,
-            detail: e.to_string(),
-        }),
+        Err(e) => {
+            for name in ["存储", "模板存储", "快照能力"] {
+                items.push(DoctorItem {
+                    name: name.into(),
+                    ok: false,
+                    detail: format!("无法读取: {e}"),
+                });
+            }
+        }
     }
 
     // 本机命令是否都在
@@ -1383,6 +1418,10 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
         ("get", "读取指定规格"),
         ("put", "保存指定规格"),
         ("delete", "删除规格文件（不动 PVE 资源）"),
+    ]),
+    ("/api/specs/{name}/model", &[
+        ("get", "结构化视图（可视化编排的数据源）"),
+        ("put", "按结构化视图保存，生成 YAML 并校验"),
     ]),
     ("/api/specs/{name}/zones", &[("post", "新增一个 zone")]),
     ("/api/specs/{name}/zones/{z}", &[

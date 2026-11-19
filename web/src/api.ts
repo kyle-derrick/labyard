@@ -166,6 +166,18 @@ export const api = {
       { method: "DELETE" },
     ),
 
+  /** 结构化视图：可视化编排读它，保存也走它（后端负责 JSON ↔ YAML）。 */
+  specModel: (name: string) =>
+    req<{ exists: boolean; model: unknown; yaml: string | null; name: string }>(
+      `/api/specs/${encodeURIComponent(name)}/model`,
+    ),
+
+  putSpecModel: (name: string, model: unknown) =>
+    req<{ ok: boolean; yaml: string }>(
+      `/api/specs/${encodeURIComponent(name)}/model`,
+      { method: "PUT", body: JSON.stringify({ model }) },
+    ),
+
   // ── 拓扑 ──
   topology: (spec?: string) =>
     req<{ nodes: TopoNode[]; edges: TopoEdge[]; specs: string[] }>(
@@ -355,7 +367,8 @@ export type RetireResp = {
 
 export type TopoNode = {
   id: string;
-  kind: "wan" | "zone" | "host" | "mirr";
+  /** 只有两类：网络（外网 / 各 zone 的内网）与主机 */
+  kind: "network" | "host";
   label: string;
   zone: string | null;
   role: string | null;
@@ -369,8 +382,11 @@ export type TopoNode = {
 export type TopoEdge = {
   from: string;
   to: string;
-  kind: "uplink" | "member" | "mirror-port" | "mirror";
+  /** attach：谁插在谁上面（方向即数据流）；mirror：网段 → 分析机的虚线 */
+  kind: "attach" | "mirror";
   label: string | null;
+  /** attach 边的接口角色：uplink（接上层网络）| inner（接本 zone 内网） */
+  port: "uplink" | "inner" | null;
 };
 
 export type MirrorRow = {

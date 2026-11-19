@@ -297,7 +297,8 @@ function ZoneTable({
   });
 
   const nodes = q.data?.nodes ?? [];
-  const zones = nodes.filter((n) => n.kind === "zone");
+  // 拓扑里的 zone 现在是一个"内网"节点（外网单独一个节点，不算 zone）
+  const zones = nodes.filter((n) => n.kind === "network" && n.meta.external !== true);
   const hostCount = useMemo(() => {
     const m = new Map<string, number>();
     for (const n of nodes) {
@@ -348,9 +349,11 @@ function ZoneTable({
         columns={[
           {
             title: "zone",
-            dataIndex: "label",
+            dataIndex: "zone",
             width: 140,
-            render: (v: string) => <Text strong>{v}</Text>,
+            render: (_: unknown, r: TopoNode) => (
+              <Text strong>{r.zone ?? r.label}</Text>
+            ),
           },
           {
             title: "网段",

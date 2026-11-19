@@ -1,13 +1,16 @@
 /** 全局拓扑图：react-flow 只负责画，语义全在后端。
  *
- * 后端的 `/api/topology` 给的已经是"节点 + 边"（`zone:main`、`host:main:web`），
- * 这里不再解析 `uplink: main` 之类的东西，只做两件事：
- *   1. 用 dagre 算一遍层级布局（wan → zone → host，mirror 边单独拉一条虚线）
- *   2. 把 kind / role / retired / status 映射成颜色与线型
+ * 后端给的是两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
+ * 方向都是数据流方向。这里做三件事：
+ *   1. 用 dagre 算层级（外网 → 网关 → 内网 → 主机），只算一次
+ *   2. 把 kind / role / 状态映射成视觉
+ *   3. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单
  *
- * 布局是**一次性**算的：节点拖动只改位置，不改结构，不需要重排。
+ * **布局只在结构变化时重算**：轮询每 15 秒来一次数据，如果每次都重排，
+ * 用户刚拖好的位置会被抹掉、图会跳一下——这也是"用起来卡"的观感来源之一。
+ * 所以这里按"节点 id + 边集合"算一个结构签名，签名没变就只更新 data。
  */
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import {
   Background,
   BackgroundVariant,
@@ -29,17 +32,15 @@ import type { TopoEdge, TopoNode } from "./api";
 
 /** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。 */
 const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
-  wan: { w: 168, h: 52 },
-  zone: { w: 184, h: 66 },
-  host: { w: 208, h: 62 },
-  mirr: { w: 132, h: 48 },
+  network: { w: 190, h: 70 },
+  host: { w: 196, h: 62 },
 };
 
-const ROLE_LABEL: Record<string, string> = {
+export const ROLE_LABEL: Record<string, string> = {
   gateway: "网关",
   analysis: "分析机",
-  server: "靶机·服务",
-  client: "靶机·终端",
+  server: "靶机",
+  client: "靶机",
 };
 
 type Data = {
@@ -49,44 +50,43 @@ type Data = {
   ipv4: string | null;
   status: string | null;
   retired: boolean;
-  /** CT 号已经拼好（"CT 101"），节点里直接显示，不用再判空 */
   vmidLabel: string;
   meta: Record<string, unknown>;
+  /** 被选中 / 被"分析机高亮"淡化 */
+  selected: boolean;
+  dimmed: boolean;
 };
 
 type GNode = Node<Data, "lab">;
 
-/** 单个节点的卡片。用自定义节点而不是默认样式，因为要区分的维度太多。 */
 function LabNode({ data }: NodeProps<GNode>) {
   const dim = DIM[data.kind];
-  const cls = [
-    "tn",
-    `tn-${data.kind}`,
-    data.kind === "host" && data.role ? `tn-role-${data.role}` : "",
-    data.retired ? "tn-retired" : "",
-    data.kind === "host" && data.status !== "running" && !data.retired ? "tn-idle" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-
   const meta = data.meta as Record<string, unknown>;
   const m = (k: string) => (typeof meta[k] === "string" ? (meta[k] as string) : null);
   const flag = (k: string) => meta[k] === true;
+
+  const roleCls = data.kind === "host" && data.role ? `tn-role-${data.role}` : "";
+  const cls = [
+    "tn",
+    data.kind === "network" ? "tn-net" : "",
+    data.kind === "network" && flag("external") ? "tn-net-wan" : "",
+    roleCls,
+    data.retired ? "tn-retired" : "",
+    data.kind === "host" && data.status !== "running" && !data.retired ? "tn-idle" : "",
+    data.selected ? "tn-sel" : "",
+    data.dimmed ? "tn-dim" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <>
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
       <div className={cls} style={{ width: dim.w, height: dim.h }}>
-        {data.kind === "wan" && (
-          <>
-            <div className="tn-title">WAN</div>
-            <div className="tn-sub mono">{m("bridge")}</div>
-          </>
-        )}
-
-        {data.kind === "zone" && (
+        {data.kind === "network" && (
           <>
             <div className="tn-row">
+              <span className="tn-neticon" data-external={flag("external") ? "1" : "0"} />
               <span className="tn-title">{data.label}</span>
               <span className="tn-chips">
                 {flag("nat") && <span className="tn-chip chip-nat">NAT</span>}
@@ -99,8 +99,11 @@ function LabNode({ data }: NodeProps<GNode>) {
                 )}
               </span>
             </div>
-            <div className="tn-sub mono">{m("cidr")}</div>
-            <div className="tn-sub mono tn-faint">{m("bridge")}</div>
+            <div className="tn-sub mono">{m("cidr") ?? "—"}</div>
+            <div className="tn-sub tn-faint mono">
+              {m("bridge")}
+              {m("gateway_host") ? ` · 网关 ${m("gateway_host")}` : ""}
+            </div>
           </>
         )}
 
@@ -123,15 +126,8 @@ function LabNode({ data }: NodeProps<GNode>) {
             <div className="tn-sub tn-faint mono">
               {data.vmidLabel}
               {data.vmidLabel && data.retired ? " · " : ""}
-              {data.retired ? "已废弃" : m("provisioner") ?? ""}
+              {data.retired ? "已废弃" : ""}
             </div>
-          </>
-        )}
-
-        {data.kind === "mirr" && (
-          <>
-            <div className="tn-title mono">mirr</div>
-            <div className="tn-sub tn-faint">二层镜像桥</div>
           </>
         )}
       </div>
@@ -142,41 +138,50 @@ function LabNode({ data }: NodeProps<GNode>) {
 
 const nodeTypes = { lab: LabNode };
 
-/** 边的画法：uplink 实线蓝、member 细灰、mirror 虚线琥珀、mirror-port 短虚线。 */
-function edgeSpec(e: TopoEdge): Partial<Edge> {
-  const label = e.label ?? undefined;
-  switch (e.kind) {
-    case "uplink":
-      return {
-        style: { stroke: "#2f6feb", strokeWidth: 1.8 },
-        label,
-        labelStyle: { fontSize: 11, fill: "#2f6feb" },
-        labelBgStyle: { fill: "#ffffff", fillOpacity: 0.85 },
-        markerEnd: { type: MarkerType.ArrowClosed, color: "#2f6feb", width: 16, height: 16 },
-      };
-    case "member":
-      return {
-        style: { stroke: "#c8d2e0", strokeWidth: 1.2 },
-        markerEnd: { type: MarkerType.Arrow, color: "#c8d2e0", width: 12, height: 12 },
-      };
-    case "mirror-port":
-      return { style: { stroke: "#d97706", strokeWidth: 1.2, strokeDasharray: "3 3" } };
-    case "mirror":
-    default:
-      return {
-        style: { stroke: "#d97706", strokeWidth: 2, strokeDasharray: "6 4" },
-        label,
-        labelStyle: { fontSize: 11, fill: "#b45309" },
-        labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.9 },
-        markerEnd: { type: MarkerType.ArrowClosed, color: "#d97706", width: 16, height: 16 },
-        animated: false,
-      };
+/** 边的画法：attach 细灰实线（网关的上联口加粗成蓝），mirror 半透明虚线。 */
+function edgeSpec(e: TopoEdge, hot: boolean): Partial<Edge> {
+  if (e.kind === "mirror") {
+    return {
+      style: {
+        stroke: "#f59e0b",
+        strokeWidth: hot ? 2.2 : 1.4,
+        strokeDasharray: "5 4",
+        opacity: hot ? 1 : 0.45,
+      },
+      label: e.label ?? undefined,
+      labelStyle: { fontSize: 10.5, fill: "#b45309", opacity: hot ? 1 : 0.7 },
+      labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.92 },
+      labelBgPadding: [4, 2] as [number, number],
+      labelBgBorderRadius: 4,
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color: "#f59e0b",
+        width: 14,
+        height: 14,
+      },
+      zIndex: hot ? 10 : 0,
+    };
   }
+  // attach：上联口（数据从外网进来那一段）画粗一点，其余细灰
+  const uplink = e.port === "uplink";
+  const color = uplink ? "#2f6feb" : "#b9c4d4";
+  return {
+    style: { stroke: color, strokeWidth: uplink ? 1.8 : 1.2 },
+    markerEnd: uplink
+      ? { type: MarkerType.ArrowClosed, color, width: 14, height: 14 }
+      : undefined,
+  };
 }
 
-function build(nodes: TopoNode[], edges: TopoEdge[]): { nodes: GNode[]; edges: Edge[] } {
+function build(
+  nodes: TopoNode[],
+  edges: TopoEdge[],
+  selected: Set<string>,
+  hotMirror: Set<string>,
+  dimmed: Set<string>,
+): { nodes: GNode[]; edges: Edge[] } {
   const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: "LR", nodesep: 26, ranksep: 104, marginx: 24, marginy: 24 });
+  g.setGraph({ rankdir: "LR", nodesep: 30, ranksep: 112, marginx: 24, marginy: 24 });
   g.setDefaultEdgeLabel(() => ({}));
 
   // 跨规格同名的 zone 会撞 id（后端一套 key 空间），这里按先出现的留下
@@ -209,9 +214,10 @@ function build(nodes: TopoNode[], edges: TopoEdge[]): { nodes: GNode[]; edges: E
         status: n.status,
         retired: n.retired,
         vmidLabel: n.vmid ? `CT ${n.vmid}` : "",
-        meta: n.meta,
+        meta: n.meta as Record<string, unknown>,
+        selected: selected.has(n.id),
+        dimmed: dimmed.has(n.id),
       },
-      // 尺寸交给自定义节点自己定，这里给 dagre 用的值即可
       width: d.w,
       height: d.h,
     });
@@ -219,13 +225,16 @@ function build(nodes: TopoNode[], edges: TopoEdge[]): { nodes: GNode[]; edges: E
 
   const rfEdges: Edge[] = edges
     .filter((e) => uniq.has(e.from) && uniq.has(e.to) && e.from !== e.to)
-    .map((e, i) => ({
-      id: `${e.kind}:${e.from}->${e.to}:${i}`,
-      source: e.from,
-      target: e.to,
-      type: "smoothstep",
-      ...edgeSpec(e),
-    }));
+    .map((e, i) => {
+      const id = `${e.kind}:${e.from}->${e.to}:${i}`;
+      return {
+        id,
+        source: e.from,
+        target: e.to,
+        type: "smoothstep",
+        ...edgeSpec(e, hotMirror.has(id)),
+      };
+    });
 
   return { nodes: rfNodes, edges: rfEdges };
 }
@@ -233,22 +242,83 @@ function build(nodes: TopoNode[], edges: TopoEdge[]): { nodes: GNode[]; edges: E
 export default function TopologyGraph({
   nodes,
   edges,
+  selected = [],
+  focus,
   onPick,
+  onSelect,
+  onContextMenu,
 }: {
   nodes: TopoNode[];
   edges: TopoEdge[];
+  selected?: string[];
+  /** 当前"正在看"的分析机 id：它的镜像虚线高亮，其余淡化 */
+  focus?: string | null;
   onPick?: (n: TopoNode | null) => void;
+  onSelect?: (ids: string[]) => void;
+  onContextMenu?: (e: React.MouseEvent, n: TopoNode | null) => void;
 }) {
-  const built = useMemo(() => build(nodes, edges), [nodes, edges]);
+  const sel = useMemo(() => new Set(selected), [selected]);
+
+  // focus（分析机）→ 它接的镜像边 + 相关网络，其余淡化
+  const hotMirror = useMemo(() => {
+    const s = new Set<string>();
+    if (!focus) return s;
+    edges.forEach((e, i) => {
+      if (e.kind === "mirror" && e.to === focus) s.add(`${e.kind}:${e.from}->${e.to}:${i}`);
+    });
+    return s;
+  }, [edges, focus]);
+
+  const dimmed = useMemo(() => {
+    if (!focus) return new Set<string>();
+    const keep = new Set<string>([focus]);
+    edges
+      .filter((e) => e.kind === "mirror" && e.to === focus)
+      .forEach((e) => keep.add(e.from));
+    const out = new Set<string>();
+    nodes.forEach((n) => {
+      if (!keep.has(n.id)) out.add(n.id);
+    });
+    return out;
+  }, [edges, nodes, focus]);
+
+  const built = useMemo(
+    () => build(nodes, edges, sel, hotMirror, dimmed),
+    [nodes, edges, sel, hotMirror, dimmed],
+  );
+
+  // 结构签名：id 与边集合不变时，只换 data，保留用户拖出来的位置
+  const structKey = useMemo(() => {
+    const nk = nodes.map((n) => n.id).sort().join(",");
+    const ek = edges.map((e) => `${e.kind}:${e.from}>${e.to}`).sort().join(",");
+    return `${nk}#${ek}`;
+  }, [nodes, edges]);
+
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode>(built.nodes);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>(built.edges);
+  const lastKey = useRef("");
 
-  // 数据变了就整体换掉（id 稳定，用户拖过的位置会丢——可以接受，
-  // 反正结构变了的图本来就该重排）
   useEffect(() => {
+    if (lastKey.current === structKey) {
+      // 同结构：只更新节点 data 与边样式，位置沿用当前值
+      setRfNodes((prev) =>
+        prev.map((p) => {
+          const b = built.nodes.find((x) => x.id === p.id);
+          return b ? { ...p, data: b.data } : p;
+        }),
+      );
+      setRfEdges(built.edges);
+      return;
+    }
+    lastKey.current = structKey;
     setRfNodes(built.nodes);
     setRfEdges(built.edges);
-  }, [built, setRfNodes, setRfEdges]);
+  }, [built, structKey, setRfNodes, setRfEdges]);
+
+  const pick = (id: string | undefined) => {
+    const orig = id ? (nodes.find((x) => x.id === id) ?? null) : null;
+    onPick?.(orig);
+  };
 
   return (
     <div className="topo-canvas">
@@ -258,17 +328,30 @@ export default function TopologyGraph({
         nodeTypes={nodeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onSelectionChange={({ nodes: ns }) => onSelect?.(ns.map((n) => n.id))}
+        // 普通拖动 = 平移画布，Shift + 拖动 = 框选。反过来的话（拖拽即框选）
+        // 会让人以为图卡住了：想挪一下视野，结果拉出一个选框。
+        selectionOnDrag={false}
+        selectionKeyCode="Shift"
+        multiSelectionKeyCode={["Meta", "Control"]}
+        deleteKeyCode={null}
         fitView
-        fitViewOptions={{ padding: 0.18 }}
-        minZoom={0.2}
+        fitViewOptions={{ padding: 0.16 }}
+        minZoom={0.15}
         maxZoom={1.6}
         nodesConnectable={false}
         edgesFocusable={false}
-        onNodeClick={(_, n) => {
+        onNodeClick={(_, n) => pick(n.id)}
+        onPaneClick={() => pick(undefined)}
+        onNodeContextMenu={(ev, n) => {
+          ev.preventDefault();
           const orig = nodes.find((x) => x.id === n.id) ?? null;
-          onPick?.(orig);
+          onContextMenu?.(ev, orig);
         }}
-        onPaneClick={() => onPick?.(null)}
+        onPaneContextMenu={(ev) => {
+          ev.preventDefault();
+          onContextMenu?.(ev as React.MouseEvent, null);
+        }}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dbe1ea" />
@@ -277,14 +360,11 @@ export default function TopologyGraph({
           pannable
           zoomable
           nodeColor={(n) => {
-            const k = (n.data as Data)?.kind;
-            return k === "wan"
-              ? "#a5b4fc"
-              : k === "zone"
-                ? "#93b8f7"
-                : k === "mirr"
-                  ? "#fbbf24"
-                  : "#e2e8f0";
+            const d = n.data as Data;
+            if (d?.kind === "network") return d.meta?.external ? "#a5b4fc" : "#ddd6fe";
+            if (d?.role === "gateway") return "#bbf7d0";
+            if (d?.role === "analysis") return "#bfdbfe";
+            return "#e2e8f0";
           }}
           maskColor="rgba(245,246,248,0.72)"
           style={{ background: "#ffffff", border: "1px solid var(--border)" }}
