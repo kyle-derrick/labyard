@@ -409,15 +409,29 @@ else
   ip link set {name} up
   echo "created {name}"
 fi
-# 宿主管理地址：Web 终端与调试从宿主 L2 直达容器，不经网关转发，
-# 所以网关的入向丢弃规则对这些流量不生效（isolation 语义不变。
-# mirr 是纯二层桥，mgmt 为空时跳过）
+# 宿主管理地址：Web 终端与调试从宿主 L2 直达容器，不经网关转发，所以
+# 网关的入向丢弃规则对这些流量不生效（isolation 语义不变。mirr 是纯二层
+# 桥，mgmt 为空时跳过）。replace 保证漂移自愈。
 if [ -n "{mgmt_ip}" ]; then
   ip addr replace {mgmt_ip} dev {name}
 fi
-# 持久化（PVE 9 用 /etc/network/interfaces，追加式，重复执行不重复写）
+# 持久化（PVE 9 用 /etc/network/interfaces，追加式，重复执行不重复写）。
+# 管理地址不能只写在内核里：宿主重启或 networking 刷新一次就没了，而
+# bridge 步骤因为"已完成且参数未变"不会再跑，症状是"终端 502、宿主
+# ping 不通容器"。所以地址必须落成接口块里的 `up` 行，开机即恢复。
 if ! grep -q "^iface {name} " /etc/network/interfaces 2>/dev/null; then
-  cat >> /etc/network/interfaces <<EOF
+  if [ -n "{mgmt_ip}" ]; then
+    cat >> /etc/network/interfaces <<EOF
+
+auto {name}
+iface {name} inet manual
+	bridge-ports
+	bridge-stp off
+	bridge-fd 0
+	up ip addr replace {mgmt_ip} dev {name}
+EOF
+  else
+    cat >> /etc/network/interfaces <<EOF
 
 auto {name}
 iface {name} inet manual
@@ -425,7 +439,19 @@ iface {name} inet manual
 	bridge-stp off
 	bridge-fd 0
 EOF
+  fi
   echo "persisted {name}"
+elif [ -n "{mgmt_ip}" ] && ! grep -q "up ip addr replace {mgmt_ip} dev {name}" /etc/network/interfaces; then
+  # 老格式迁移：块已存在但没有地址恢复行——插到块内 bridge-fd 之后。
+  # 用 awk 而不是 sed：网段里有 /（10.77.0.254/24），sed 的 s/// 分隔符
+  # 会被它打断；awk 的替换文本走 -v 变量，没有分隔符问题。
+  awk -v up="\tup ip addr replace {mgmt_ip} dev {name}" '
+    !done && $0 == "iface {name} inet manual" {{ blk = 1; print; next }}
+    blk && $0 == "\tbridge-fd 0" {{ print; print up; blk = 0; done = 1; next }}
+    {{ print }}
+  ' /etc/network/interfaces > /etc/network/interfaces.labyard.tmp \
+    && mv /etc/network/interfaces.labyard.tmp /etc/network/interfaces
+  echo "migrated {name} mgmt address"
 fi
 "#
         );
@@ -469,6 +495,36 @@ fi
         Ok(())
     }
 
+    /// 容器现有的网卡槽位（`net0`、`net1`……）。
+    ///
+    /// 只在"更新一台已有容器"时调用：网卡列表变短了（比如监控机不再抓某个
+    /// 网络的流量），多出来的 `netN` 必须删掉——`pct set` 不传就等于保留，
+    /// 于是容器里会留着一块谁都不认的网卡，镜像脚本还在往上灌流量。
+    pub async fn ct_nets(&self, vmid: u32, cancel: &CancellationToken) -> Result<Vec<u32>, PveError> {
+        let out = self
+            .runner
+            .run(
+                &format!("ct-config:{vmid}"),
+                &CommandSpec::new("pct", vec!["config".into(), vmid.to_string()])
+                    .with_timeout(Duration::from_secs(20)),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                // `net0: name=eth0,bridge=lablab,hwaddr=...`
+                let l = l.trim_start();
+                let rest = l.strip_prefix("net")?;
+                let (idx, _) = rest.split_once(':')?;
+                idx.parse::<u32>().ok()
+            })
+            .collect())
+    }
+
     /// 建 CT。已存在则改为 `pct set` 更新配置（幂等的关键）。
     ///
     /// 三件事必须在这里做掉，否则后面的步骤全是空转：
@@ -476,6 +532,12 @@ fi
     /// 2. 网关要有第二块网卡 `eth1` 上联，否则网关脚本里的 `ip link set eth1 up` 直接失败
     /// 3. 内网口用 `ip=manual`——内网桥上没有 DHCP 服务，写 `ip=dhcp` 只会白白等超时，
     ///    地址由后面的 net 步骤静态配
+    ///
+    /// 网卡布局（顺序即 eth 编号）：
+    /// - `eth0`：所在 zone 的桥（外网 zone 是 wan 桥，且 `ip=dhcp`）
+    /// - `eth1`：只有网关有，上联网桥
+    /// - `eth1..N`：监控机的抓包口，一个被监控网络一块（与解析层给的
+    ///   `ResolvedMirror::to_iface` 严格同序，测试里有断言）
     #[allow(clippy::too_many_arguments)]
     pub async fn ensure_ct(
         &self,
@@ -488,7 +550,8 @@ fi
         template_vol: &str,
         bridge: &str,
         uplink_bridge: Option<&str>,
-        mirr_bridge: Option<&str>,
+        capture_bridges: &[String],
+        dhcp: bool,
         password: Option<&str>,
         ssh_keys: &[String],
         cancel: &CancellationToken,
@@ -498,6 +561,22 @@ fi
             .await?
             .into_iter()
             .find(|r| r.is_lxc() && r.vmid_parsed() == Some(vmid));
+
+        // 期望的网卡列表：顺序即 eth 编号，建机与改机共用一份，避免两条路径
+        // 各写一遍而慢慢漂开。
+        let mut nets: Vec<(String, String, &'static str)> = Vec::new();
+        let mgmt_ip = if dhcp { "dhcp" } else { "manual" };
+        nets.push(("eth0".into(), bridge.to_string(), mgmt_ip));
+        if let Some(up) = uplink_bridge {
+            nets.push(("eth1".into(), up.to_string(), "dhcp"));
+        }
+        for b in capture_bridges {
+            nets.push((
+                format!("eth{}", nets.len()),
+                b.clone(),
+                "manual",
+            ));
+        }
 
         match existing {
             None => {
@@ -513,8 +592,6 @@ fi
                     memory.to_string(),
                     "--rootfs".into(),
                     format!("{storage}:{disk}"),
-                    "--net0".into(),
-                    format!("name=eth0,bridge={bridge},ip=manual,type=veth"),
                     "--unprivileged".into(),
                     "1".into(),
                     "--features".into(),
@@ -524,15 +601,9 @@ fi
                     "--start".into(),
                     "1".into(),
                 ];
-                if let Some(up) = uplink_bridge {
-                    args.push("--net1".into());
-                    // 上联网卡走 DHCP：wan 桥通常有 DHCP，或用户自己配好再改
-                    args.push(format!("name=eth1,bridge={up},ip=dhcp,type=veth"));
-                }
-                if let Some(mirr) = mirr_bridge {
-                    // analysis 的抓包口：纯二层、无 IP（ip=manual 不配地址）
-                    args.push("--net2".into());
-                    args.push(format!("name=eth2,bridge={mirr},ip=manual,type=veth"));
+                for (i, (name, br, ip)) in nets.iter().enumerate() {
+                    args.push(format!("--net{i}"));
+                    args.push(format!("name={name},bridge={br},ip={ip},type=veth"));
                 }
                 if let Some(p) = password {
                     args.push("--password".into());
@@ -555,14 +626,16 @@ fi
                 args.extend(["--cores".into(), cores.to_string()]);
                 args.extend(["--memory".into(), memory.to_string()]);
                 args.extend(["--hostname".into(), hostname.into()]);
-                if let Some(up) = uplink_bridge {
-                    // 老容器可能是上一版建的，只有一块网卡——补上而不是重建
-                    args.push("--net1".into());
-                    args.push(format!("name=eth1,bridge={up},ip=dhcp,type=veth"));
+                for (i, (name, br, ip)) in nets.iter().enumerate() {
+                    args.push(format!("--net{i}"));
+                    args.push(format!("name={name},bridge={br},ip={ip},type=veth"));
                 }
-                if let Some(mirr) = mirr_bridge {
-                    args.push("--net2".into());
-                    args.push(format!("name=eth2,bridge={mirr},ip=manual,type=veth"));
+                // 多出来的网卡删掉。改短（监控机少抓一个网络）时不做这一步，
+                // 容器里会留一块仍然挂着旧抓包桥的口，而平台上已经看不见它。
+                let have = self.ct_nets(vmid, cancel).await.unwrap_or_default();
+                for i in have.iter().filter(|i| (**i as usize) >= nets.len()) {
+                    args.push("--delete".into());
+                    args.push(format!("net{i}"));
                 }
                 self.cmd(
                     "ct-update",

@@ -109,9 +109,9 @@ pub fn nft_script(p: &Policy) -> String {
     if p.nat {
         if !p.pubs.is_empty() {
             // 映射进来的连接要再 SNAT 一次（源改成网关的内网地址）。
-            // 靶机**没有默认路由**，只有 on-link 的 zone 网段——不 SNAT 的话
+            // 内网主机**没有默认路由**，只有 on-link 的 zone 网段——不 SNAT 的话
             // 它的 SYN-ACK 发不出去，端口映射永远连不上。这一条是实测撞出来的：
-            // DNAT 抓包能看到包到了靶机，但对面一个字节都不回。
+            // DNAT 抓包能看到包到了目标主机，但对面一个字节都不回。
             s.push_str(&format!("    oifname \"{}\" ct status dnat masquerade\n", p.lan));
         }
         s.push_str(&format!(
@@ -379,7 +379,7 @@ mod tests {
         );
         assert!(
             s.contains("oifname \"eth0\" ct status dnat masquerade"),
-            "映射到靶机时必须 SNAT 回网关：靶机没有默认路由，不回程就永远连不上"
+            "映射到内网主机时必须 SNAT 回网关：内网主机没有默认路由，不回程就永远连不上"
         );
     }
 

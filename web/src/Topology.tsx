@@ -6,7 +6,7 @@ const { Text } = Typography;
 /** 与后端 `ResolvedZone` 对应的最小类型。 */
 export type Host = {
   name: string;
-  role: "gateway" | "analysis" | "server" | "client";
+  role: "gateway" | "monitor" | "server" | "client";
   vmid: number | null;
   cores: number;
   memory: number;
@@ -29,9 +29,9 @@ export type Zone = {
 
 const ROLE_LABEL: Record<Host["role"], string> = {
   gateway: "网关",
-  analysis: "分析",
-  server: "靶机·服务",
-  client: "靶机·终端",
+  monitor: "监控",
+  server: "服务主机",
+  client: "终端主机",
 };
 
 export default function Topology({ zones }: { zones: Zone[] }) {

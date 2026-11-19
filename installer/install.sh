@@ -165,13 +165,17 @@ WorkingDirectory=/var/lib/labyard
 #
 # 但账里不只有 labyard 自己：`pct` / `pvesh` 是 perl 进程，实测单个峰值
 # RSS 176 MB（charged 约 60–80 MB），而且是它的子进程，**同属这个 cgroup**。
-# 所以这里的上限要按"最大同时几个 pct"来算，不是按"常驻 12 MB × 2"：
-#   3 × 70（apply 批内并发 3）+ 12（常驻）+ 32（scrypt）+ 余量 ≈ 384 MB
-# 取 64M 那版在真机上的表现是：登录开始稳定回"密码错误"（scrypt 的 32 MB
-# 工作区分配不到，verify 返 false），而 doctor 并发四个 pvesh 则直接
-# oom-kill。SwapMax 给一点兜底，但不让热工作区整体换出。
-MemoryMax=384M
-MemorySwapMax=128M
+# 所以这里的上限要按"最大同时几个 pvesh"来算，不是按"常驻 12 MB × 2"：
+# 最坏情况是静态可算的（run 闸已把 run 串行化，见 spawn_plan）：
+#   3 × 176（一个 run 批内并发 3 个 pct exec，单个实测峰值 150–176 MB）
+#   + 176（run 执行期间，一次 preview 的快照 pvesh 叠上来）
+#   + 60（常驻与峰值 HWM）+ 32（scrypt）+ 余量 ≈ 1 GB
+# 768M 那版在真机上的表现是：两个 run 并发（run 闸加入前）直接 oom-kill，
+# 768M + 192M swap 全部吃满——那是 run 未串行的账；run 闸加入后按上面的
+# 最坏账给 1G。宿主有 12 GB 内存，这个护栏只防失控，不防正常使用。
+# SwapMax 给一点兜底，但不让热工作区整体换出。
+MemoryMax=1G
+MemorySwapMax=192M
 CPUQuota=50%
 IOWeight=50
 TasksMax=256

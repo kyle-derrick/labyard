@@ -18,6 +18,16 @@ export type PreviewStep = {
   phase: string;
   input_hash: string;
   zone: string;
+  /** create=会新建 update=会更新 skip=已完成且参数未变，跳过 */
+  action?: "create" | "update" | "skip";
+  reason?: string;
+};
+
+/** 资源目录（/api/catalog）：可视化编排下拉的数据源。 */
+export type Catalog = {
+  template_storages: { storage: string; kind: string }[];
+  disk_storages: { storage: string; kind: string; avail: number | null; total: number | null }[];
+  templates: { storage: string; volid: string; label: string }[];
 };
 
 export type PreviewResp = {
@@ -98,6 +108,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ yaml, snapshot }),
     }),
+
+  /** 可用模板与存储：编排页的下拉数据源。 */
+  catalog: () => req<Catalog>("/api/catalog"),
 
   apply: (yaml: string, snapshot = false) =>
     req<{ run_id: string }>("/api/apply", {
@@ -210,6 +223,13 @@ export const api = {
     req<{ ok: boolean; run_id: string }>(
       `/api/zones/${encodeURIComponent(zone)}/gateway/vpn`,
       { method: "POST", body: JSON.stringify({ proto, action }) },
+    ),
+
+  /** 整网流量监控开关（拓扑页右键用）。 */
+  setMonitor: (zone: string, on: boolean, opts?: { name?: string; mgmt?: string; use?: string }) =>
+    req<{ ok: boolean; run_id: string | null }>(
+      `/api/zones/${encodeURIComponent(zone)}/monitor`,
+      { method: "POST", body: JSON.stringify({ on, ...opts }) },
     ),
 
   // ── 镜像连线 ──
@@ -382,11 +402,16 @@ export type TopoNode = {
 export type TopoEdge = {
   from: string;
   to: string;
-  /** attach：谁插在谁上面（方向即数据流）；mirror：网段 → 分析机的虚线 */
+  /** attach：谁插在谁上面（方向即数据流）；mirror：主机网口 → 监控机的单向虚线 */
   kind: "attach" | "mirror";
   label: string | null;
-  /** attach 边的接口角色：uplink（接上层网络）| inner（接本 zone 内网） */
-  port: "uplink" | "inner" | null;
+  /** attach 边的接口角色：uplink（接上层网络）| inner（接本 zone 内网）| mgmt（挂外网桥） */
+  port: "uplink" | "inner" | "mgmt" | null;
+  /** mirror 边：源主机的采集口（eth0）与监控机的抓包口（eth1…） */
+  source_iface?: string;
+  target_iface?: string;
+  /** mirror 边落到的两层抓包桥 */
+  capture_bridge?: string;
 };
 
 export type MirrorRow = {
@@ -394,6 +419,9 @@ export type MirrorRow = {
   from: string;
   to: string;
   src_bridge: string;
+  capture_bridge?: string;
+  source_iface?: string;
+  target_iface?: string;
 };
 
 /** VPN 客户端配置的下载地址（后端现读容器里的私钥现拼，平台不存副本）。 */

@@ -1,8 +1,8 @@
 /** 拓扑页：一张图看完整环境，点节点直接改。
  *
  * 设计上只有一件事要守住：**图是入口，不是截图**。看到网关的"出网"是关的，
- * 就在这张图上打开；看到某台机停了，就在这里起来；想把三台靶机的流量交给
- * 分析机，就框选三台然后右键。改结构（加 zone、加主机）仍然要去「编排」，
+ * 就在这张图上打开；看到某台机停了，就在这里起来；想把几台主机的流量交给
+ * 监控机，就框选然后右键。改结构（加 zone、加主机）仍然要去「编排」，
  * 因为那是在改文件，不是在改运行态。
  *
  * 镜像的添加入口从底部的表单挪到了右键菜单：底部表单只解决了"加一条"，
@@ -79,7 +79,7 @@ export default function TopologyPage() {
   const rows = mirrors.data?.mirrors ?? [];
 
   const hosts = useMemo(() => nodes.filter((n) => n.kind === "host"), [nodes]);
-  const analyses = useMemo(() => hosts.filter((n) => n.role === "analysis"), [hosts]);
+  const monitors = useMemo(() => hosts.filter((n) => n.role === "monitor"), [hosts]);
   /** 网关面板：只有打开网络节点的抽屉时才查，避免每次进页面都打一次 pvesh */
   const pickedZone = picked?.kind === "network" && picked.zone ? picked.zone : null;
   const gw = useQuery({
@@ -89,12 +89,12 @@ export default function TopologyPage() {
     retry: 0,
   });
 
-  /** 当前在多选里的主机（排除分析机自身：它不能抓自己） */
+  /** 当前在多选里的主机（排除监控机自身：它不能抓自己） */
   const selectedHosts = useMemo(
     () =>
       selected
         .map((id) => nodes.find((n) => n.id === id))
-        .filter((n): n is TopoNode => !!n && n.kind === "host" && n.role !== "analysis"),
+        .filter((n): n is TopoNode => !!n && n.kind === "host" && n.role !== "monitor"),
     [nodes, selected],
   );
 
@@ -138,8 +138,22 @@ export default function TopologyPage() {
     }
     setBusy(false);
     setMenu(null);
-    if (ok) afterChange(`已把 ${ok} 台主机加入 ${target.label} 的镜像`);
+    if (ok) afterChange(`已把 ${ok} 台主机的流量交给 ${target.label}`);
     if (fail.length) message.warning(fail.join("；"));
+  };
+
+  /** 右键开关某网络的整网流量监控（写规格 + 立刻落地抓包口） */
+  const toggleMonitor = async (node: TopoNode, on: boolean) => {
+    if (!node.zone) return;
+    setBusy(true);
+    try {
+      await api.setMonitor(node.zone, on);
+      afterChange(on ? "已开启整网流量监控（抓包口安装中）" : "已关闭流量监控");
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const delMirror = async (m: MirrorRow) => {
@@ -260,7 +274,7 @@ export default function TopologyPage() {
         },
       });
     }
-    if (menuNode.kind === "network" && menuNode.zone) {
+    if (menuNode.kind === "network" && menuNode.zone && !menuNode.meta.external) {
       menuItems.push({
         key: "egress",
         label: menuNode.meta.egress ? "关闭出网" : "开启出网",
@@ -275,6 +289,15 @@ export default function TopologyPage() {
           } finally {
             setBusy(false);
           }
+        },
+      });
+      menuItems.push({
+        key: "monitor",
+        label: menuNode.meta.monitor ? "关闭整网流量监控" : "开启整网流量监控",
+        onClick: async () => {
+          const on = !menuNode.meta.monitor;
+          setMenu(null);
+          await toggleMonitor(menuNode, on);
         },
       });
     }
@@ -312,7 +335,7 @@ export default function TopologyPage() {
             <span>全局拓扑</span>
             <Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>
               {nodes.filter((n) => n.kind === "network").length} 网络 /{" "}
-              {hosts.length} 主机 · 点节点看详情，框选后右键加到分析机
+              {hosts.length} 主机 · 点节点看详情，悬停监控机看采集链路，框选后右键采集
             </Text>
           </Space>
         }
@@ -352,7 +375,6 @@ export default function TopologyPage() {
             nodes={nodes}
             edges={edges}
             selected={selected}
-            focus={picked?.role === "analysis" ? picked.id : null}
             onPick={(n) => setPicked(n)}
             onSelect={setSelected}
             onContextMenu={(e, n) => setMenu({ x: e.clientX, y: e.clientY, node: n })}
@@ -374,7 +396,7 @@ export default function TopologyPage() {
           </span>
           <span className="lg">
             <b style={{ background: "#eff6ff", borderColor: "#2563eb" }} />
-            分析机
+            流量监控
           </span>
           <span className="lg">
             <b style={{ background: "#ffffff" }} />
@@ -407,13 +429,15 @@ export default function TopologyPage() {
               {it.label}
             </div>
           ))}
-          {targets.length > 0 && analyses.length > 0 && (
+          {targets.length > 0 && monitors.length > 0 && (
             <>
               <div className="ctx-sep" />
               <div className="ctx-title">
-                {targets.length > 1 ? `把 ${targets.length} 台加入镜像…` : "加入镜像…"}
+                {targets.length > 1
+                  ? `把 ${targets.length} 台的流量交给…`
+                  : "把这台的流量交给…"}
               </div>
-              {analyses.map((a) => (
+              {monitors.map((a) => (
                 <div
                   key={a.id}
                   className="ctx-item"
@@ -534,11 +558,11 @@ export default function TopologyPage() {
               )}
             </Space>
 
-            {detail.role === "analysis" && (
+            {detail.role === "monitor" && (
               <Card size="small" title="抓到的流量">
                 {edges.filter((e) => e.kind === "mirror" && e.to === detail.id).length === 0 ? (
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    还没有镜像连线。框选几台主机 → 右键 → 加入镜像。
+                    还没有采集连线。框选几台主机 → 右键 → 把流量交给它；或在编排里打开整网监控。
                   </Text>
                 ) : (
                   <Space direction="vertical" size={4}>
@@ -546,8 +570,12 @@ export default function TopologyPage() {
                       .filter((e) => e.kind === "mirror" && e.to === detail.id)
                       .map((e) => (
                         <div key={`${e.from}`}>
-                          <Text className="mono">{e.from.replace(/^net:/, "")}</Text>
-                          <Text type="secondary"> · 抓 {e.label}</Text>
+                          <Text className="mono">{e.from.replace(/^host:/, "")}</Text>
+                          <Text type="secondary" className="mono">
+                            {" "}
+                            · {e.source_iface ?? "eth0"} → {e.target_iface ?? "?"}
+                            {e.capture_bridge ? ` @ ${e.capture_bridge}` : ""}
+                          </Text>
                         </div>
                       ))}
                   </Space>
@@ -592,7 +620,7 @@ export default function TopologyPage() {
           <Space size={8}>
             <span>流量镜像</span>
             <Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>
-              源机的全部二层流量复制到分析机
+              源主机接口的双向流量复制到监控机的抓包口
             </Text>
           </Space>
         }
@@ -621,20 +649,31 @@ export default function TopologyPage() {
               render: (v: string) => <Tag className="mono">{v}</Tag>,
             },
             {
-              title: "源",
+              title: "源主机",
               dataIndex: "from",
-              render: (v: string) => <code>{v}</code>,
+              render: (v: string, r) => (
+                <code>
+                  {v}
+                  {r.source_iface ? ` · ${r.source_iface}` : ""}
+                </code>
+              ),
             },
             {
-              title: "分析机",
+              title: "监控机",
               dataIndex: "to",
-              render: (v: string) => <code>{v}</code>,
+              render: (v: string, r) => (
+                <code>
+                  {v}
+                  {r.target_iface ? ` · ${r.target_iface}` : ""}
+                </code>
+              ),
             },
             {
-              title: "源网桥",
-              dataIndex: "src_bridge",
+              title: "抓包桥",
+              dataIndex: "capture_bridge",
               width: 130,
-              render: (v: string) => <span className="mono">{v}</span>,
+              render: (v: string | undefined) =>
+                v ? <span className="mono">{v}</span> : <span className="mono">{""}</span>,
             },
             {
               title: "",
@@ -642,7 +681,7 @@ export default function TopologyPage() {
               render: (_: unknown, r: MirrorRow) => (
                 <Popconfirm
                   title="删除这条镜像？"
-                  description="规格里会一并删掉，分析机上的镜像实例也会停。"
+                  description="规格里会一并删掉，监控机上的采集实例也会停。"
                   okText="删除"
                   okButtonProps={{ danger: true }}
                   onConfirm={() => delMirror(r)}

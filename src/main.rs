@@ -1,4 +1,4 @@
-//! labyard —— 声明式攻防实验网络编排（Proxmox VE）。
+//! labyard —— 声明式网络编排（Proxmox VE）。
 //!
 //! 三条命令：`serve`（Web 界面）、`doctor`（环境自检）、`apply`（无界面执行）。
 
@@ -178,6 +178,9 @@ async fn serve_with(cfg: Config, concurrency: usize) -> Result<(), Box<dyn std::
         preview_gate: Arc::new(tokio::sync::Semaphore::new(4)),
         // scrypt 单次 32 MB 工作内存，必须串行
         hash_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        // run 串行闸：一个 run 批内并发 3 个 pct exec（各 ~176 MB），两个
+        // run 并发就是 1 GB+，真机被 oom-kill 过。见 spawn_plan 的注释。
+        run_gate: Arc::new(tokio::sync::Semaphore::new(1)),
     });
 
     let app = api::router(state);

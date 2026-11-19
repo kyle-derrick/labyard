@@ -1,30 +1,26 @@
-//! 全局拓扑：**网络是锚点，主机挂在网络上**。
+//! 全局拓扑：**网络是锚点，主机挂在网络上，采集线从主机接口连到监控机**。
 //!
 //! 第一版画的是"zone / 桥 / 主机 / 镜像桥"四类节点，连线是 `uplink` /
 //! `member` / `mirror-port` / `mirror` 四种。看图的直接感受是"这图画错了"，
 //! 因为人问的问题是**"这台机器接在哪个网段上"**，而图回答的是"这个对象
 //! 属于哪个 zone"。zone 本身不是网络——它是个配置作用域。
 //!
-//! 所以这一版把 zone 压成网络节点的属性（网段、桥名、NAT、出网），只留两类节点：
+//! 第二版把 zone 压成网络节点的属性，但镜像仍然画成 `网络 → 监控机`。
+//! 那还是错的：镜像的来源是**每台主机的网卡**，不是网段。所以这一版：
 //!
-//! - `net:wan` / `net:{zone}`：外网与各 zone 的内网
-//! - `host:{zone}:{host}`：容器
+//! - 节点两类：`net:wan` / `net:{zone}`（网络）与 `host:{zone}:{host}`（主机）
+//! - `attach` 边：谁插在谁上面，方向即数据流（外网 → 网关 → 内网 → 主机）。
+//!   网关因此有两条——`net_up → gw`（eth1 上联）与 `gw → net_zone`（eth0 内网），
+//!   这一对边就把它画成"桥接两个网络的那台机器"。
+//! - `mirror` 边：`源主机 → 监控机`，一条主机一条线。label 写
+//!   `eth0 → eth1`（源主机的采集口 → 监控机上的抓包口），虚线单向。
+//!   不再按网络聚合：聚合之后"这个网段里到底谁被抓了"要读 label 才知道，
+//!   而图本来就是用来回答这个问题的。
 //!
-//! 边只有两条语义，方向都是**数据流方向**（外网 → 网关 → 内网 → 主机）：
-//!
-//! - `attach`：谁插在谁上面。网关因此有两条——`net_up → gw`（上联口）与
-//!   `gw → net_zone`（内网口），这一对边就把它画成"桥接两个网络的那台机器"，
-//!   也正是 dagre 分出层级链 `外网 → 网关A → 内网A → 网关B → 内网B` 的依据。
-//! - `mirror`：`net → 分析机` 的虚线单向箭头，表示"这个网段上被抓的流量"
-//!   进到分析机。同一条 (网络, 分析机) 上多个源主机聚合成一条，label 里列出来，
-//!   否则一个网段抓三台机就会叠出三条完全重合的虚线。
-//!
-//! 前端仍然只负责画：它不理解 `uplink: main`，也不需要知道 mirror 的源是主机
-//! 还是桥。
+//! 前端只负责画：它不理解 `uplink: main`，也不需要知道抓包桥叫什么名字。
 
 use crate::core::spec::{ResolvedSpec, Role};
 use serde::Serialize;
-use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize)]
 pub struct Node {
@@ -50,7 +46,14 @@ pub struct Edge {
     pub kind: String,
     pub label: Option<String>,
     /// attach 边的接口角色：uplink（接上层网络）| inner（接本 zone 内网）
+    /// | mgmt（挂在外网桥上的管理口）
     pub port: Option<String>,
+    /// mirror 边：源主机上的哪块网卡（恒为 eth0——它在所连网络里的那块脸）
+    pub source_iface: Option<String>,
+    /// mirror 边：监控机上的哪块抓包网卡（eth1、eth2……）
+    pub target_iface: Option<String>,
+    /// mirror 边落到的两层桥（`mir{zone}`），抽屉里显示用
+    pub capture_bridge: Option<String>,
 }
 
 pub struct State<'a> {
@@ -83,55 +86,59 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
 
     for (spec_name, spec) in specs {
         for z in &spec.zones {
-            let gateway = z.gateway.as_ref();
-            let egress = gateway.map(|g| g.egress).unwrap_or(false);
-            let pubs = gateway.map(|g| g.pubs.len()).unwrap_or(0);
-            let vpn: Vec<&str> = gateway
-                .map(|g| {
-                    let mut v = Vec::new();
-                    if g.vpn.wireguard {
-                        v.push("wireguard");
-                    }
-                    if g.vpn.openvpn {
-                        v.push("openvpn");
-                    }
-                    v
-                })
-                .unwrap_or_default();
+            // 外网合成 zone 的"网络"就是 net:wan，不再画第二个外网节点
+            if !z.external {
+                let gateway = z.gateway.as_ref();
+                let egress = gateway.map(|g| g.egress).unwrap_or(false);
+                let pubs = gateway.map(|g| g.pubs.len()).unwrap_or(0);
+                let vpn: Vec<&str> = gateway
+                    .map(|g| {
+                        let mut v = Vec::new();
+                        if g.vpn.wireguard {
+                            v.push("wireguard");
+                        }
+                        if g.vpn.openvpn {
+                            v.push("openvpn");
+                        }
+                        v
+                    })
+                    .unwrap_or_default();
 
-            // 网络节点：这个 zone 的内网。标签里带 zone 名，免得一张图里
-            // 三个"内网"分不清是哪个。
-            let gateway_host = z
-                .hosts
-                .iter()
-                .find(|h| h.role == Role::Gateway)
-                .map(|h| h.name.clone());
-            nodes.push(Node {
-                id: format!("net:{}", z.name),
-                kind: "network".into(),
-                label: format!("{} 内网", z.name),
-                zone: Some(z.name.clone()),
-                role: None,
-                vmid: None,
-                ipv4: None,
-                status: None,
-                retired: (st.retired)(&z.name, "*"),
-                meta: serde_json::json!({
-                    "spec": spec_name,
-                    "bridge": z.bridge,
-                    "cidr": z.v4_cidr,
-                    "v6": z.v6_prefix,
-                    "mgmt_ip": z.bridge_mgmt_ip,
-                    "nat": z.nat,
-                    "uplink": z.uplink,
-                    "uplink_bridge": z.uplink_bridge,
-                    "gateway_host": gateway_host,
-                    "egress": egress,
-                    "pubs": pubs,
-                    "vpn": vpn,
-                    "external": false,
-                }),
-            });
+                // 网络节点：这个 zone 的内网。标签里带 zone 名，免得一张图里
+                // 三个"内网"分不清是哪个。
+                let gateway_host = z
+                    .hosts
+                    .iter()
+                    .find(|h| h.role == Role::Gateway)
+                    .map(|h| h.name.clone());
+                nodes.push(Node {
+                    id: format!("net:{}", z.name),
+                    kind: "network".into(),
+                    label: format!("{} 内网", z.name),
+                    zone: Some(z.name.clone()),
+                    role: None,
+                    vmid: None,
+                    ipv4: None,
+                    status: None,
+                    retired: (st.retired)(&z.name, "*"),
+                    meta: serde_json::json!({
+                        "spec": spec_name,
+                        "bridge": z.bridge,
+                        "cidr": z.v4_cidr,
+                        "v6": z.v6_prefix,
+                        "mgmt_ip": z.bridge_mgmt_ip,
+                        "nat": z.nat,
+                        "uplink": z.uplink,
+                        "uplink_bridge": z.uplink_bridge,
+                        "gateway_host": gateway_host,
+                        "monitor": z.monitor,
+                        "egress": egress,
+                        "pubs": pubs,
+                        "vpn": vpn,
+                        "external": false,
+                    }),
+                });
+            }
 
             for h in &z.hosts {
                 let retired = (st.retired)(&z.name, &h.name);
@@ -152,7 +159,8 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         "memory": h.memory,
                         "disk": h.disk,
                         "provisioner": h.provisioner,
-                        "mirror": h.mirror,
+                        "capture": h.capture,
+                        "external_zone": z.external,
                     }),
                 });
 
@@ -160,8 +168,23 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                 let inner = format!("net:{}", z.name);
                 let ip = h.ipv4.split('/').next().unwrap_or(&h.ipv4);
 
-                if h.role == Role::Gateway {
-                    // 上联口：从上层网络指向网关（数据从外面进来）
+                if z.external {
+                    // 挂在外网桥上的主机（监控机常在这种位置）：一块管理口，
+                    // 地址由 DHCP 给，所以这里不写 IP。
+                    edges.push(Edge {
+                        from: "net:wan".into(),
+                        to: host_id,
+                        kind: "attach".into(),
+                        label: Some("eth0 · DHCP".into()),
+                        port: Some("mgmt".into()),
+                        source_iface: None,
+                        target_iface: None,
+                        capture_bridge: None,
+                    });
+                } else if h.role == Role::Gateway {
+                    // 上联口：从上层网络指向网关（数据从外面进来）。
+                    // 容器里的编号是 eth1 —— eth0 是内网口，两者写反了会让人
+                    // 按图去 `ip addr show eth0` 找 WAN 地址，然后找不到。
                     let up = match &z.uplink {
                         None => "net:wan".to_string(),
                         Some(u) => format!("net:{u}"),
@@ -170,16 +193,22 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         from: up,
                         to: host_id.clone(),
                         kind: "attach".into(),
-                        label: Some("eth0".into()),
+                        label: Some("eth1".into()),
                         port: Some("uplink".into()),
+                        source_iface: None,
+                        target_iface: None,
+                        capture_bridge: None,
                     });
                     // 内网口：从网关指向本 zone 内网（数据流进去）
                     edges.push(Edge {
                         from: host_id,
                         to: inner,
                         kind: "attach".into(),
-                        label: Some(format!("eth1 · {ip}")),
+                        label: Some(format!("eth0 · {ip}")),
                         port: Some("inner".into()),
+                        source_iface: None,
+                        target_iface: None,
+                        capture_bridge: None,
                     });
                 } else {
                     edges.push(Edge {
@@ -188,26 +217,26 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         kind: "attach".into(),
                         label: Some(ip.to_string()),
                         port: Some("inner".into()),
+                        source_iface: None,
+                        target_iface: None,
+                        capture_bridge: None,
                     });
                 }
             }
         }
 
-        // 镜像：同一个 (源网络, 分析机) 上的多个源聚合成一条虚线，
-        // label 写清被抓的是哪几台——否则三条虚线叠在一起，看起来只有一条。
-        let mut agg: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+        // 镜像：一条主机一条虚线。源主机在它自己的 zone 桥上的那块网卡
+        // （eth0）→ 监控机的抓包网卡，方向就是流量被复制过去的方向。
         for m in &spec.mirrors {
-            agg.entry((m.from_zone.clone(), m.to_zone.clone(), m.to_host.clone()))
-                .or_default()
-                .push(m.from_host.clone());
-        }
-        for ((from_zone, to_zone, to_host), hosts) in agg {
             edges.push(Edge {
-                from: format!("net:{from_zone}"),
-                to: format!("host:{to_zone}:{to_host}"),
+                from: format!("host:{}:{}", m.from_zone, m.from_host),
+                to: format!("host:{}:{}", m.to_zone, m.to_host),
                 kind: "mirror".into(),
-                label: Some(hosts.join(", ")),
+                label: Some(format!("eth0 → {}", m.to_iface)),
                 port: None,
+                source_iface: Some("eth0".into()),
+                target_iface: Some(m.to_iface.clone()),
+                capture_bridge: Some(m.capture_bridge.clone()),
             });
         }
     }
@@ -228,19 +257,21 @@ zones:
     uplink: wan
     v4: 10.10.1.0/24
     gateway: { egress: true, pub: [{ proto: tcp, port: 80, to: "10.10.1.20" }] }
+    monitor: { use: "edge:probe" }
     hosts:
       gateway: { role: gateway, vmid: 100 }
-      analysis: { role: analysis, vmid: 101 }
       web: { role: server, vmid: 102 }
+  edge:
+    uplink: wan
+    v4: 10.90.0.0/24
+    hosts:
+      probe: { role: monitor, vmid: 101 }
   sub:
     uplink: main
     v4: 10.20.1.0/24
     hosts:
       gateway: { role: gateway }
       client1: { role: client }
-mirrors:
-  - { from: "sub:gateway", to: "main:analysis" }
-  - { from: "sub:client1", to: "main:analysis" }
 "#;
         Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap()
     }
@@ -267,19 +298,36 @@ mirrors:
         assert!(!n.iter().any(|x| x.kind == "zone"), "zone 不再是节点");
         assert!(n.iter().any(|x| x.id == "net:main" && x.kind == "network"));
         assert!(n.iter().any(|x| x.id == "net:wan"));
-        assert!(!n.iter().any(|x| x.id == "mirr"), "没有 mirr 假节点");
+        assert!(
+            n.iter().filter(|x| x.id == "net:wan").count() == 1,
+            "外网节点只应有一个（合成 zone 不再画第二个）"
+        );
     }
 
     #[test]
     fn a_gateway_bridges_two_networks() {
         let (_, e) = run();
-        // 上联：外网 → 网关
         assert!(has_edge(&e, "net:wan", "host:main:gateway", "attach"));
-        // 内网口：网关 → 本 zone 内网
         assert!(has_edge(&e, "host:main:gateway", "net:main", "attach"));
-        // 二层 zone 的上联是上一层的内网
         assert!(has_edge(&e, "net:main", "host:sub:gateway", "attach"));
         assert!(has_edge(&e, "host:sub:gateway", "net:sub", "attach"));
+    }
+
+    #[test]
+    fn gateway_iface_labels_match_the_container() {
+        // 容器里 eth0 是内网口、eth1 是上联口（net.rs 与 ensure_ct 都这么建）。
+        // 图上写反了会让人照着去 `ip addr show eth0` 找 WAN 地址。
+        let (_, e) = run();
+        let up = e
+            .iter()
+            .find(|x| x.to == "host:main:gateway" && x.port.as_deref() == Some("uplink"))
+            .unwrap();
+        assert_eq!(up.label.as_deref(), Some("eth1"));
+        let inner = e
+            .iter()
+            .find(|x| x.from == "host:main:gateway")
+            .unwrap();
+        assert!(inner.label.as_deref().unwrap_or("").starts_with("eth0"));
     }
 
     #[test]
@@ -287,24 +335,53 @@ mirrors:
         let (_, e) = run();
         assert!(has_edge(&e, "net:main", "host:main:web", "attach"));
         assert!(has_edge(&e, "net:sub", "host:sub:client1", "attach"));
-        // 普通主机不应该被画成插在上层网络上
         assert!(!has_edge(&e, "net:wan", "host:main:web", "attach"));
     }
 
     #[test]
-    fn mirrors_run_from_network_to_analysis_and_are_aggregated() {
+    fn mirrors_run_from_host_interface_to_monitor_interface() {
         let (_, e) = run();
-        let m: Vec<&Edge> = e
-            .iter()
-            .filter(|x| x.kind == "mirror" && x.from == "net:sub")
-            .collect();
-        assert_eq!(m.len(), 1, "同一网络到同一分析机只画一条");
-        assert_eq!(m[0].to, "host:main:analysis");
-        let label = m[0].label.as_deref().unwrap_or("");
-        assert!(
-            label.contains("gateway") && label.contains("client1"),
-            "label 要列出被抓的源：{label}"
-        );
+        let m: Vec<&Edge> = e.iter().filter(|x| x.kind == "mirror").collect();
+        // main 网络开了监控（抓 gateway + web），edge 网络没开（probe 自己不被抓）
+        assert_eq!(m.len(), 2, "一台源主机一条虚线，实际 {m:?}");
+        assert!(m.iter().all(|x| x.to == "host:edge:probe"));
+        let gw = m.iter().find(|x| x.from == "host:main:gateway").unwrap();
+        assert_eq!(gw.source_iface.as_deref(), Some("eth0"));
+        assert_eq!(gw.target_iface.as_deref(), Some("eth1"));
+        assert_eq!(gw.label.as_deref(), Some("eth0 → eth1"));
+        assert_eq!(gw.capture_bridge.as_deref(), Some("mirmain"));
+    }
+
+    #[test]
+    fn external_zone_hosts_hang_off_the_wan_bridge() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  lab:
+    uplink: wan
+    v4: 10.7.0.0/24
+    monitor: { name: probe, mgmt: wan }
+    hosts: { gateway: { role: gateway }, t1: { role: server } }
+  core:
+    uplink: wan
+    v4: 10.9.0.0/24
+    monitor: { use: "wan:probe" }
+    hosts: { gateway: { role: gateway }, t2: { role: server } }
+"#;
+        let s = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
+        let st = State {
+            wan_bridge: "vmbr0",
+            status: &|_| None,
+            retired: &|_, _| false,
+        };
+        let (n, e) = build(&[("lab".to_string(), s)], &st);
+        let probe = n.iter().find(|x| x.id == "host:wan:probe").unwrap();
+        assert_eq!(probe.role.as_deref(), Some("monitor"));
+        assert_eq!(probe.ipv4.as_deref(), Some("dhcp"));
+        assert!(has_edge(&e, "net:wan", "host:wan:probe", "attach"));
+        // 两个网络各给 probe 一块抓包口
+        let t = probe.meta["capture"].as_array().unwrap();
+        assert_eq!(t.len(), 2, "core 与 lab 各一块：{t:?}");
     }
 
     #[test]
@@ -327,6 +404,11 @@ mirrors:
             net.meta["gateway_host"],
             serde_json::json!("gateway"),
             "前端要靠这个字段在网络上显示网关名"
+        );
+        assert_eq!(
+            net.meta["monitor"],
+            serde_json::json!("probe"),
+            "网络上要能显示'这个网段归谁采集'"
         );
     }
 }

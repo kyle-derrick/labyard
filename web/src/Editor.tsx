@@ -49,9 +49,10 @@ zones:
       pub:
         - { proto: tcp, port: 2222, to: "10.10.1.20:22" }
       vpn: { wireguard: true, clients: [alice] }
+    # 流量监控：本网络每台主机的接口流量复制到一台监控机
+    monitor: { name: probe, mgmt: wan }
     hosts:
       gateway:   { role: gateway }
-      analysis:  { role: analysis, provisioner: apt-mirror }
       server1:   { role: server }
       client1:   { role: client }
 
@@ -59,13 +60,15 @@ zones:
   sub:
     uplink: main
     v4: 10.20.1.0/24
+    # 复用 main 里新建的那台监控机
+    monitor: { use: "main:probe" }
     hosts:
       gateway: { role: gateway }
       client1: { role: client }
 
-# 跨 zone 流量镜像：sub 的网关全部流量复制到 main 的分析机
+# 精确连线：某台主机的流量复制到某台监控机（可跨网络）
 mirrors:
-  - { from: "sub:gateway", to: "main:analysis" }
+  - { from: "sub:client1", to: "main:probe" }
 `;
 
 type LogLine = { cls: string; text: string };
@@ -149,14 +152,28 @@ export default function Editor() {
     });
   };
 
+  /** 预览/执行前若还有未保存的改动，先落盘——所见即所跑。
+   *  可视化模式下用户经常忘记"先保存"，这里替他做掉。 */
+  const ensureSaved = async () => {
+    if (!dirty) return;
+    await api.putSpecNamed(specName, yaml);
+    setSaved(yaml);
+    message.info(`已自动保存 ${specName}.yaml`);
+  };
+
   const onPreview = async () => {
     setErr(null);
     setBusy(true);
     try {
+      await ensureSaved();
       const r = await api.preview(yaml, snapshot);
       setSteps(r.steps);
       setZones(r.zones);
-      message.success(`计划 ${r.steps.length} 步`);
+      const skip = r.steps.filter((s) => s.action === "skip").length;
+      const create = r.steps.filter((s) => s.action === "create").length;
+      message.success(
+        `计划 ${r.steps.length} 步：新建 ${create} · 更新 ${r.steps.length - skip - create} · 跳过 ${skip}`,
+      );
     } catch (e) {
       setErr((e as Error).message);
       setSteps([]);
@@ -173,6 +190,7 @@ export default function Editor() {
     // 自动保存要存的是"跑的那一份"，不是改过的新文本。
     const sent = yaml;
     try {
+      await ensureSaved();
       const r = await api.apply(sent, snapshot);
       setRunId(r.run_id);
       message.info(`已启动 ${r.run_id}`);
@@ -242,7 +260,7 @@ export default function Editor() {
 
   return (
     <Row gutter={[16, 16]}>
-      <Col xs={24} xl={10}>
+      <Col xs={24} xl={13}>
         <Card
           title={
             <Space size={8}>
@@ -325,7 +343,7 @@ export default function Editor() {
           )}
           {mode === "visual" && (
             <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 10 }}>
-              预览与执行用的是已经保存的规格——在可视化里改完，先点上面的「保存」。
+              预览或执行时会自动保存当前改动——所见即所跑。
             </Text>
           )}
           <Space style={{ marginTop: 12 }} wrap>
@@ -380,9 +398,26 @@ export default function Editor() {
                 {list.map((s) => (
                   <div className="step-row" key={s.key}>
                     <span className="step-key">{s.key}</span>
-                    <Text type="secondary" className="mono">
-                      {s.input_hash}
-                    </Text>
+                    <Space size={6}>
+                      {s.action === "create" && (
+                        <Tag color="green" style={{ marginInlineEnd: 0 }}>
+                          新建
+                        </Tag>
+                      )}
+                      {s.action === "update" && (
+                        <Tooltip title={s.reason}>
+                          <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                            更新
+                          </Tag>
+                        </Tooltip>
+                      )}
+                      {s.action === "skip" && (
+                        <Tag style={{ marginInlineEnd: 0 }}>跳过</Tag>
+                      )}
+                      <Text type="secondary" className="mono">
+                        {s.input_hash}
+                      </Text>
+                    </Space>
                   </div>
                 ))}
               </div>
@@ -391,7 +426,7 @@ export default function Editor() {
         )}
       </Col>
 
-      <Col xs={24} xl={14}>
+      <Col xs={24} xl={11}>
         {zones.length > 0 && (
           <Card title="拓扑预览" size="small" style={{ marginBottom: 16 }}>
             <Topology zones={zones as Zone[]} />

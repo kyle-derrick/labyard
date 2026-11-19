@@ -4,6 +4,15 @@
  * 这样前端完全不需要懂 YAML 的锚点、缩进和 `{ role: gateway }` 这类简写——
  * 解析规则只有一份，在后端。
  *
+ * 模板与存储是下拉而不是输入框：数据来自 `/api/catalog`（PVE 现查，
+ * 后端有 TTL 缓存），所以下拉里只有真的存在的选项，拼错名字这种事
+ * 到不了保存那一步。
+ *
+ * 每个 zone 有一个「流量监控」开关（`zone.monitor`）：
+ * - 开 = 这个网络的流量交给一台监控机采集（整网采集，按主机逐口镜像）；
+ * - 新建一台（可指定挂在哪个网络做管理口）或复用别的 zone 里已有的监控机；
+ * - 关 = 不采集。
+ *
  * **刻意的取舍**：这里不是拖拽画布。拖一个方框到画布上，背后要回答"它属于
  * 哪个 zone、IP 从哪来、桥怎么接"，这些答案最后还是变成表单；而拖拽还会
  * 带来"位置要不要存进 YAML"这种没有意义的问题。所以做成"卡片 + 表格"：
@@ -25,6 +34,7 @@ import {
   InputNumber,
   Modal,
   Popconfirm,
+  Radio,
   Row,
   Select,
   Space,
@@ -35,7 +45,7 @@ import {
   Typography,
 } from "antd";
 import { DeleteOutlined, PlusOutlined, SaveOutlined } from "@ant-design/icons";
-import { api } from "./api";
+import { api, type Catalog } from "./api";
 
 const { Text } = Typography;
 
@@ -52,6 +62,22 @@ type HostM = {
   mirror?: string;
 };
 
+type MonitorM = {
+  /** 复用已有监控机时是 `zone:host` 或唯一的 `host`；新建时不存在 */
+  use?: string;
+  /** 新建监控机的名字，默认 monitor */
+  name?: string;
+  /** 新建时管理口挂哪：不写 = 本 zone 内网；wan = 外网桥（DHCP）；或别的 zone */
+  mgmt?: string;
+  /** 只抓这些主机；不写 = 本网络全部主机 */
+  targets?: string[];
+  cores?: number;
+  memory?: number;
+  disk?: number;
+  template?: string;
+  storage?: string;
+};
+
 type ZoneM = {
   uplink?: string;
   v4?: string;
@@ -59,6 +85,7 @@ type ZoneM = {
   nat?: boolean;
   bridge?: string;
   gateway?: { egress?: boolean; pub?: unknown[]; vpn?: Record<string, unknown> };
+  monitor?: MonitorM;
   hosts?: Record<string, HostM>;
 };
 
@@ -70,16 +97,22 @@ type Model = {
 
 const ROLES = [
   { value: "gateway", label: "网关" },
-  { value: "analysis", label: "分析机" },
-  { value: "server", label: "靶机·服务" },
-  { value: "client", label: "靶机·终端" },
+  { value: "monitor", label: "流量监控" },
+  { value: "server", label: "服务主机" },
+  { value: "client", label: "终端主机" },
 ];
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
   return (
     <div>
       <div style={{ fontSize: 11, color: "#64748b", marginBottom: 2 }}>{label}</div>
-      {children}
+      {hint ? (
+        <Tooltip title={hint}>
+          <div>{children}</div>
+        </Tooltip>
+      ) : (
+        children
+      )}
     </div>
   );
 }
@@ -93,6 +126,7 @@ export default function SpecVisual({
 }) {
   const { message } = AntApp.useApp();
   const [model, setModel] = useState<Model | null>(null);
+  const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [exists, setExists] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -116,6 +150,11 @@ export default function SpecVisual({
       })
       .catch((e) => alive && setErr((e as Error).message))
       .finally(() => alive && setBusy(false));
+    // 目录（模板/存储）失败不阻塞编辑——下拉退化为手填
+    api
+      .catalog()
+      .then((c) => alive && setCatalog(c))
+      .catch(() => {});
     return () => {
       alive = false;
     };
@@ -190,6 +229,45 @@ export default function SpecVisual({
   const roleOf = (z: ZoneM) =>
     Object.values(z.hosts ?? {}).find((h) => h.role === "gateway") ?? null;
 
+  /** 全部规格里 role=monitor 的主机（zone:host），供"复用已有"下拉用 */
+  const monitorChoices = useMemo(() => {
+    const out: { value: string; label: string }[] = [];
+    for (const zn of zoneNames) {
+      for (const [hn, h] of Object.entries(zones[zn].hosts ?? {})) {
+        if (h.role === "monitor") out.push({ value: `${zn}:${hn}`, label: `${zn} / ${hn}` });
+      }
+      const m = zones[zn].monitor;
+      if (m?.name && !m.use) {
+        const v = `${zn}:${m.name}`;
+        if (!out.some((o) => o.value === v)) out.push({ value: v, label: `${zn} / ${m.name}（本 zone 将新建）` });
+      }
+    }
+    return out;
+  }, [zones, zoneNames]);
+
+  // ── 下拉数据源 ──
+  const templateOptions = (catalog?.templates ?? []).map((t) => ({
+    value: t.label,
+    label: t.label,
+  }));
+  const diskStorageOptions = (catalog?.disk_storages ?? []).map((s) => ({
+    value: s.storage,
+    label: `${s.storage}（${s.kind}）`,
+  }));
+  const withFallback = (opts: { value: string; label: string }[], cur?: string) =>
+    cur && !opts.some((o) => o.value === cur)
+      ? [...opts, { value: cur, label: `${cur}（不在目录里）` }]
+      : opts;
+
+  /** 监控机管理口可挂的网络：本 zone / 外网 / 其他 zone */
+  const mgmtOptions = (zn: string) => [
+    { value: "", label: "本 zone 内网（推荐）" },
+    { value: "wan", label: "外网（wan，DHCP）" },
+    ...zoneNames
+      .filter((o) => o !== zn)
+      .map((o) => ({ value: o, label: `zone ${o}` })),
+  ];
+
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
       {!exists && (
@@ -236,43 +314,60 @@ export default function SpecVisual({
               </Field>
             </Col>
           ))}
-          {[
-            ["template", "模板名"],
-            ["storage", "存储"],
-          ].map(([k, label]) => (
-            <Col span={12} key={k} style={{ marginTop: 8 }}>
-              <Field label={label}>
-                <Input
-                  size="small"
-                  placeholder={k === "template" ? "debian-13-standard" : "local-lvm"}
-                  value={(model?.defaults?.[k] as string) ?? ""}
-                  onChange={(e) =>
-                    patch((m) => ({
-                      ...m,
-                      defaults: { ...(m.defaults ?? {}), [k]: e.target.value },
-                    }))
-                  }
-                />
-              </Field>
-            </Col>
-          ))}
+          <Col span={12} style={{ marginTop: 8 }}>
+            <Field label="模板">
+              <Select
+                size="small"
+                showSearch
+                style={{ width: "100%" }}
+                placeholder={catalog ? "从列表选择" : "debian-13-standard"}
+                value={(model?.defaults?.template as string) ?? undefined}
+                options={withFallback(templateOptions, model?.defaults?.template as string | undefined)}
+                onChange={(v) =>
+                  patch((m) => ({
+                    ...m,
+                    defaults: { ...(m.defaults ?? {}), template: v },
+                  }))
+                }
+              />
+            </Field>
+          </Col>
+          <Col span={12} style={{ marginTop: 8 }}>
+            <Field label="存储">
+              <Select
+                size="small"
+                showSearch
+                style={{ width: "100%" }}
+                placeholder={catalog ? "从列表选择" : "local-lvm"}
+                value={(model?.defaults?.storage as string) ?? undefined}
+                options={withFallback(diskStorageOptions, model?.defaults?.storage as string | undefined)}
+                onChange={(v) =>
+                  patch((m) => ({
+                    ...m,
+                    defaults: { ...(m.defaults ?? {}), storage: v },
+                  }))
+                }
+              />
+            </Field>
+          </Col>
         </Row>
       </Card>
 
       {zoneNames.length === 0 && (
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description="还没有 zone——一个 zone 就是一段内网 + 一台网关"
+          description="还没有网络——一个网络就是一段内网 + 一台网关"
         />
       )}
 
       {zoneNames.map((zn) => {
         const z = zones[zn];
         const gw = roleOf(z);
-        const hostRows = Object.entries(z.hosts ?? {}).map(([hn, h]) => ({
-          name: hn,
-          ...h,
-        }));
+        const hostEntries = Object.entries(z.hosts ?? {});
+        const hostRows = hostEntries.map(([hn, h]) => ({ name: hn, ...h }));
+        const mon = z.monitor;
+        const monOn = !!mon;
+        const monMode = mon?.use ? "use" : "new";
         return (
           <Card
             key={zn}
@@ -281,12 +376,21 @@ export default function SpecVisual({
               <Space size={8}>
                 <Text strong>{zn}</Text>
                 <Tag className="mono">{z.v4 ?? "无网段"}</Tag>
-                {gw ? <Tag color="green">网关 {Object.keys(z.hosts ?? {}).find((k) => z.hosts?.[k].role === "gateway")}</Tag> : <Tag color="red">没有网关</Tag>}
+                {gw ? (
+                  <Tag color="green">网关 {hostEntries.find(([, h]) => h.role === "gateway")?.[0]}</Tag>
+                ) : (
+                  <Tag color="red">没有网关</Tag>
+                )}
+                {monOn && (
+                  <Tag color="blue">
+                    流量监控 {monMode === "use" ? `← ${mon!.use}` : `← 新建 ${mon!.name || "monitor"}`}
+                  </Tag>
+                )}
               </Space>
             }
             extra={
               <Popconfirm
-                title={`从规格里删掉 zone ${zn}？`}
+                title={`从规格里删掉网络 ${zn}？`}
                 description="只改文件，PVE 上的容器不动。"
                 okText="删除"
                 okButtonProps={{ danger: true }}
@@ -308,7 +412,7 @@ export default function SpecVisual({
                       { value: "wan", label: "外网（wan）" },
                       ...zoneNames
                         .filter((o) => o !== zn)
-                        .map((o) => ({ value: o, label: `zone ${o}` })),
+                        .map((o) => ({ value: o, label: `网络 ${o}` })),
                     ]}
                   />
                 </Field>
@@ -349,13 +453,128 @@ export default function SpecVisual({
               </Col>
             </Row>
 
+            {/* ── 流量监控开关 ── */}
+            <div
+              style={{
+                marginTop: 10,
+                padding: "8px 10px",
+                border: "1px solid var(--border, #e2e8f0)",
+                borderRadius: 6,
+                background: monOn ? "rgba(22,119,255,0.04)" : "transparent",
+              }}
+            >
+              <Space size={10} align="center" wrap>
+                <Text strong>流量监控</Text>
+                <Switch
+                  size="small"
+                  checked={monOn}
+                  onChange={(v) =>
+                    patchZone(zn, {
+                      monitor: v
+                        ? { name: "monitor" }
+                        : undefined,
+                    })
+                  }
+                />
+                {monOn ? (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    开启后，本网络每台主机的接口流量会被复制到监控机对应网口
+                  </Text>
+                ) : (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    关闭——需要采集时打开，单台主机的精确连线请到「拓扑」页加
+                  </Text>
+                )}
+              </Space>
+              {monOn && (
+                <div style={{ marginTop: 8 }}>
+                  <Radio.Group
+                    size="small"
+                    value={monMode}
+                    onChange={(e) => {
+                      const v = e.target.value as "new" | "use";
+                      patchZone(zn, {
+                        monitor:
+                          v === "new"
+                            ? { name: mon?.name || "monitor", mgmt: mon?.mgmt, cores: mon?.cores, memory: mon?.memory, disk: mon?.disk }
+                            : { use: monitorChoices.find((c) => !c.value.startsWith(`${zn}:`))?.value ?? monitorChoices[0]?.value },
+                      });
+                    }}
+                    options={[
+                      { value: "new", label: "新建一台" },
+                      { value: "use", label: "复用已有" },
+                    ]}
+                    style={{ marginBottom: 8 }}
+                  />
+                  {monMode === "new" ? (
+                    <Row gutter={8}>
+                      <Col span={5}>
+                        <Field label="名字">
+                          <Input
+                            size="small"
+                            className="mono"
+                            value={mon?.name ?? "monitor"}
+                            onChange={(e) =>
+                              patchZone(zn, { monitor: { ...mon!, name: e.target.value || undefined } })
+                            }
+                          />
+                        </Field>
+                      </Col>
+                      <Col span={7}>
+                        <Field label="管理口挂在" hint="监控机自己的管理网卡接哪：默认本网段，也可以挂到外网或别的网络（边界采集）">
+                          <Select
+                            size="small"
+                            style={{ width: "100%" }}
+                            value={mon?.mgmt ?? ""}
+                            options={mgmtOptions(zn)}
+                            onChange={(v) =>
+                              patchZone(zn, { monitor: { ...mon!, mgmt: v || undefined } })
+                            }
+                          />
+                        </Field>
+                      </Col>
+                      {(["cores", "memory", "disk"] as const).map((k) => (
+                        <Col span={4} key={k}>
+                          <Field
+                            label={k === "cores" ? "CPU" : k === "memory" ? "内存 MB" : "磁盘 GB"}
+                          >
+                            <InputNumber
+                              size="small"
+                              min={1}
+                              style={{ width: "100%" }}
+                              placeholder={String(model?.defaults?.[k] ?? "")}
+                              value={mon?.[k]}
+                              onChange={(nv) =>
+                                patchZone(zn, { monitor: { ...mon!, [k]: nv ?? undefined } })
+                              }
+                            />
+                          </Field>
+                        </Col>
+                      ))}
+                    </Row>
+                  ) : (
+                    <Field label="复用哪台监控机">
+                      <Select
+                        size="small"
+                        style={{ width: "100%", maxWidth: 360 }}
+                        placeholder="选择已有的流量监控机"
+                        value={mon?.use}
+                        options={monitorChoices}
+                        onChange={(v) => patchZone(zn, { monitor: { use: v } })}
+                      />
+                    </Field>
+                  )}
+                </div>
+              )}
+            </div>
+
             <Table
               size="small"
               style={{ marginTop: 10 }}
               rowKey="name"
               dataSource={hostRows}
               pagination={false}
-              locale={{ emptyText: "这个 zone 还没有主机" }}
+              locale={{ emptyText: "这个网络还没有主机" }}
               columns={[
                 {
                   title: "主机",
@@ -366,7 +585,7 @@ export default function SpecVisual({
                 {
                   title: "角色",
                   dataIndex: "role",
-                  width: 120,
+                  width: 130,
                   render: (v: string | undefined, r) => (
                     <Select
                       size="small"
@@ -382,7 +601,7 @@ export default function SpecVisual({
                   dataIndex: "ip",
                   width: 76,
                   render: (v: number | undefined, r) => (
-                    <Tooltip title="主机号（网段的最后一段）。留空按角色自动分配：网关 .1、分析机 .10、靶机 .20/.30">
+                    <Tooltip title="主机号（网段的最后一段）。留空按角色自动分配：网关 .1、流量监控 .10、服务 .20、终端 .30">
                       <InputNumber
                         size="small"
                         min={1}
@@ -460,7 +679,7 @@ export default function SpecVisual({
 
       <Space>
         <Button size="small" icon={<PlusOutlined />} onClick={() => setZoneOpen(true)}>
-          添加 zone
+          添加网络
         </Button>
         <Button
           size="small"
@@ -478,7 +697,7 @@ export default function SpecVisual({
       </Space>
 
       <Text type="secondary" style={{ fontSize: 12 }}>
-        {zoneNames.length} 个 zone / {totalHosts} 台主机
+        {zoneNames.length} 个网络 / {totalHosts} 台主机
         {(model?.mirrors?.length ?? 0) > 0
           ? ` · ${model!.mirrors!.length} 条镜像连线（在「拓扑」页增删）`
           : ""}
@@ -486,7 +705,7 @@ export default function SpecVisual({
 
       <Modal
         open={zoneOpen}
-        title="添加 zone"
+        title="添加网络"
         onCancel={() => setZoneOpen(false)}
         onOk={() => zoneForm.submit()}
         okText="添加"
@@ -498,7 +717,7 @@ export default function SpecVisual({
           preserve={false}
           onFinish={(v: { name: string; uplink: string; v4: string }) => {
             if (zones[v.name]) {
-              message.error(`zone ${v.name} 已存在`);
+              message.error(`网络 ${v.name} 已存在`);
               return;
             }
             patch((m) => ({
@@ -533,7 +752,7 @@ export default function SpecVisual({
             <Select
               options={[
                 { value: "wan", label: "外网（wan）" },
-                ...zoneNames.map((o) => ({ value: o, label: `zone ${o}` })),
+                ...zoneNames.map((o) => ({ value: o, label: `网络 ${o}` })),
               ]}
             />
           </Form.Item>
@@ -583,7 +802,7 @@ export default function SpecVisual({
               },
             ]}
           >
-            <Input placeholder="target1" className="mono" />
+            <Input placeholder="web1" className="mono" />
           </Form.Item>
           <Form.Item name="role" label="角色" initialValue="server">
             <Select options={ROLES} />

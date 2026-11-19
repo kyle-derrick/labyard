@@ -641,7 +641,7 @@ export default function Specs() {
           <Text type="secondary" style={{ fontSize: 12 }}>
             {copyOf
               ? `内容复制自 ${copyOf}，之后两份独立演化。`
-              : "内容是一个能直接执行的最小骨架（一个 zone + 网关 + 一台靶机）。"}
+              : "内容是一个能直接执行的最小骨架（一个网络 + 网关 + 一台服务主机）。"}
           </Text>
         </Space>
       </Modal>

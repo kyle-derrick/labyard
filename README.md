@@ -1,6 +1,6 @@
 # labyard
 
-声明式攻防实验网络编排。给 Proxmox VE 单节点用：写一份 YAML，得到一个可以复现、
+声明式网络编排。给 Proxmox VE 单节点用：写一份 YAML，得到一个可以复现、
 可以推倒重来的实验网络。
 
 **状态：功能完整，已在真实 PVE 9.2.2 上端到端验证。** 核心引擎、PVE 命令层、Web 界面
@@ -46,10 +46,10 @@ zones:
 其余约定：
 
 - 三层默认值：`defaults` → `zone` → `host`，逐字段覆盖
-- 主机基础配置同样三层合并：`timezone`（时区）、`lang`（locale，如 `zh_CN.UTF-8`）、`apt_mirror`（apt 源，无外网机器可指向内网 apt-cacher-ng）、`packages`（预装包；`packages: []` 显式不要——无外网靶机用它退出继承）
+- 主机基础配置同样三层合并：`timezone`（时区）、`lang`（locale，如 `zh_CN.UTF-8`）、`apt_mirror`（apt 源，无外网机器可指向内网 apt-cacher-ng）、`packages`（预装包；`packages: []` 显式不要——无外网主机用它退出继承）
 - `storage` 是 rootfs 落点；`template_storage` 是模板（vztmpl）落点，**默认跟随 `storage`**。rootfs 用 lvmthin/zfspool 时模板必须分开放（如 `template_storage: local`），一体存储（dir/NFS）零配置
 - IPv6 默认开启，只发 ULA（`fd` 开头，按 zone 名确定性派生）+ NAT66，不向上游要前缀
-- 靶机（server/client）**不给默认路由**，只能从内网发起
+- 内网主机（server/client）**不给默认路由**，只能从内网发起
 - `nat: true`（默认）让网关做地址转换；`nat: false` 只转发不转换，用于上游已经路由了整个网段的情形
 - 同角色主机不写 `ip` 时自动取不同主机位（两台 `server` 是 `.20`/`.21`，不会撞）
 - 幂等的单位是「步骤 key + 输入哈希」，不是版本号
@@ -61,11 +61,12 @@ zones:
   lab:
     uplink: wan
     v4: 10.77.0.0/24
+    # 整网流量监控：本网络每台主机的接口流量复制到一台监控机的抓包口
+    monitor: { name: probe, mgmt: wan }   # 管理口挂外网桥；不写 mgmt = 本网段
     hosts:
-      gw:    { role: gateway, ip: 1 }
-      cache: { role: analysis, ip: 10, provisioner: apt-mirror, mirror: target }
-      t1:    { role: server, ip: 20, mirror: source,
-               apt_mirror: http://10.77.0.10:3142/debian }
+      gw:     { role: gateway, ip: 1 }
+      t1:     { role: server, ip: 20,
+                apt_mirror: http://10.77.0.10:3142/debian }
     gateway:
       egress: true            # 内网是否允许出网（关 = 立刻切断，已建立连接一起断）
       pub:                    # 端口映射：宿主端口 → 内网某台机
@@ -74,8 +75,8 @@ zones:
         wireguard: false
         openvpn: false
 
-mirrors:                      # 跨 zone 的精确镜像连线（host 级 mirror: 是同 zone 全连的简写）
-  - { from: "sub:victim", to: "main:analysis" }
+mirrors:                      # 精确连线：单台主机的流量交给某台监控机（可跨网络）
+  - { from: "sub:client1", to: "lab:probe" }
 ```
 
 - `role: gateway` 每个 zone 唯一，拿网段 `.1`；`egress` / `pub` / `vpn` 只作用于它
@@ -204,18 +205,18 @@ docs/operations.md  安装、升级、备份恢复、排障
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | **99 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
+| ✅ 单元测试通过 | **101 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
-| ✅ 真机逐接口回归 | 82 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 分析机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
+| ✅ 真机逐接口回归 | 90 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 监控机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
 | ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.7 MB，含 1.48 MB 前端）与内存（常驻 12.0 MiB / 峰值 44.8 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
-| ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` **14/14** 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、靶机**无默认路由**、宿主入向被网关丢弃；幂等重跑全部跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、靶机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）|
+| ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` **14/14** 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、内网主机**无默认路由**、宿主入向被网关丢弃；幂等重跑全部跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、主机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）|
 | ✅ **Web 运维** | 主机表格（电源 start/stop/reboot）、快照（列/建/回滚/删）、run 历史与明细、retry、destroy（zone 名二次确认）。真机逐项验证通过 |
-| ✅ **mirror/analysis** | analysis 主机自动挂 `mirr` 桥（纯二层无 IP）+ 宿主侧 `labmirror@` 单元（tc mirred），落点按桥探测自愈；apt-cacher-ng 缓存链路端到端验证（无外网靶机经缓存装包成功） |
+| ✅ **流量监控** | `zone.monitor` 开整网采集：每个被监控网络一块抓包桥，监控机按主机逐口镜像（tc mirred，双向），监控机可挂本网段/外网/任意网络（`mgmt`），也可复用别的 zone 已有监控机（`use`）；精确连线走 `mirrors:`。采集单元按桥探测落点自愈 |
 | ✅ **网关策略** | `egress` 关：`forward` 里 drop 排在 `established` 之前，容器立刻断网（含已建立连接）；开：`http=200`。端口映射 `tcp:17681 → 10.77.0.20:7681` 实测可穿透（回 `404` 是 ttyd 自己的响应，说明链路通），删除后端口关闭 |
 | ✅ **VPN** | WireGuard：`wg0` 起来、公钥/peer/allowed-ips 正确、客户端 `.conf` 可下载；OpenVPN：`openvpn-server@labyard` active、监听 1194、`.ovpn` 可下载。**关闭也落地**（`disable --now` + 删 `wg0`），平台显示与实际一致 |
 | ✅ **retire / revive** | 主机级与整 zone 级都闭环：停机 → 摘镜像单元 → 拓扑折叠，保留 vmid/IP/磁盘/快照；revive 原样回来且 `gateway` / `mirror` 自动重跑恢复 |
 | ✅ **多规格管理** | 创建/复制（重名 409、非法名 400）、列表、zone 片段单独读写（往返只做块状序列化的风格归一，注释与其他 zone 不动）、增删 zone、删除规格 |
-| ✅ **拓扑** | `/api/topology` 输出**两类节点两类边**：网络（外网 + 各 zone 内网）与主机，边是 `attach`（方向即数据流：外网→网关→内网→主机）与 `mirror`（网段→分析机虚线，按 (网段, 分析机) 聚合）。前端 react-flow + dagre 只负责画。图上可开抽屉改运行态、Shift 框选后右键加镜像、点分析机高亮其镜像虚线 |
+| ✅ **拓扑** | `/api/topology` 输出**两类节点两类边**：网络（外网 + 各 zone 内网）与主机，边是 `attach`（方向即数据流：外网→网关→内网→主机）与 `mirror`（主机→监控机虚线，一台主机一条）。前端 react-flow + dagre 只负责画。图上可开抽屉改运行态、Shift 框选后右键加镜像、悬停监控机高亮其采集链路 |
 | ✅ **可视化编排** | `GET/PUT /api/specs/{name}/model` 做 YAML ↔ JSON 投影，前端用卡片 + 表格改结构，保存走与手工粘贴**同一条校验**（`Spec::parse` + `resolve_all`）；YAML 是可切换的高级选项。代价写在界面上：保存会重排 YAML 并丢注释 |
 | ✅ **重启自愈** | 地址与 nft 规则落成容器内开机单元（`labyard-net` / `labyard-nft`）：`pct reboot` 后地址、含端口映射的完整策略、关闭态的 egress 都原样恢复。这一步是真机发现的——早先只 `ip addr` 一次性下发，容器重启后整个 zone 静默失联，网关静默 fail-open |
 | ✅ **Web 终端** | ttyd 1.7.7 静态二进制注入容器（systemd 单元、绑容器内网地址）→ axum HTTP+WS 反代（hyper client + tokio-tungstenite）→ iframe 嵌入（ttyd 自带 xterm.js、CJK 输入、ZMODEM 传文件）。真机验证：页面 200（729 KB）、WS 握手 `101 Switching Protocols` |

@@ -43,14 +43,14 @@ const { Text } = Typography;
 
 const ROLE_LABEL: Record<string, string> = {
   gateway: "网关",
-  analysis: "分析机",
-  server: "靶机·服务",
-  client: "靶机·终端",
+  monitor: "流量监控",
+  server: "服务主机",
+  client: "终端主机",
 };
 
 const ROLE_COLOR: Record<string, string> = {
   gateway: "blue",
-  analysis: "orange",
+  monitor: "orange",
   server: "green",
   client: "default",
 };

@@ -148,13 +148,20 @@ check("单份规格", "GET", f"/api/specs/{q(ZONE)}", keys=["yaml", "exists", "n
 # 可视化编排的数据源：YAML 的 JSON 投影，不是补全过默认值的那份
 check("结构化视图", "GET", f"/api/specs/{q(ZONE)}/model",
       keys=["model", "exists", "name"])
+check("资源目录", "GET", "/api/catalog",
+      keys=["template_storages", "disk_storages", "templates"])
 check("zone 片段", "GET", f"/api/specs/{q(ZONE)}/zones/{q(ZONE)}",
       keys=["zone", "yaml", "exists"])
 gone = check("zone 片段-不存在也返回 200", "GET",
              f"/api/specs/{q(ZONE)}/zones/nope__", keys=["zone", "yaml", "exists"])
 record(isinstance(gone, dict) and gone.get("exists") is False and gone.get("yaml") is None,
        "不存在的 zone 是 exists:false", "yaml 为 null", 200, str(gone)[:110])
-check("预览", "POST", "/api/preview", {"spec": ZONE}, keys=["steps"])
+pv = check("预览", "POST", "/api/preview", {"spec": ZONE}, keys=["steps"])
+# preview 现在带逐步动作判定：有字段就行（值取决于环境实际状态，不硬断言）
+if isinstance(pv, dict) and pv.get("steps"):
+    first = pv["steps"][0]
+    record("action" in first, "预览带 create/update/skip 判定", "steps[0]",
+           200, str(first)[:110])
 
 head("运行态")
 check("自检", "GET", "/api/doctor", keys=["items"])
@@ -229,6 +236,14 @@ if PW:
         model.setdefault("defaults", {})["cores"] = 3
         check("按结构化视图保存", "PUT", f"/api/specs/{q(TMP)}/model",
               {"model": model}, keys=["ok", "yaml"])
+    # ── 整网监控开关 ──
+    # 开（on=true）会真的建抓包桥/装采集单元，回归里不跑——只验证：
+    # ① use 与 name 同写被 400 挡下（且不动规格）；② 关闭是幂等清理。
+    check("监控开关-use+name 冲突被拒", "POST", f"/api/zones/{q(ZONE)}/monitor",
+          {"on": True, "name": "probe", "use": f"{ZONE}:probe"}, want=400)
+    before = call("GET", f"/api/specs/{q(ZONE)}")[1]
+    check("监控开关-关（幂等）", "POST", f"/api/zones/{q(ZONE)}/monitor",
+          {"on": False}, keys=["ok", "spec"])
     check("加 zone", "POST", f"/api/specs/{q(TMP)}/zones",
           {"zone": "tmp1",
            "yaml": "uplink: wan\nv4: 10.99.1.0/24\nhosts:\n  gw: { role: gateway }\n"},

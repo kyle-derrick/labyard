@@ -1,11 +1,16 @@
 [Unit]
 Description=labyard traffic mirror instance %i
 After=network.target
+# 容器比宿主晚起来是常态：规则挂不上就重试几次，而不是从此静默不镜像。
+StartLimitIntervalSec=300
+StartLimitBurst=6
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/labmirror %i
+Restart=on-failure
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target

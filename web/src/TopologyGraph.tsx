@@ -10,7 +10,7 @@
  * 用户刚拖好的位置会被抹掉、图会跳一下——这也是"用起来卡"的观感来源之一。
  * 所以这里按"节点 id + 边集合"算一个结构签名，签名没变就只更新 data。
  */
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   BackgroundVariant,
@@ -38,9 +38,9 @@ const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
 
 export const ROLE_LABEL: Record<string, string> = {
   gateway: "网关",
-  analysis: "分析机",
-  server: "靶机",
-  client: "靶机",
+  monitor: "流量监控",
+  server: "服务",
+  client: "终端",
 };
 
 type Data = {
@@ -52,7 +52,7 @@ type Data = {
   retired: boolean;
   vmidLabel: string;
   meta: Record<string, unknown>;
-  /** 被选中 / 被"分析机高亮"淡化 */
+  /** 被选中 / 被 hover 高亮时的淡化 */
   selected: boolean;
   dimmed: boolean;
 };
@@ -243,7 +243,6 @@ export default function TopologyGraph({
   nodes,
   edges,
   selected = [],
-  focus,
   onPick,
   onSelect,
   onContextMenu,
@@ -251,36 +250,46 @@ export default function TopologyGraph({
   nodes: TopoNode[];
   edges: TopoEdge[];
   selected?: string[];
-  /** 当前"正在看"的分析机 id：它的镜像虚线高亮，其余淡化 */
-  focus?: string | null;
   onPick?: (n: TopoNode | null) => void;
   onSelect?: (ids: string[]) => void;
   onContextMenu?: (e: React.MouseEvent, n: TopoNode | null) => void;
 }) {
   const sel = useMemo(() => new Set(selected), [selected]);
 
-  // focus（分析机）→ 它接的镜像边 + 相关网络，其余淡化
-  const hotMirror = useMemo(() => {
-    const s = new Set<string>();
-    if (!focus) return s;
+  // 高亮靠 **hover** 而不是点击：点击节点要开抽屉，两个事件会撞在一起。
+  // 悬停监控机节点 = 它的所有镜像线高亮；悬停某条镜像线 = 只高亮那条。
+  const [hoverNode, setHoverNode] = useState<string | null>(null);
+  const [hoverEdge, setHoverEdge] = useState<string | null>(null);
+
+  const mirrorIds = useMemo(() => {
+    const m = new Map<string, string[]>();
     edges.forEach((e, i) => {
-      if (e.kind === "mirror" && e.to === focus) s.add(`${e.kind}:${e.from}->${e.to}:${i}`);
+      if (e.kind !== "mirror") return;
+      const id = `${e.kind}:${e.from}->${e.to}:${i}`;
+      (m.get(e.to) ?? m.set(e.to, []).get(e.to)!).push(id);
     });
-    return s;
-  }, [edges, focus]);
+    return m;
+  }, [edges]);
+
+  const hotMirror = useMemo(() => {
+    if (hoverEdge) return new Set([hoverEdge]);
+    if (hoverNode && mirrorIds.has(hoverNode)) return new Set(mirrorIds.get(hoverNode));
+    return new Set<string>();
+  }, [hoverEdge, hoverNode, mirrorIds]);
 
   const dimmed = useMemo(() => {
-    if (!focus) return new Set<string>();
-    const keep = new Set<string>([focus]);
+    if (!hoverNode || !mirrorIds.has(hoverNode) || hoverEdge) return new Set<string>();
+    // 悬停监控机时淡化无关节点，聚焦它的采集链路
+    const keep = new Set<string>([hoverNode]);
     edges
-      .filter((e) => e.kind === "mirror" && e.to === focus)
+      .filter((e) => e.kind === "mirror" && e.to === hoverNode)
       .forEach((e) => keep.add(e.from));
     const out = new Set<string>();
     nodes.forEach((n) => {
       if (!keep.has(n.id)) out.add(n.id);
     });
     return out;
-  }, [edges, nodes, focus]);
+  }, [edges, nodes, hoverNode, hoverEdge, mirrorIds]);
 
   const built = useMemo(
     () => build(nodes, edges, sel, hotMirror, dimmed),
@@ -343,6 +352,11 @@ export default function TopologyGraph({
         edgesFocusable={false}
         onNodeClick={(_, n) => pick(n.id)}
         onPaneClick={() => pick(undefined)}
+        // hover 高亮：监控机节点与镜像线都接住鼠标
+        onNodeMouseEnter={(_, n) => setHoverNode(n.id)}
+        onNodeMouseLeave={() => setHoverNode(null)}
+        onEdgeMouseEnter={(_, e) => setHoverEdge(e.id)}
+        onEdgeMouseLeave={() => setHoverEdge(null)}
         onNodeContextMenu={(ev, n) => {
           ev.preventDefault();
           const orig = nodes.find((x) => x.id === n.id) ?? null;
@@ -363,7 +377,7 @@ export default function TopologyGraph({
             const d = n.data as Data;
             if (d?.kind === "network") return d.meta?.external ? "#a5b4fc" : "#ddd6fe";
             if (d?.role === "gateway") return "#bbf7d0";
-            if (d?.role === "analysis") return "#bfdbfe";
+            if (d?.role === "monitor") return "#bfdbfe";
             return "#e2e8f0";
           }}
           maskColor="rgba(245,246,248,0.72)"

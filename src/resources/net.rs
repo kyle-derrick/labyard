@@ -43,7 +43,7 @@ pub fn gateway_addressing(
     s
 }
 
-/// 普通主机：静态地址；靶机不给默认路由（避免从内网直接出网）。
+/// 普通主机：静态地址；不给默认路由（避免从内网直接出网）。
 pub fn host_script(
     ipv4: &str,
     gateway: Option<&str>,
@@ -60,7 +60,7 @@ pub fn host_script(
             s.push_str(&format!("ip route replace default via {gw} dev eth0\n"));
         }
     } else {
-        s.push_str("# 靶机：不要默认路由\n");
+        s.push_str("# 内网主机：不要默认路由\n");
         s.push_str("ip route del default 2>/dev/null || true\n");
     }
     if let Some(p) = v6_prefix {
@@ -87,7 +87,7 @@ pub fn host_script(
     s
 }
 
-/// 解析器列表。spec 里写了就用 spec 的——实验网经常要把靶机指向内网 DNS
+/// 解析器列表。spec 里写了就用 spec 的——实验网经常要把内网主机指向内网 DNS
 /// 才能解析到假域名；没写才退回公共解析器。
 ///
 /// 之所以在这里写而不是靠 `pct create --nameserver`：net 步骤在此之后执行，
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn host_has_no_default_route_when_asked() {
         let s = host_script("10.10.1.20/24", Some("10.10.1.1"), None, false, &[]);
-        assert!(s.contains("ip route del default"), "靶机必须删默认路由");
+        assert!(s.contains("ip route del default"), "内网主机必须删默认路由");
         assert!(!s.contains("ip route replace default"));
     }
 
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn dns_comes_from_the_spec() {
-        // 写了 dns 就必须用写的——实验网里靶机要靠内网 DNS 才能解析假域名
+        // 写了 dns 就必须用写的——实验网里内网主机要靠内网 DNS 才能解析假域名
         let dns = vec!["10.10.1.10".to_string(), "1.1.1.1".to_string()];
         let h = host_script("10.10.1.20/24", Some("10.10.1.1"), None, true, &dns);
         assert!(h.contains("nameserver 10.10.1.10"));
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn gateway_uses_its_own_ip_not_the_zone_cidr() {
         // 真机教训：早期把网段地址 10.10.1.0/24 写上接口——网段号当 IP 是错的，
-        // 网关必须拿 .1 这个身份，靶机的默认路由才有落点。
+        // 网关必须拿 .1 这个身份，主机的默认路由才有落点。
         let s = gateway_addressing("10.10.1.1/24", None, "eth1", &[]);
         assert!(s.contains("ip addr replace 10.10.1.1/24 dev eth0"));
         assert!(!s.contains("ip addr replace 10.10.1.0/24"), "网段号不该上接口");

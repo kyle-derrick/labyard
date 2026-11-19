@@ -43,7 +43,7 @@
 | `labvpn` 的 0 字节 `server.key` | `wg genkey > f` 在 `wg` 缺失时留下空文件，之后 `[ -f ]` 判定存在、跳过重建 | 所有密钥判断改成 `[ -s f ]`（非空才算存在）；现存的坑做成回归测试（`gateway.rs` 里断言生成脚本含 `[ -s ... ]`） |
 | `openvpn@server` 模板单元 | `is-enabled` 返回 `enabled-runtime` 且 exit 0，"据此判断已启用"是错的 | 不再借 systemd 模板单元的语义判断状态：VPN 的开关由生成脚本自己落地（`enable --now` / `disable --now` + 删设备），平台只信容器里的实际运行态 |
 | 无特权 LXC 的 tun | 容器内 `mknod` 必然 EPERM；必须让宿主把设备交给容器，且 Stop→Start 才重新读 config | `pct set <vmid> --dev0 /dev/net/tun` 后重启容器（`pct set` 对已运行容器不会生效）；不去手写 `/etc/pve/lxc/<id>.conf`，也不依赖 PVE 的重启编排 |
-| `labmirror` 硬编码 DST veth | analysis 重建后 veth 名变，规则静默失效 | 镜像单元名是 `{zone}-{源vmid}-{目标vmid}`，每次 mirror 步骤按**当前** vmid 重算；停单元时按前缀（源端）+ 后缀（目标端）双向 glob，见 `mirror_unit_globs` |
+| `labmirror` 硬编码落点 veth | 监控机重建后 veth 名变，规则静默失效 | 镜像单元名是 `{zone}-{源vmid}-{目标vmid}`，每次 mirror 步骤按**当前** vmid 重算；停单元时按前缀（源端）+ 后缀（目标端）双向 glob，见 `mirror_unit_globs` |
 | `labgw reset` 清空 set | 重置后出网/映射全丢，需要手工恢复 | 不再有 `reset` 子命令。每次网关步骤**整表重建** `inet labyard`（§8.6.1），规则与规格永远一致，没有"重置后忘了恢复"这个状态 |
 
 边界说清楚：**旧目录不进新仓库的依赖链**；其中的实现可以按需搬运（同一作者、同样 Apache-2.0），但搬运前必须补齐上面的测试项，否则宁可重写。
@@ -64,8 +64,8 @@
 
 ### 2.2 不做（明确写死，避免无限膨胀）
 
-- **不做 VM（qemu）**。只建 LXC；要 Windows / 带内核的靶机，你自己用 PVE 建，平台负责把它接进哪张桥。责任分开
-- **不装业务软件**。server 上跑 nginx、client 上装 nmap、analysis 上装 ELK，都不管（见 §6.2）
+- **不做 VM（qemu）**。只建 LXC；要 Windows / 带内核的虚拟机，你自己用 PVE 建，平台负责把它接进哪张桥。责任分开
+- **不装业务软件**。server 上跑 nginx、client 上装 nmap、监控机上装 ELK，都不管（见 §6.2）
 - **不做操作型 CLI**。只有 `serve` / `doctor` / `apply` / `destroy` 四条命令（§0）
 - 不做多租户 SaaS、不做计费、不做镜像仓库
 - **不做自动发现**。桥上出现但规格里没声明的机器，平台不列、不管、不镜像（早期设计里的 `observed` / `unknown` 两级没有实现，见 §5.9）
@@ -199,7 +199,7 @@ input_hash = sha256(
 
 - 每 zone 一把锁：`/var/lib/labyard/locks/<zone>.lock`（`fs2::FileExt::lock_exclusive`）
 - Web 上重复点"部署" → 第二次直接返回 409 + 当前 run_id
-- 跨 zone 共享资源（被引用的父内网桥、被复用的 analysis）→ 加引用计数，删除时检查
+- 跨 zone 共享资源（被引用的父内网桥、被复用的监控机）→ 加引用计数，删除时检查
 
 ### 4.6 生命周期：stop / retire / destroy 三级
 
@@ -216,7 +216,7 @@ input_hash = sha256(
 1. 必须 `--yes` 且输入 zone 名（两次确认，防手滑）
 2. 桥上若还有**非本 zone** 的成员口 → 不删桥，只删自己的 CT，并打印剩余成员
 3. 被其他 zone `uplink` 引用中 → 拒绝，先改上联
-4. 共享 `analysis` 仍被其他 zone 的 `mirrors` 引用 → 拒绝，先删连线
+4. 共享监控机仍被其他 zone 的 `mirrors` 引用 → 拒绝，先删连线
 
 `retire` 与 `destroy` 的区别只有一个但很关键：**retire 保留 IP 和 VMID 的占用**。否则一下轮重建，同样的 `main-server1` 可能拿到 `10.3.3.14`，你笔记里的地址就全废了。
 
@@ -231,10 +231,10 @@ input_hash = sha256(
 | 网络单元 zone | 小写字母数字，≤10 | `main`、`suba`、`subb` |
 | 主机名 | `{zone}-{role}{n}` | `main-gateway`、`suba-gateway`、`main-client1` |
 | 内网桥 | `{zone}-inner` | `main-inner`、`suba-inner` |
-| 镜像桥 | `mirr`（全局一张，纯二层） | `mirr` |
+| 抓包桥 | `mir{zone}`（每个被监控网络一块，纯二层） | `mirlab`、`mirmain` |
 | 桥名 | 同上，**≤15 字符**（内核 IFNAMSIZ） | `suba-inner`(10) ✅ `longzonename-inner`(18) ❌ |
-| 镜像实例 | `labmirror@{bridge}` | `labmirror@main-inner` |
-| 共享分析机 | `analysis{n}`（不带 zone 前缀） | `analysis1` |
+| 采集实例 | `labmirror@{zone}-{源vmid}-{目标vmid}` | `labmirror@lab-102-100` |
+| 监控机 | `role: monitor` 的主机，可属于任何 zone 或挂外网 | `probe` |
 | 状态目录 | `/var/lib/labyard/zones/{zone}/` | |
 
 **15 字符是真限制**，不是风格问题：`IFNAMSIZ` 是 16（含结尾 `\0`），超了 `ip link add` 直接报 `name not a valid ifname`。zone 名限 ≤10 就是为了让 `{zone}-inner` 落在 15 以内。真超了平台在 plan 阶段报错，并给出建议名（截断 + 2 位哈希），不留到建桥那一刻才失败。
@@ -299,19 +299,17 @@ zones:
     hosts:
       - {name: client, role: client, ip: auto}
 
-# ============ 分析机：全局资源，不属于任何 zone ============
-analysis:
-  - name: main-analysis            # 全局唯一，mirrors 用它引用
-    storage: local-lvm
-    egress: wan                    # wan | none | <zone>  → 第二块口接哪
-    tools: [tcpdump]               # tcpdump | tshark（可选装）
+# ============ 流量监控：整网开关，写在 zone 上 ============
+# monitor 二选一：新建（name + 可选 mgmt）或复用已有（use: "zone:host"）
+  main:
+    monitor: { name: probe, mgmt: wan }    # 管理口挂外网桥；不写 mgmt = 本网段
+  suba:
+    monitor: { use: "main:probe" }         # 复用 main 里那台，抓 suba 全网
 
-# ============ 流量镜像：源桥 → 分析机，多源可投同一台 ============
+# ============ 精确连线：单台主机的流量交给某台监控机（可跨网络）============
 mirrors:
-  - from: main-inner
-    to: main-analysis
-  - from: suba-inner
-    to: main-analysis              # 多个源 → 同一台 analysis，不冲突
+  - from: "subb:client"
+    to: "main:probe"                       # 多个源 → 同一台监控机，不冲突
 ```
 
 字段语义，逐条说清：
@@ -322,9 +320,9 @@ mirrors:
 - `node`：zone 固定在一个 PVE 节点上。桥是 per-node 资源，跨节点要 SDN/VXLAN，明确不做。
 - `gateway.wan`：不写就继承全局 `wan.mode`；写 `{mode: static, ip, gw}` 或 `{mode: dhcp}` 覆盖。DHCP 时平台等租约并回读地址入库。
 - `inner.ipv6`：`auto` 从全局 `ula_prefix` 派生 `/64`；`false` 表示这个 zone 不配 v6（即使全局开了）。
-- **`analysis[].egress`**：`wan` = 第二块口直接挂外网桥（拿管理网地址，方便 SSH 和传报告，但也就暴露在管理网）；`none` = 只有 `mirr` 一块口，完全离线（数据靠 PVE 的 `pct pull` 或快照取出）；`<zone>` = 挂到某个 zone 的内网、通过该 zone 的网关出网（能联网但受网关策略约束）。默认 `wan`。
-- **`mirrors`** 是独立的连线表，不属于任何 zone。所以"给 suba 也抓包"只是在列表里加一行，不需要动 suba 的定义。
-- `hosts[].role`：`server | client | target`，只决定"配不配 gw、装不装基础工具"，**不决定装什么业务**（见 §6.2）。
+- **`zone.monitor`**：整网采集开关，二选一——`{name: probe, mgmt: wan}` 新建一台监控机（`mgmt` = 管理口挂哪：不写 = 本网段、`wan` = 外网桥 DHCP、`<zone>` = 挂到某个 zone 的内网；资源字段 `cores/memory/disk/template/storage` 可覆盖默认），或 `{use: "main:probe"}` 复用别的 zone 已有的监控机。开启后**每个被监控网络一块抓包桥（`mir{zone}`）**，监控机上每个被抓网络对应一块网卡（eth1、eth2……），本网络每台主机的接口流量复制到对应网口。
+- **`mirrors`** 是独立的精确连线表（`from: "zone:host"` → `to: "zone:host"`），不属于任何 zone。所以"给 suba 的某台机也抓包"只是在列表里加一行；`zone.monitor` 是它的批量形态（整网全抓）。两者最后收敛成同一批 `ResolvedMirror`。
+- `hosts[].role`：`gateway | monitor | server | client`，只决定"配不配 gw、要不要抓包口、装不装基础工具"，**不决定装什么业务**（见 §6.2）。
 - `hosts[].ip`：`auto` 或具体地址。`auto` 的结果写进 DB，不回写 YAML，重跑不重排。
 - `count: 2` 展开成 `client1`、`client2`。
 - `access` 可在 `defaults`、`zone`、`host` 三层逐级覆盖：`{mode: password, password: env:JUMP_PW}`。
@@ -380,43 +378,38 @@ mirrors:
 | 保留 | `.0` 网络号、`.255` 广播（/24）、`.1`（网关） |
 | 唯一性 | 同一 zone 内按最后一段查重（`DuplicateIp`：两台机都占 `.20` 直接报错）；跨 zone 靠网段不同，天然隔离 |
 | CIDR 重叠 | **不检测**。两个 zone 写同一个 `10.77.0.0/24` 不会被拦——桥名不同（`lab` + zone 名），但两边路由会互相打架。这是留给人看的：网段规划错了，症状是"能 ping 通但连错机器"，比直接报错难查，所以规划时别偷懒 |
-| `mirr` / `wan` | 不参与分配（前者无 IP，后者由 DHCP 或你指定） |
+| `mir{zone}` / `wan` | 不参与分配（前者无 IP，后者由 DHCP 或你指定） |
 | 持久化 | **不持久化**。地址由 YAML 决定（写了 `ip:` 就用，没写就从 `.10` 起顺序分配），"只增不重排"是文件的性质而不是表的性质——你不动 YAML，地址就不会变 |
 
 vmid 同理但要落库：`vmid_base` 之上取最小空闲，写进 `vmids` 表，下次重跑优先复用。**不用 PVE 的自动分配**——它会在你删掉 1001 后把 1001 给别人，快照名、镜像口、你的笔记就全对不上了。
 
-### 5.6 镜像接线
+### 5.6 流量监控接线
 
-先把 `analysis` 的归属定清楚：**它是"观测节点"，不属于任何 zone**。
+先把监控机的归属定清楚：**它是普通主机，`role: monitor`，可以属于任何 zone，也可以直接挂外网桥**（`zone.monitor.mgmt: wan`）。它不是独立于拓扑之外的观测节点——拓扑图上它就是一台主机，只是多了几块抓包网卡。
 
-- 一张全局 `mirr` 桥：纯二层、无 IP、不挂网关（这条是你明确要求的："只连接 analysis，gateway 不连"）
-- analysis 一块口挂 `mirr`（无 IP），另一块口**可选**挂 `wan`（让它自己能 SSH、能拉包、能出报告）。这个"可选"就是你说的"analysis 可能还会挂外网，可选配"
-- analysis 可以多台，都挂同一张 `mirr` 桥
+- **每个被监控网络一块抓包桥**：`mir{zone}`，纯二层、无 IP、不挂网关。zone 里开 `monitor`（或有 `mirrors:` 指进来的连线）才会建。
+- 监控机上**每个被抓网络对应一块抓包网卡**（eth1、eth2……，`ip=manual` 无地址），管理口（eth0）正常接网络、拿地址、能 SSH/装包。
+- 抓的是**每台主机的接口**，不是网段：同一网络里多台源主机，每台一条 `labmirror@` 实例，各自把源主机 veth 的双向流量 `mirred` 到监控机在该网络抓包桥上的宿主侧口。拓扑图上因此一条主机一条虚线，谁被抓一眼可查。
 
-`mirrors` 里每一条，对应宿主机上一条 `labmirror@<bridge>` 实例：
+`mirrors`（含 `zone.monitor` 展开出来的）每一条，对应宿主机上一条 `labmirror@<instance>` 实例：
 
 ```
-SRC_BRIDGE=main-inner        # 源桥：每个成员口的入向
-DST_IF=veth1002i1            # 落点：analysis 在 mirr 桥上的宿主侧口
+SRC_VMID=102                 # 源主机：逐个枚举它的 veth，双向镜像
+MIRR_BRIDGE=mirlab           # 落点桥：监控机在这张桥上的宿主侧口
+TARGET_VMID=100              # 监控机
 ```
 
 自动化四步：
 
-1. 建 analysis 时记下 vmid，在 `mirr` 桥上按 `veth<vmid>i*` 找宿主侧口
-2. 写 `/etc/labmirror/<instance>.conf`
-3. `systemctl enable --now labmirror@main-inner`
-4. `DST_IF` 留空则让 `labmirror` 自己按 `mirr` 桥探测唯一成员口
+1. 执行时按 `mir{zone}` 桥现探监控机的宿主侧 veth（不写死 `veth<vmid>i*`——监控机重建后 vmid 会变，探测自愈）
+2. 写 `/etc/labyard/mirror/<instance>.conf`
+3. `systemctl enable --now labmirror@<instance>`
+4. 源主机的 veth 比容器晚出现是常态：脚本里带等待重试，挂不上规则就重试几次而不是静默退出
 
 两条推论：
 
-- **多源 → 同一台 analysis 不冲突**。三条实例各管一张源桥，DST 都指向同一个 veth，tc 的 mirred 允许多条 filter 指向同一目标口，互不干扰。所以 `main`、`suba`、`subc` 可以共用一台 `analysis1`。
-- **analysis 重建会静默打断镜像**。vmid 变了，veth 名从 `veth1002i1` 变成 `veth1005i1`，旧 conf 里的 `DST_IF` 指向一个不存在的口，`labmirror` 规则挂不上但**不报错**。所以这一步不能靠输入哈希跳过，每次 `apply` / `doctor` 都要重算并 rewrite，然后 `restart`。
-
-`labmirror` 的最小改造（约 40 行）：
-
-- 读 `/etc/labmirror/%i.conf` 而不是写死的 `/etc/default/labmirror`
-- 改成 `labmirror@.service` 模板单元，`%i` 即实例名（`main-inner`）
-- `DST_IF` 探测改为"按 `MIRR_BRIDGE` 找唯一成员口"，不再依赖 vmid 前缀——analysis 换了也能自愈
+- **多源 → 同一台监控机不冲突**。每个源主机一条实例，落点指向监控机在同一抓包桥上的同一个宿主侧口，tc 的 mirred 允许多条 filter 指向同一目标口，互不干扰。
+- **监控机重建会静默打断镜像**。vmid 变了，veth 名跟着变，旧 conf 里的落点指向一个不存在的口，`labmirror` 规则挂不上但**不报错**。所以每次 `apply` 都按当前桥成员重算并 rewrite，然后 `restart`；脚本内容参与步骤哈希，升级 labmirror 也会触发重装。
 
 ### 5.7 数据库表
 
@@ -458,7 +451,7 @@ retired(zone, host, note, retired_at, PRIMARY KEY (zone, host))  -- host='*' 表
 
 | 约束 | 做法 | 为什么 |
 |---|---|---|
-| **只给 ULA，不给 GUA** | 全局 `ula_prefix: fdxx:xxxx:xxxx::/48`，安装时随机生成并存 DB | 如果直接从上联拿运营商 GUA，内网机器能凭 v6 地址绕过网关直连外网，NAT 日志全失效。"靶机不联网"这条保证会当场破功 |
+| **只给 ULA，不给 GUA** | 全局 `ula_prefix: fdxx:xxxx:xxxx::/48`，安装时随机生成并存 DB | 如果直接从上联拿运营商 GUA，内网机器能凭 v6 地址绕过网关直连外网，NAT 日志全失效。"内网不联网"这条保证会当场破功 |
 | **v6 出网必须过网关** | 网关 `masquerade`（NAT66），内网 default route 指向网关 `::1` | 和 v4 同一套可控性：能审计、能一刀切断、能按 zone 关 |
 | **`target` 角色不配 v6 default route** | 和 v4 一致：`gateway: false` 的主机在 v4/v6 上都不写网关 | 隔离是结构性的，不能靠"记得别配" |
 
@@ -477,19 +470,19 @@ retired(zone, host, note, retired_at, PRIMARY KEY (zone, host))  -- host='*' 表
 
 `nat: true`（默认）时网关对本站内网做地址转换，v4 与 v6 一起开：`ip saddr $LAB4 oifname $WAN masquerade` + `ip6 saddr $LAB6 oifname $WAN masquerade`。
 
-`nat: false` 只做转发、不做转换——用于上游已经把整个网段路由过来的情形（宿主加了静态路由，或 v6 拿到的是真正可分发的前缀）。这时内网地址在外部可见，靶机可以直接从实验网外部被访问，这是"要抓外部回连"的实验必需的。
+`nat: false` 只做转发、不做转换——用于上游已经把整个网段路由过来的情形（宿主加了静态路由，或 v6 拿到的是真正可分发的前缀）。这时内网地址在外部可见，内网机器可以直接从外部被访问，这是"要抓外部回连"的实验必需的。
 
 **默认值必须是 `true`。** 第一版实现里这个字段被解析、被展示在预览里，却从来没传到执行器——`gateway_script` 的 `nat44` 参数是硬编码的 `true`。也就是说 `nat: false` 是一个纯装饰字段，写了没反应。现在的做法是：`ResolvedZone.nat` → `StepKind::Net { nat }` → `gateway_script(..., nat)`，三步都带值，并且有回归测试盯着"`nat: false` 时脚本里不能出现任何 `masquerade`"。
 
-同时改掉的默认值：`nat` 原先 serde 默认 `false`，与"靶机要靠网关出网装包"直接矛盾（不写 `nat` 的实验网会全部断网）。现在默认 `true`。
+同时改掉的默认值：`nat` 原先 serde 默认 `false`，与"内网主机要靠网关出网装包"直接矛盾（不写 `nat` 的实验网会全部断网）。现在默认 `true`。
 
 
 地址规划：
 
 - `ula_prefix` 安装时随机生成（`fd` + 40 bit 随机），不用固定的 `fd00::/8` 子段，避免两个 lab 撞车
-- zone 序号 `i` → `{prefix}:{i}::/64`；`0` 段留给 `mirr`
+- zone 序号 `i` → `{prefix}:{i}::/64`；`0` 段留给抓包桥
 - 网关 `::1`，主机从 `::10` 起，与 v4 分配规则一一对应
-- `mirr` 桥不配 v6（镜像流量是二层复制，与地址无关）
+- 抓包桥 `mir{zone}` 不配 v6（镜像流量是二层复制，与地址无关）
 - **不做 SLAAC、不发 RA**：LXC 里 SLAAC 需要上游发 RA，而宿主桥不能发（会把整个二层域带偏）；静态 ULA 确定、可复现，与 v4 模型一致
 
 两个验收陷阱：
@@ -511,7 +504,7 @@ zones:
     v4: 10.10.1.0/24
     hosts:
       gateway: { role: gateway }
-      analysis: { role: analysis }
+      probe: { role: monitor }
       my-win10: { role: server, vmid: 205 }   # 你手动建的，声明 vmid 就接管
 ```
 
@@ -557,8 +550,8 @@ zones:
 
 | 角色 | 平台做的 | 平台**不**做的 |
 |---|---|---|
-| gateway | 全套：依赖、转发、nftables、`labgw`/`labvpn`、恢复 unit | 不建桥、不挂靶机 |
-| analysis | 抓包基础件（`tcpdump`，`tshark` 可选）、抓包目录、`mirr` 接口 | 不装 ELK / Suricata / Zeek，不写规则、不管分析 |
+| gateway | 全套：依赖、转发、nftables、`labgw`/`labvpn`、恢复 unit | 不建桥、不挂业务主机 |
+| monitor | 抓包基础件（`tcpdump`，`tshark` 可选）、抓包目录、`mir{zone}` 接口 | 不装 ELK / Suricata / Zeek，不写规则、不管分析 |
 | server / client / target | hostname、静态 IP / gw / DNS、SSH 公钥或密码、apt 源、时区 | **不装任何业务软件**（nginx、docker、nmap 都不管） |
 
 除 gateway 外，其余角色共用一份 `bootstrap.sh`（约 120 行纯 shell，随平台分发）：
@@ -680,7 +673,7 @@ lxc.cgroup2.devices.allow: c 10:200 rwm
 
 另外两条只影响使用习惯、不影响代码，但 README 要写：
 
-- **AppArmor 4**：嵌套容器（LXC 里跑 Docker）有已知问题（bug #6538）。你在靶机里装 Docker 自己负责，但报错会很怪，先知道这条
+- **AppArmor 4**：嵌套容器（LXC 里跑 Docker）有已知问题（bug #6538）。你在容器里装 Docker 自己负责，但报错会很怪，先知道这条
 - **PVE 9 的 `pve-test` 仓库改名**（原 `pve-test` 沿用）：装依赖时别引用旧源名
 
 CLI 侧没有变化：`pct`/`qm`/`pvesh` 的参数在 9.x 内稳定。**但"命令能跑"不等于"JSON 结构没变"**——`pvesh --output-format json` 序列化的就是 API 处理器返回的那份结构，字段跟着 API 走。所以 `doctor` 第一件事是 `pvesh get /version`，第二件是拿真实的 `/cluster/resources`、`/nodes/{n}/storage`、`/nodes/{n}/aplinfo` 各调一次，字段缺失就当场报，而不是等到 `apply` 跑到一半 `KeyError`。
@@ -1170,7 +1163,7 @@ TasksMax=256
 |---|---|---|
 | **编排** | `Editor.tsx` + `SpecVisual.tsx` | 默认**可视化**：默认配置 + 每个 zone 一张卡（上联/网段/NAT/出网 + 主机表格），增删 zone 与主机都是点出来的；`YAML` 是同一张卡上可切换的高级选项。两种模式都走「预览计划 → 应用」 |
 | **规格** | `Specs.tsx` | 多份规格的文件级 CRUD（新建 / 复制 / 改 / 删），以及文件内 zone 片段的增删改；片段编辑走 CST 就地改写，保留注释与缩进 |
-| **拓扑** | `TopologyPage.tsx` | 全局拓扑图（React Flow + dagre），**可操作**：点节点开抽屉改运行态、Shift 框选后右键加镜像、点分析机高亮它的镜像虚线。懒加载 |
+| **拓扑** | `TopologyPage.tsx` | 全局拓扑图（React Flow + dagre），**可操作**：点节点开抽屉改运行态、Shift 框选后右键加镜像、悬停监控机高亮它的采集链路。懒加载 |
 | **主机** | `Hosts.tsx` | 主机表（角色、IP、规格归属、电源、retired）+ 单机操作（开/关/重启、快照、retire/revive、终端） |
 | **运行历史** | `Runs.tsx` | run 列表 + 步骤明细 + SSE 实时日志 + retry / cancel |
 | **概览** | `Dashboard.tsx` | PVE 健康、`doctor` 结果统计、规格与主机计数 |
@@ -1178,21 +1171,21 @@ TasksMax=256
 **全局拓扑图是主视图**，不是每个 zone 一张。因为 zone 之间的关系（`suba` 挂在 `main-inner` 上）只有放到一张图里才看得出来；单看一个 zone，它和别人的连接就丢了。`/api/topology` 已经把"谁挂谁""哪条镜像线"解析成 nodes + edges，前端只负责画。
 
 **拓扑的模型（v2，改过一次）**。第一版把 `zone` 当作节点、把 `mirror` 当作一个假节点
-`mirr`，边有 `uplink` / `member` / `mirror-port` / `mirror` 四种。画出来"像那么回事但
+`mirr`，边有四种。这一版后来被推翻了——
 不对"：人看图问的是**"这台机接在哪个网段上"**，而图回答的是"这个对象属于哪个 zone"。
 zone 不是网络，它是一个配置作用域。现在只有两类节点：
 
 | 节点 | 是什么 | 图上显示 |
 |---|---|---|
 | `net:wan` / `net:{zone}` | 外网桥、各 zone 的内网桥 | 紫虚线框；网段、桥名、NAT/出网/映射数 |
-| `host:{zone}:{host}` | 容器 | 网关绿底、分析机蓝底、靶机白底；IP、配置、CT 号、运行状态点 |
+| `host:{zone}:{host}` | 容器 | 网关绿底、监控机蓝底、主机白底；IP、配置、CT 号、运行状态点 |
 
 边只有两条语义，**方向都是数据流方向**：
 
 - `attach`：谁插在谁上面。网关因此有两条——`net_up → gw`（上联口 eth0）与
   `gw → net_zone`（内网口 eth1）。正是这一对边让 dagre 顺着排出了
   `外网 → 网关A → 内网A → 网关B → 内网B` 这条链，不需要额外指定 rank。
-- `mirror`：`net → 分析机` 的虚线单向箭头。同一个 (网段, 分析机) 上多个源主机
+- `mirror`：`源主机 → 监控机` 的虚线单向箭头（一条主机一条线）
   **聚合成一条**，label 里列出被抓的主机名——否则三条虚线完全重合，看起来只有一条。
 
 
@@ -1245,9 +1238,10 @@ ttyd 里的 `lrzsz`（`sz`/`rz` + ZMODEM）就是文件通道，`/terminal/{z}/{
 | 操作 | 结果 |
 |---|---|
 | 点节点 | 右侧抽屉：主机可开机/关机/重启/终端/retire/revive；网络可看出网、加删端口映射 |
-| 点分析机 | 它的镜像虚线高亮成实色、其余节点淡化，一眼看出"这台抓了哪几个网段" |
+| 悬停监控机 | 它的采集链路高亮成实色、其余节点淡化，一眼看出"这台抓了哪几个网段"；悬停单条虚线只高亮那一条 |
+| 悬停单条镜像线 | 只高亮这一条——比点击更轻，点击留给"开抽屉" |
 | Shift + 拖动 | 框选多台主机 |
-| 右键（多选后） | "把 N 台加入镜像 →"列出所有分析机，一次写 N 条 `mirrors:` |
+| 右键（多选后） | "把 N 台的流量交给 →"列出所有监控机，一次写 N 条 `mirrors:`；右键网络节点还能开/关整网监控 |
 | 右键（单节点） | 打开详情、终端、开/关机、复制网段 |
 | 拖动节点 | 只改画布位置，**不写回规格**；结构没变时轮询刷新不会重置位置 |
 
@@ -1260,8 +1254,8 @@ ttyd 里的 `lrzsz`（`sz`/`rz` + ZMODEM）就是文件通道，`/terminal/{z}/{
 |---|---|---|---|
 | 新建 | bridge `main-inner` | 10.3.3.0/24 | — |
 | 新建 | CT 1001 `main-gateway` | 2c/1G/8G, net0=vmbr0, net1=main-inner | — |
-| 新建 | CT 1002 `main-analysis` | 2c/1G/8G, net0=vmbr0, net1=mirr | — |
-| 新建 | 镜像 `main-inner → main-analysis` | tc mirred | — |
+| 新建 | CT 1002 `main-probe`（监控机） | 2c/1G/8G, net0=vmbr0, net1=mir{zone} | — |
+| 新建 | 采集 `主机接口 → 监控机抓包口` | tc mirred（每源主机一条实例） | — |
 | 新建 | CT 1003 `suba-gateway` | net0=main-inner(10.3.3.40), net1=suba-inner | 子单元，接上联 |
 | 更新 | CT 1004 `main-server1` | memory 512→1024 | 需重启 |
 | 跳过 | `provision:main-server1` | 哈希未变 | — |
@@ -1302,7 +1296,8 @@ PUT    /api/specs/{name}/zones/{z}       用片段替换整个 zone
 DELETE /api/specs/{name}/zones/{z}       从规格里删掉 zone（不动 PVE 资源）
 
                       —— 计划与执行 ——
-POST   /api/preview                      解析并返回计划（不执行）
+POST   /api/preview                      解析并返回计划（不执行；逐步骤标注 create/update/skip）
+GET    /api/catalog                      资源目录：可用模板（按存储分组）与存储清单
 POST   /api/apply                        执行，返回 run_id
 GET    /api/runs                         run 历史
 GET    /api/runs/{id}/steps              run 的步骤明细
@@ -1328,6 +1323,7 @@ POST   /api/zones/{z}/gateway/pub        {proto, port, to}
 DELETE /api/zones/{z}/gateway/pub/{idx}  删第 idx 条映射
 POST   /api/zones/{z}/gateway/vpn        {proto: wireguard|openvpn, action: on|off}
 GET    /api/zones/{z}/gateway/vpn/{proto}/client   .conf / .ovpn 下载（现读现拼）
+POST   /api/zones/{z}/monitor            {on: bool, name?, mgmt?, use?}——开关整网流量监控
 
                       —— 生命周期（整 zone）——
 POST   /api/zones/{z}/retire             废弃整个 zone
@@ -1430,7 +1426,7 @@ GET    /api/openapi.json                 上面这份清单
    到我们这边——`doctor` 把"能放模板的存储"列出来已经够用。
 
 **冲突检测放在解析层**，不放在表单层：网段重叠、vmid 冲突、`uplink` 指向不存在的
-zone、镜像目标不是 `analysis`、同一端口映射写两遍……全部在 `resolve_all()` 里报错，
+zone、镜像目标不是 `monitor`、同一端口映射写两遍……全部在 `resolve_all()` 里报错，
 `POST /api/preview` 与 `POST /api/apply` 都走同一条路径，所以"预览能过、应用报错"
 这种事不会发生。错误信息带具体对象名（哪个 zone、哪台主机、哪个端口），
 不返回 `invalid spec` 这种废话。
@@ -1500,7 +1496,7 @@ wireguard 的私钥、openvpn 的 CA 与客户端证书，全部在网关容器�
 | `destroy` | 删除 | 全部释放 | 真不要了 |
 
 retire 是打靶场上最常用的那个动作：一台机器已经打完，但它的快照、磁盘里的痕迹
-还有价值，直接删掉等于把证据扔了；一直开着又占内存、还继续往分析机里灌流量。
+还有价值，直接删掉等于把证据扔了；一直开着又占内存、还继续往监控机里灌流量。
 
 实现上：`retired(zone, host)` 记一行 DB（`host = '*'` 表示整个 zone），拓扑里该节点
 变成灰色虚线、镜像实例（`labmirror@` 单元）被停掉、`gateway`/`mirror` 的步骤记录被
@@ -1529,7 +1525,7 @@ rowan CST 就地替换：只动目标节点，**注释、空行、引号风格�
 `/api/topology` 返回的是**解析后的节点与边**：
 
 ```
-节点  wan | zone | host | mirr          边  uplink | member | mirror-port | mirror
+节点  network(net:wan/net:{zone}) | host    边  attach(uplink/inner/mgmt) | mirror
 ```
 
 节点 id 是稳定字符串（`zone:main`、`host:main:web`），前端用 react-flow + dagre
@@ -1578,7 +1574,7 @@ rowan CST 就地替换：只动目标节点，**注释、空行、引号风格�
 必须手动 +1，否则"改好了但不生效、apply 全程显示 done"。它现在同时管地址脚本与
 nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 
-真机验证：`pct reboot 102`（靶机）后地址回来、且仍然没有默认路由；`pct reboot 101`
+真机验证：`pct reboot 102`（服务主机）后地址回来、且仍然没有默认路由；`pct reboot 101`
 （网关）后地址、含 `tcp:17681 → 10.77.0.20:7681` 的完整策略、以及"egress 关闭"这个状态
 都原样恢复（映射端口继续返回 ttyd 的 404，说明链路通）。
 
@@ -1592,8 +1588,8 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 | 1 | 平台以 root 跑 + Web 暴露 | 拿到面板 = 拿到宿主 | 默认只一个 `admin` + scrypt + 会话 cookie（`HttpOnly`/`SameSite=Strict`/TLS 下加 `Secure`）+ 自签 TLS；**没有** IP allowlist / TOTP / 审计表（§8.4 里逐条写明），外网暴露前请在宿主或上游加一层来源限制 |
 | 2 | Web 是唯一界面，服务挂了就没法操作 | 实验环境"停在那儿" | `labyard doctor` 不需要 Web；`systemctl restart labyard` 恢复；`apply` 命令可应急；再不济直接点 PVE 页面（桥和 CT 都在，只是没人管状态） |
 | 3 | 桥名受 `IFNAMSIZ`(15) 限制 | 长 zone 名会让 `lab` + 名字超长，建桥直接失败 | 解析阶段就拦：zone 名 >10 字符报 `zone 名 \`x\` 超过 10 字符，网桥名会超出 IFNAMSIZ(15) 限制`（桥名规则是 `lab` + zone 名） |
-| 4 | 多层 NAT | 端口映射要逐层配；conntrack 表项按层数翻倍；排障路径变长 | 映射链按 zone 上联自动生成（`uplink` 指向谁，就把 DNAT 落在谁的网关上）；**没有** `doctor --trace` 逐跳探测——排障靠 `nft list ruleset` 看 prerouting 链 + 在靶机侧 `tcpdump` |
-| 5 | analysis 重建后 veth 名变 | 镜像静默失效（规则挂不上但不报错） | 每次 apply 重算 `DST_IF`；doctor 校验 filter 数 = 成员口数 |
+| 4 | 多层 NAT | 端口映射要逐层配；conntrack 表项按层数翻倍；排障路径变长 | 映射链按 zone 上联自动生成（`uplink` 指向谁，就把 DNAT 落在谁的网关上）；**没有** `doctor --trace` 逐跳探测——排障靠 `nft list ruleset` 看 prerouting 链 + 在内网主机侧 `tcpdump` |
+| 5 | 监控机重建后 veth 名变 | 采集静默失效（规则挂不上但不报错） | 每次 apply 按桥现探落点并 rewrite；脚本内容参与哈希 |
 | 6 | apt 源不可达 | provision 失败 | 源可切（tuna/ustc/官方/自定义）；`--no-install-recommends`；失败原样回传 |
 | 7 | 半成品状态 | 重跑不确定 | §4.3 reconcile；不自动删重建 |
 | 8 | 你手动建的 VM 接进内网 | 镜像漏掉它，抓包文件缺主角 | 规格里声明为成员（§5.9）后，平台按声明接管：桥、地址、镜像都覆盖；**没有**自动发现（"桥上看见但没声明"的机器不会被列出来），也就是说漏配一台不会被提醒 |
@@ -1602,7 +1598,7 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 | 10 | 平台自身升级 | DB schema 变 | 编号 SQL 迁移 + `schema_version` 表，启动时按序补齐；**备份要自己做**（`docs/operations.md` 给了 `VACUUM INTO` 的一行命令），平台不会自动备份 |
 | 11 | IPv4 / IPv6 两套规则不一致 | 主机用 link-local / 自配 ULA 绕过 v4 防火墙 | 网关规则表是 `inet labyard`（同时匹配 v4 与 v6），`iifname <上联> oifname <内网> drop` 对两族都生效，不存在"只挡了 v4"的分叉；`nat: false` 只是不生成 masquerade，不影响过滤 |
 | 12 | 多节点下桥不存在于目标节点 | CT 建好却起不来，或起在错误的二层域 | **首版只支持单节点**；`doctor` 检测到集群直接警告不阻止（单节点功能仍可用），建 zone 时强制绑定当前节点 |
-| 13 | PVE 9 AppArmor 4 + 嵌套容器 | 靶机里跑 Docker 报错怪异 | §6.7 写明已知问题（bug #6538）；平台不碰业务软件，但报错会很怪，先知道这条 |
+| 13 | PVE 9 AppArmor 4 + 嵌套容器 | 容器里跑 Docker 报错怪异 | §6.7 写明已知问题（bug #6538）；平台不碰业务软件，但报错会很怪，先知道这条 |
 | 14 | 厚 LVM 快照是 tech preview | 以为有快照，实际不可靠 | `doctor` 列出存储类型（`lvmthin` / `lvm`），快照操作原样透传 PVE 的报错；**没有**额外的"二次确认"门禁 |
 | 15 | 并发 provision 打满磁盘 IO | **全宿主机卡死**，含 PVE 管理面与 SSH（内存/CPU 不足不会这样） | apply 批内并发默认 3（`--concurrency`）+ `systemd` 的 `IOWeight=50` 兜底；**没有** `ionice`（§7.6.5 第 3 条） |
 | 16 | 高频 probe 打慢 pmxcfs | `/etc/pve` 是单线程 FUSE，20 台 N+1 查询会拖慢整个节点 | 状态一律走一次 `GET /cluster/resources?type=vm` 批量取（`Pve::cluster_vms`），不逐台查；前端轮询 6–15 秒（§7.6.5 第 7 条） |
@@ -1625,7 +1621,7 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 
 | 域 | 必须全部可用 |
 |---|---|
-| 建 | zone（任意层嵌套）、桥、LXC、analysis、网络接入（v4 + v6 双栈） |
+| 建 | zone（任意层嵌套）、桥、LXC、监控机、抓包桥（mir{zone}）、网络接入（v4 + v6 双栈） |
 | 配 | 网关全套（转发 / nft / 出网 / 端口映射 / VPN / 重启恢复）、bootstrap（IP·gw·DNS·SSH·apt·时区·lrzsz） |
 | 看 | 全局拓扑、zone 详情、单机详情、运行态、外来成员、任务日志 |
 | 用 | Web 终端（独立窗口、多开）、文件上传下载（终端内 + 面板）、快照 |
@@ -1672,9 +1668,9 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 
 | 问题 | 结论 |
 |---|---|
-| 镜像网职责 | **只做流量镜像**。全局一张 `mirr` 纯二层桥，无 IP、不挂网关，只挂 analysis。gateway 只有 WAN + LAN 两块口 |
-| analysis 外网 | **三选一**：`egress: wan`（默认，拿管理网地址，方便 SSH/传报告）/ `<zone>`（走该 zone 网关，受策略约束）/ `none`（完全离线） |
-| 靶机 | **只做 LXC**。VM 由你在 PVE 自建；要接进 zone 就在规格里声明 `vmid`（§5.9），声明后地址与镜像都覆盖，但平台不重建磁盘。**不做自动发现** |
+| 抓包网职责 | **只做流量镜像**。每个被监控网络一块 `mir{zone}` 纯二层桥，无 IP、不挂网关，只挂监控机的抓包口。gateway 只有 WAN + LAN 两块口 |
+| 监控机管理口 | `zone.monitor.mgmt` **三选一**：不写（本网段）/ `wan`（外网桥 DHCP，方便 SSH/传报告）/ `<zone>`（走该 zone 网关，受策略约束） |
+| 内网主机 | **只做 LXC**。VM 由你在 PVE 自建；要接进 zone 就在规格里声明 `vmid`（§5.9），声明后地址与镜像都覆盖，但平台不重建磁盘。**不做自动发现** |
 | 凭据 | **创建时选**：`key` / `password` / `key-password`，可在 defaults / zone / host 三层逐级覆盖 |
 | 结构 | 不是"单层/双层"，是**同构 zone 的自由组合**。`uplink` 指向 `wan` 或任意 zone，串几层都行 |
 | 平台边界 | 只管网络环境与基础设施；业务软件、VM、具体服务一律不管，责任分开 |
@@ -1807,7 +1803,7 @@ CI 不需要 root 也不需要 PVE。
 
 ## 13. 已经想清楚、不再问你的三件事
 
-**镜像开关的粒度**：数据模型按"每条 `from → to` 一个 systemd 实例"（这样才能多源投同一台 analysis）；界面上默认显示**一个总开关**，展开后是每条链路的独立开关。两个需求同时满足，不用二选一。
+**镜像开关的粒度**：数据模型按"每条 `from → to` 一个 systemd 实例"（这样才能多源投同一台监控机）；界面上默认显示**一个总开关**，展开后是每条链路的独立开关。两个需求同时满足，不用二选一。
 
 **单节点 vs 集群**：只支持单节点，但 `doctor` 在集群环境下**只警告不阻止**——集群里的单节点用法（桥和 CT 都在同一台）完全成立，强行拒绝反而挡路。真要跨节点编排是另一个项目。
 
@@ -1828,7 +1824,7 @@ CI 不需要 root 也不需要 PVE。
 | 5 | 桥存在判定用配置面 | `ip link add` 的桥在 pvesh network 里 `type=unknown` 被滤掉，每轮误判"已消失" | 新增 `kernel_bridges()` 查内核实际面；配置视图留给 doctor |
 | 6 | 安装器复述初始密码 | 安装输出（shell 历史）里出现密码 | 只在 journal 出现一次（bootstrap_password 原有语义） |
 
-**验证结论**：doctor 9 项全绿；apply 6/6 步成功；网关 `.1`、NAT 出网、靶机无默认
+**验证结论**：doctor 9 项全绿；apply 6/6 步成功；网关 `.1`、NAT 出网、内网主机无默认
 路由、宿主入向被丢全部符合设计；幂等重跑 6/6 跳过。
 
 **经验**：这六处全部属于"字段/事件存在但行为断线"或"判定用错了视图"，单元测试

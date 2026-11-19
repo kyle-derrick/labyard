@@ -57,6 +57,12 @@ pub struct AppState {
     /// 单次哈希让进程 HWM 从 6.7 MB 冲到 38 MB。两个并发登录就是 64 MB+，
     /// 正好顶到 `MemoryMax=64M` 会被内核杀掉。所以哈希必须串行。
     pub hash_gate: Arc<tokio::sync::Semaphore>,
+    /// run 闸（容量 1）：同一时刻只执行一个 run。
+    ///
+    /// 一个 run 批内并发 3 个 `pct exec`（各 ~176 MB）≈ 530 MB；两个 run
+    /// 并发就是 1 GB+，真机上 768M + 192M swap 都被吃满然后 oom-kill。
+    /// 串行是刻意的：排队的 run 等 permit，用户端表现是操作依次生效。
+    pub run_gate: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct RunHandle {
@@ -92,6 +98,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(ops::delete_zone),
         )
         .route("/api/preview", post(preview))
+        .route("/api/catalog", get(ops::catalog))
         .route("/api/apply", post(apply))
         .route("/api/runs/{id}/events", get(run_events))
         .route("/api/runs/{id}/cancel", post(cancel_run))
@@ -111,6 +118,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/zones/{z}/gateway/pub", post(ops::gateway_pub_add))
         .route("/api/zones/{z}/gateway/pub/{idx}", delete(ops::gateway_pub_del))
         .route("/api/zones/{z}/gateway/vpn", post(ops::gateway_vpn))
+        .route("/api/zones/{z}/monitor", post(ops::set_zone_monitor))
         .route(
             "/api/zones/{z}/gateway/vpn/{proto}/client",
             get(ops::gateway_vpn_client),
@@ -424,25 +432,64 @@ async fn preview(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(re
         }
     };
     match build_plan(&state, &yaml, req.snapshot) {
-        Ok((zones, plan)) => Json(PreviewResp {
-            zones: zones
-                .iter()
-                .map(|z| serde_json::to_value(z).unwrap_or_default())
-                .collect(),
-            steps: plan
+        Ok((zones, plan)) => {
+            // 逐步骤判定 create/update/skip：把执行器里那套 decide 逻辑
+            // 原样搬到预览里——预览说"会新建"、执行时却走了更新，这种
+            // 不一致比慢更伤人。快照查询全部走 PVE 缓存，热路径 <10ms。
+            let executor = crate::resources::Executor::new(
+                state.pve.clone(),
+                state.db.clone(),
+                state.runner.clone(),
+            );
+            let pairs: Vec<(String, String)> = plan
                 .steps
                 .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "key": s.key,
-                        "phase": s.phase.as_str(),
-                        "input_hash": &s.input_hash[..8],
-                        "zone": s.zone,
-                    })
+                .filter_map(|s| match &s.kind {
+                    crate::core::plan::StepKind::Container {
+                        template_storage,
+                        template,
+                        ..
+                    }
+                    | crate::core::plan::StepKind::Template {
+                        template_storage,
+                        template,
+                    } => Some((template_storage.clone(), template.clone())),
+                    _ => None,
                 })
-                .collect(),
-        })
-        .into_response(),
+                .collect();
+            let snap = executor
+                .load_snapshot(&pairs, &tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap_or_default();
+            Json(PreviewResp {
+                zones: zones
+                    .iter()
+                    .map(|z| serde_json::to_value(z).unwrap_or_default())
+                    .collect(),
+                steps: plan
+                    .steps
+                    .iter()
+                    .map(|s| {
+                        let (action, reason) = match executor.decide(s, &snap) {
+                            crate::resources::Decision::Done => ("skip", "已完成且参数未变"),
+                            crate::resources::Decision::Apply(r) if r == "从未执行" => {
+                                ("create", r)
+                            }
+                            crate::resources::Decision::Apply(r) => ("update", r),
+                        };
+                        serde_json::json!({
+                            "key": s.key,
+                            "phase": s.phase.as_str(),
+                            "input_hash": &s.input_hash[..8],
+                            "zone": s.zone,
+                            "action": action,
+                            "reason": reason,
+                        })
+                    })
+                    .collect(),
+            })
+            .into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
@@ -528,8 +575,15 @@ pub(crate) async fn spawn_plan(state: &Arc<AppState>, plan: &Plan, label: &str) 
     let conc = state.concurrency;
     let rid = run_id.clone();
     let plan = plan.clone();
+    let gate = state.run_gate.clone();
 
     tokio::spawn(async move {
+        // 全局 run 闸：同一时刻只放一个 run 执行。不是性能优化，是内存账本——
+        // 批内并发 3 个 `pct exec`（实测单个峰值 150–176 MB）一个 run 就能
+        // 冲到 500 MB+；两个 run 并发就是 1 GB+，MemoryMax 顶不住，真机上
+        // 已经被 oom-kill 过两次。串行化换来的是"用户怎么点都不会把宿主
+        // 内存打爆"，排队的 run 等 permit，行为可预期。
+        let _permit = gate.acquire().await;
         let (mtx, mut mrx) = mpsc::channel::<Event>(500);
         let btx2 = btx.clone();
         let fwd = tokio::spawn(async move {
@@ -1429,7 +1483,8 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
         ("put", "用片段替换整个 zone"),
         ("delete", "从规格里删掉 zone（不动 PVE 资源）"),
     ]),
-    ("/api/preview", &[("post", "解析规格并返回计划（不执行）")]),
+    ("/api/preview", &[("post", "解析规格并返回计划（不执行，逐步骤标注 create/update/skip）")]),
+    ("/api/catalog", &[("get", "资源目录：可用模板（按存储分组）与存储清单")]),
     ("/api/apply", &[("post", "执行规格，返回 run_id")]),
     ("/api/runs", &[("get", "run 历史")]),
     ("/api/runs/{id}/events", &[("get", "SSE 日志流")]),
@@ -1452,6 +1507,7 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
     ("/api/zones/{z}/gateway/pub", &[("post", "新增端口映射")]),
     ("/api/zones/{z}/gateway/pub/{idx}", &[("delete", "删除第 idx 条端口映射")]),
     ("/api/zones/{z}/gateway/vpn", &[("post", "开/关 VPN（wireguard / openvpn）")]),
+    ("/api/zones/{z}/monitor", &[("post", "开关整网流量监控（写规格并立刻落地抓包口）")]),
     ("/api/zones/{z}/gateway/vpn/{proto}/client", &[("get", "下载客户端配置（现读现拼）")]),
     ("/api/zones/{z}/retire", &[("post", "废弃整个 zone")]),
     ("/api/zones/{z}/revive", &[("post", "恢复整个 zone")]),
@@ -1477,7 +1533,7 @@ fn openapi_doc() -> serde_json::Value {
         "info": {
             "title": "labyard",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "声明式攻防实验网络编排。摘要级清单，不含 schema；前端类型见 web/src/api.ts。",
+            "description": "声明式网络编排。摘要级清单，不含 schema；前端类型见 web/src/api.ts。",
         },
         "paths": paths,
     })

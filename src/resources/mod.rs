@@ -9,7 +9,7 @@ pub mod gateway;
 pub mod net;
 
 use crate::core::plan::{Phase, Step, StepKind};
-use crate::core::spec::ResolvedZone;
+use crate::core::spec::{ResolvedZone, Role};
 use crate::core::runner::{CommandSpec, Event, Runner};
 use crate::db::Db;
 use crate::pve::Pve;
@@ -434,7 +434,8 @@ async fn apply_step(
             template_storage,
             bridge,
             uplink_bridge,
-            mirr_bridge,
+            capture_bridges,
+            dhcp,
             ssh_keys,
             password,
             ..
@@ -456,7 +457,8 @@ async fn apply_step(
                 vol,
                 bridge,
                 uplink_bridge.as_deref(),
-                mirr_bridge.as_deref(),
+                capture_bridges,
+                *dhcp,
                 password.as_deref(),
                 ssh_keys,
                 cancel,
@@ -575,11 +577,17 @@ async fn apply_step(
             // ── Web 终端：ttyd 静态二进制注入 + systemd 单元 ──
             // 绑定容器自己的内网地址而不是 0.0.0.0：网关的 eth1 接 WAN，
             // 监听全网卡等于把终端暴露给外部。
+            //
+            // 地址有可能是 `dhcp`（挂在外网桥上的监控机）：那种情况现查一次
+            // 容器里的实际地址，查不到就跳过终端——把 "dhcp" 这个字面量当
+            // 地址传给 ttyd 只会让单元起不来，而这是增强功能，不该炸掉基础配置。
             {
                 let (zone, host) = (bootstrap_zone, bootstrap_host);
-                let bind_ip = args
-                    .get("ipv4")
-                    .map(|v| v.split('/').next().unwrap_or(v).to_string());
+                let bind_ip = match args.get("ipv4").map(|v| v.as_str()) {
+                    Some("dhcp") => pve.ct_ip(*vmid, "eth0", cancel).await.ok(),
+                    Some(v) => Some(v.split('/').next().unwrap_or(v).to_string()),
+                    None => None,
+                };
                 if let Some(ip) = bind_ip {
                     match pve.ensure_terminal(*vmid, zone.as_str(), host.as_str(), &ip, cancel).await {
                         Ok(true) => {}
@@ -680,8 +688,10 @@ async fn apply_step(
         StepKind::Mirror {
             zone,
             bridge,
+            capture_bridge,
             source_vmid,
             target_vmid,
+            target_iface,
             ..
         } => {
             // labmirror 的脚本与单元模板是二进制内嵌资产——版本永远与
@@ -696,12 +706,14 @@ async fn apply_step(
             let instance = format!("{zone}-{source_vmid}-{target_vmid}");
             let unit = format!("labmirror@{instance}");
             let conf_dir = "/etc/labyard/mirror";
-            // 落点不写死 veth 名：analysis 重建后 veth1002i1→veth1005i1，
-            // 旧名字挂不上规则且不报错。让 labmirror 按 mirr 桥现探。
+            // 落点不写死 veth 名：容器重建后 veth1002i1→veth1005i1，旧名字
+            // 挂不上规则且不报错。让 labmirror 按 vmid 前缀现探源口与目标口。
+            //
             // SRC_BRIDGE 必须是桥名（lablab）而不是 zone 名（lab）——两者
-            // 只在没配 bridge 前缀时碰巧相同，用错了单元会静默 inactive
+            // 只在没配 bridge 前缀时碰巧相同，用错了单元会静默 inactive。
+            // TARGET_IFACE 只进日志，让"抓不到"时能一眼看到该往哪块口上看。
             let conf = format!(
-                "SRC_BRIDGE={bridge}\nMIRR_BRIDGE=mirr\nSOURCE_VMID={source_vmid}\nTARGET_VMID={target_vmid}\n"
+                "SRC_BRIDGE={bridge}\nCAPTURE_BRIDGE={capture_bridge}\nSOURCE_VMID={source_vmid}\nTARGET_VMID={target_vmid}\nTARGET_IFACE={target_iface}\n"
             );
             let b64_script = crate::pve::base64_encode(script_body.as_bytes());
             let b64_unit = crate::pve::base64_encode(unit_body.as_bytes());
@@ -795,8 +807,8 @@ impl Executor {
     /// 停掉匹配给定 glob 的镜像实例（宿主侧 `labmirror@` 单元）。
     ///
     /// 为什么要接受多个 pattern：单元名是 `{zone}-{源vmid}-{目标vmid}`。
-    /// 废弃**源机**要按前缀匹配（`lab-102-*`），废弃**分析机**要按后缀匹配
-    /// （`lab-*-100`）。只做前缀时，retire 一台 analysis 会"成功"但单元还在跑，
+    /// 废弃**源机**要按前缀匹配（`lab-102-*`），废弃**监控机**要按后缀匹配
+    /// （`lab-*-100`）。只做前缀时，retire 一台监控机会"成功"但单元还在跑，
     /// 症状是平台说废弃了、流量照旧灌进去。
     pub async fn stop_mirror_instances(
         &self,
@@ -886,6 +898,15 @@ impl Executor {
         all_zones: &[ResolvedZone],
         cancel: &CancellationToken,
     ) -> Result<DestroyReport, String> {
+        // 外网合成 zone 的"桥"是宿主的上联口（vmbr0 之类）。它由 PVE 管理，
+        // 不是我们建的，删掉等于把宿主踢出网络。
+        if zone.external {
+            return Err(format!(
+                "`{}` 是外网合成 zone（监控机挂在外部网桥上），它的桥属于 PVE，不能销毁",
+                zone.name
+            ));
+        }
+
         // ── 硬检查 1：被其他 zone 当 uplink 引用 → 拒绝 ──
         let dependents: Vec<&str> = all_zones
             .iter()
@@ -944,10 +965,61 @@ impl Executor {
             }
         }
 
-        // ── mirr 桥：analysis 的 eth2 随容器消失，桥空了就一并删 ──
-        if let Ok(m) = self.pve.bridge_members("mirr", cancel).await {
+        // ── 监控机：本 zone **新建**的才删，`use` 复用的不动 ──
+        //
+        // 监控机可能建在别的 zone（甚至外网合成 zone）——按"哪个 zone 里有
+        // 这个名字的 monitor 主机"找落点，再走与普通主机相同的
+        // stop → destroy → 释放 vmid → 忘步骤 管线。
+        if let Some(mon_name) = &zone.monitor_created {
+            let located = all_zones.iter().find_map(|z| {
+                z.hosts
+                    .iter()
+                    .find(|h| &h.name == mon_name && h.role == Role::Monitor)
+                    .map(|h| (&z.name, h))
+            });
+            if let Some((mz, mh)) = located {
+                let hostname = format!("{}-{}", mz, mh.name);
+                let vmid = mh.vmid.or_else(|| self.db.vmid_of(mz, &mh.name));
+                if let Some(vmid) = vmid {
+                    let vms = self.pve.cluster_vms(cancel).await.map_err(|e| e.to_string())?;
+                    let exists = vms
+                        .iter()
+                        .any(|r| r.is_lxc() && r.vmid_parsed() == Some(vmid));
+                    if exists {
+                        match self.pve.ct_status(vmid, cancel).await {
+                            Ok(Some(st)) if st == "running" => {
+                                self.pve
+                                    .ct_action(vmid, "stop", cancel)
+                                    .await
+                                    .map_err(|e| format!("停监控机 {hostname} 失败: {e}"))?;
+                            }
+                            Ok(_) => {}
+                            Err(e) => return Err(format!("查监控机 {hostname} 状态失败: {e}")),
+                        }
+                        self.pve
+                            .ct_action(vmid, "destroy", cancel)
+                            .await
+                            .map_err(|e| format!("删监控机 {hostname} 失败: {e}"))?;
+                        report.destroyed_cts.push((hostname, vmid));
+                    }
+                    self.db.release_vmid(mz, &mh.name);
+                    for prefix in ["ct", "net", "bootstrap", "snapshot"] {
+                        self.db
+                            .forget_step(&format!("{prefix}:{}:{}", mz, mh.name));
+                    }
+                }
+            }
+        }
+
+        // ── 抓包桥：监控机在这块网络上的网卡随容器消失，桥空了就一并删 ──
+        //
+        // 一个被监控网络一块桥（mir{zone}），所以这里逐块查——旧实现只有
+        // 一块全局 mirr，删 zone 时跟它没关系。
+        let cap = crate::core::spec::capture_bridge(&zone.name);
+        if let Ok(m) = self.pve.bridge_members(&cap, cancel).await {
             if m.is_empty() {
-                let _ = self.pve.destroy_bridge("mirr", cancel).await;
+                let _ = self.pve.destroy_bridge(&cap, cancel).await;
+                self.db.forget_step(&format!("bridge:mir:{}", zone.name));
             }
         }
 

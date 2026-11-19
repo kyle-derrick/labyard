@@ -406,6 +406,51 @@ pub fn remove_mirror(doc: &str, from: &str, to: &str) -> Result<String, String> 
     Err(format!("没有找到连线 {from} → {to}"))
 }
 
+/// 打开/关闭某 zone 的整网流量监控（`zone.monitor`）。
+///
+/// `monitor=None` 移除开关（关掉采集）；`Some(obj)` 写入 `name` / `mgmt` /
+/// `use` / 资源字段。只动 `monitor` 这一个节点，注释与空行保留。
+/// `use` 与 `name` 互斥的规则在这里先挡一道——报错要落在保存前，
+/// 不能等用户点了执行才看到 Spec::parse 的抱怨。
+pub fn set_zone_monitor(
+    doc: &str,
+    zone: &str,
+    monitor: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let d = parse(doc)?;
+    let z = zone_of(&d, zone)?;
+    match monitor {
+        Some(v) => {
+            let obj = v
+                .as_object()
+                .ok_or_else(|| "monitor 要求是对象（{\"name\": ...} 或 {\"use\": ...}）")?;
+            if obj.contains_key("use") && obj.contains_key("name") {
+                return Err("monitor 的 use 与 name 只能写一个".into());
+            }
+            let m = Mapping::new();
+            for (k, val) in obj {
+                match val {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::String(s) => m.set(k.as_str(), s.as_str()),
+                    serde_json::Value::Number(n) => m.set(
+                        k.as_str(),
+                        n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
+                    ),
+                    serde_json::Value::Bool(b) => m.set(k.as_str(), *b),
+                    // 数组（targets）先不开放：整网开关用不到精确清单，
+                    // 要精确连线就走 mirrors
+                    _ => return Err(format!("monitor.{k} 暂不支持这种类型")),
+                }
+            }
+            z.set("monitor", m);
+        }
+        None => {
+            z.remove("monitor");
+        }
+    }
+    Ok(d.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

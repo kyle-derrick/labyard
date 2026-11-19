@@ -57,7 +57,7 @@ export default function Login({ onOk }: { onOk: () => void }) {
           <Title level={3} style={{ marginBottom: 4 }}>
             labyard
           </Title>
-          <Text type="secondary">实验网络编排控制台</Text>
+          <Text type="secondary">网络编排控制台</Text>
         </div>
 
         {error && (

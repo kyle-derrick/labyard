@@ -418,6 +418,81 @@ pub async fn gateway_egress(
 }
 
 #[derive(Deserialize)]
+pub struct MonitorReq {
+    /// true = 开启整网采集；false = 关闭
+    pub on: bool,
+    /// 新建监控机的名字（不写用默认 monitor）
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 新建监控机管理口挂哪：wan / 某 zone 名；不写 = 本 zone 内网
+    #[serde(default)]
+    pub mgmt: Option<String>,
+    /// 复用已有监控机：`zone:host`（JSON 键是 `use`，与规格字段同名）
+    #[serde(rename = "use", default)]
+    pub use_host: Option<String>,
+}
+
+/// 整网流量监控开关：写规格 + 立刻落地。
+///
+/// 开启 = 建抓包桥（每个被监控网络一块）、给监控机装抓包网卡、装采集单元；
+/// 关闭 = 规格里移除 monitor，旧抓包桥与单元在下一次 apply 时清理。
+/// 阶段与 add_mirror 相同（Bridge/Container/Mirror）：只跑 Mirror 会拿到
+/// "桥和网卡都还不存在"的单元，而单元自己会静默退出。
+pub async fn set_zone_monitor(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(zone): Path<String>,
+    Json(req): Json<MonitorReq>,
+) -> Response {
+    render_async(async {
+        authed(&state, &headers)?;
+        // 互斥在这里挡（而不是等 specs::set_zone_monitor）：前端不会同时传，
+        // 但手打请求会——两个都传说明调用方没想清楚，直接 400。
+        if req.use_host.is_some() && req.name.is_some() {
+            return Err(bad("monitor 的 use 与 name 只能写一个"));
+        }
+        let (spec_name, cur) = locate_zone(&state, &zone)?;
+        let monitor = if req.on {
+            let mut obj = serde_json::Map::new();
+            if let Some(u) = &req.use_host {
+                obj.insert("use".into(), serde_json::json!(u));
+            } else {
+                obj.insert(
+                    "name".into(),
+                    serde_json::json!(req.name.clone().unwrap_or(crate::core::spec::DEFAULT_MONITOR.to_string())),
+                );
+                if let Some(mg) = &req.mgmt {
+                    obj.insert("mgmt".into(), serde_json::json!(mg));
+                }
+            }
+            Some(serde_json::Value::Object(obj))
+        } else {
+            None
+        };
+        let next = specs::set_zone_monitor(&cur, &zone, monitor.as_ref()).map_err(bad)?;
+        save_spec(&state, &spec_name, &next)?;
+        let run_id = match build_plan(&state, &next, false).map_err(|e| bad(e)) {
+            Ok((_, mut plan)) => {
+                plan.steps.retain(|s| {
+                    matches!(s.phase, Phase::Bridge | Phase::Container | Phase::Mirror)
+                });
+                if plan.steps.is_empty() {
+                    None
+                } else {
+                    Some(spawn_plan(&state, &plan, &format!("monitor:{zone}")).await)
+                }
+            }
+            // 规格已写进去：落地失败是运行态问题，不该回滚开关
+            Err(_) => None,
+        };
+        Ok(Json(
+            serde_json::json!({ "ok": true, "spec": spec_name, "run_id": run_id }),
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
 pub struct PubReq {
     pub proto: String,
     pub port: u16,
@@ -840,6 +915,9 @@ fn collect_mirrors(state: &AppState, only: Option<&str>) -> ApiResult<Vec<serde_
                 "from": format!("{}:{}", m.from_zone, m.from_host),
                 "to": format!("{}:{}", m.to_zone, m.to_host),
                 "src_bridge": m.src_bridge,
+                "capture_bridge": m.capture_bridge,
+                "source_iface": "eth0",
+                "target_iface": m.to_iface,
             }));
         }
     }
@@ -878,13 +956,23 @@ pub async fn add_mirror(
 
         // 立刻把镜像实例装起来，而不是等下一次全量 apply：用户刚加的连线，
         // 打开「主机」页看不到 `labmirror@` 单元只会以为没生效。
-        let src_zone = req
-            .from
-            .split_once(':')
-            .map(|(z, _)| z.to_string())
-            .ok_or_else(|| bad("from 请写成 zone:host"))?;
-        let run_id = match steps_plan(&state, &src_zone, &next, &[Phase::Mirror]).await {
-            Ok(p) => Some(spawn_plan(&state, &p, &format!("mirror:{src_zone}")).await),
+        //
+        // 阶段要带上 Bridge 与 Container：新连线的目标监控机可能第一次接这个
+        // 网络，它需要一块新的抓包网卡、以及对应的两层桥。只跑 Mirror 阶段会
+        // 拿到一个"桥不存在、网口不存在"的单元，而单元自己会静默退出。
+        // 全量计划（不限 zone）里截取三个阶段：镜像连线可能跨 zone，
+        // 目标监控机还可能在外网 zone，只截单 zone 会漏掉另一半。
+        let run_id = match build_plan(&state, &next, false).map_err(|e| bad(e)) {
+            Ok((_, mut plan)) => {
+                plan.steps.retain(|s| {
+                    matches!(s.phase, Phase::Bridge | Phase::Container | Phase::Mirror)
+                });
+                if plan.steps.is_empty() {
+                    None
+                } else {
+                    Some(spawn_plan(&state, &plan, "mirror:add").await)
+                }
+            }
             // 规格已经写进去了：实例起不来是运行态问题，不该把写入回滚掉
             Err(_) => None,
         };
@@ -1054,7 +1142,7 @@ async fn do_retire(
         }
     }
 
-    // 摘掉镜像实例：废弃的机器不该继续往分析机里灌流量
+    // 摘掉镜像实例：废弃的机器不该继续往监控机里灌流量
     let ex = Executor::new(state.pve.clone(), state.db.clone(), state.runner.clone());
     let stopped_units = ex
         .stop_mirror_instances(&mirror_unit_globs(&zone, &host, retire_vmid), &cancel)
@@ -1155,8 +1243,8 @@ async fn do_revive(
 ///
 /// 单元名是 `{zone}-{源vmid}-{目标vmid}`，于是两支都要照顾：
 /// - 废弃**源机** → 前缀匹配 `lab-102-*`；
-/// - 废弃**分析机（目标端）** → 后缀匹配 `lab-*-100`。只按前缀做的话，
-///   retire 一台 analysis 会"成功"但单元还在跑，流量照旧灌进已停掉的容器。
+/// - 废弃**监控机（目标端）** → 后缀匹配 `lab-*-100`。只按前缀做的话，
+///   retire 一台监控机会"成功"但单元还在跑，流量照旧灌进已停掉的容器。
 /// - 整个 zone、或查不到 vmid → `lab-*`，宁可多停几个（下一次 apply 会按
 ///   当前规格重新装回来），也不能留下"平台说废弃了、实际还在跑"。
 fn mirror_unit_globs(zone: &str, host: &str, vmid: Option<u32>) -> Vec<String> {
@@ -1164,6 +1252,75 @@ fn mirror_unit_globs(zone: &str, host: &str, vmid: Option<u32>) -> Vec<String> {
         (false, Some(v)) => vec![format!("{zone}-{v}-*"), format!("{zone}-*-{v}")],
         _ => vec![format!("{zone}-*")],
     }
+}
+
+/// 资源目录：可视化编排的下拉数据源。
+///
+/// 模板按存储分组返回，而不是一张平表——同一个模板名可能存在于多个
+/// 存储上，`template` + `template_storage` 是一对，平表丢掉配对信息。
+/// 请求代价有 TTL 缓存兜底（storage 120s / content 15s），反复打开
+/// 编排页不会打爆 PVE。
+pub async fn catalog(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    render_async(async {
+        authed(&state, &headers)?;
+        let cancel = CancellationToken::new();
+        let all = state
+            .pve
+            .storages(&cancel)
+            .await
+            .map_err(internal)?;
+        // 只要有 vztmpl 能力的存储才值得出现在"模板存储"下拉里；
+        // rootfs 存储单独一组，两种用途不混。
+        let mut tpl_storages = Vec::new();
+        let mut disk_storages = Vec::new();
+        let mut templates = Vec::new();
+        for s in &all {
+            let active = s.active.unwrap_or(0) == 1;
+            if !active {
+                continue;
+            }
+            let content = s.content.as_deref().unwrap_or("");
+            let can_tpl = content.split(',').any(|c| c.trim() == "vztmpl");
+            let can_disk = content.split(',').any(|c| c.trim() == "rootdir" || c.trim() == "images");
+            if can_disk {
+                disk_storages.push(serde_json::json!({
+                    "storage": s.storage,
+                    "kind": s.kind,
+                    "avail": s.avail,
+                    "total": s.total,
+                }));
+            }
+            if can_tpl {
+                tpl_storages.push(serde_json::json!({
+                    "storage": s.storage,
+                    "kind": s.kind,
+                }));
+                let vols = state
+                    .pve
+                    .templates_on(&s.storage, &cancel)
+                    .await
+                    .unwrap_or_default();
+                for v in vols {
+                    // volid 形如 local:vztmpl/debian-12-standard...，剥出文件名给 UI 显示
+                    let label = v.rsplit('/').next().unwrap_or(&v).to_string();
+                    templates.push(serde_json::json!({
+                        "storage": s.storage,
+                        "volid": v,
+                        "label": label,
+                    }));
+                }
+            }
+        }
+        Ok(Json(serde_json::json!({
+            "template_storages": tpl_storages,
+            "disk_storages": disk_storages,
+            "templates": templates,
+        })))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1183,7 +1340,7 @@ mod tests {
         let g = mirror_unit_globs("lab", "cache", Some(100));
         assert!(
             g.iter().any(|p| p == "lab-*-100"),
-            "废弃分析机必须能匹配目标端: {g:?}"
+            "废弃监控机必须能匹配目标端: {g:?}"
         );
     }
 

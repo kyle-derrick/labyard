@@ -7,11 +7,11 @@
 //! 阶段内无依赖的步骤，也可以只重跑失败的后半段。
 
 use crate::core::spec::{
-    ResolvedMirror, ResolvedPub, ResolvedVpn, ResolvedZone, Role,
+    capture_bridge, ResolvedMirror, ResolvedPub, ResolvedVpn, ResolvedZone, Role,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// 执行阶段。顺序即语义：前面的阶段必须先完成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -88,13 +88,16 @@ pub enum StepKind {
         storage: String,
         /// 模板所在存储（查 volid 用）
         template_storage: String,
-        /// analysis 主机挂 mirr 桥的口（抓包落点）；其余主机为 None
-        mirr_bridge: Option<String>,
+        /// 抓包口：一个被监控网络一块，按 zone 名排序后落在 eth1、eth2……
+        /// 空列表 = 这台主机不抓包。eth0 恒为管理口。
+        capture_bridges: Vec<String>,
         node: Option<String>,
         /// 接入桥（建机时就绑，避免先建后改）
         bridge: String,
         /// 只有网关有第二块网卡（上联）。没有它，网关脚本配 eth1 会直接失败。
         uplink_bridge: Option<String>,
+        /// eth0 走 DHCP 而不是静态地址。只有"挂在外部网桥上"的主机是这样。
+        dhcp: bool,
         ipv4: String,
         gateway: Option<String>,
         // dns 不在这里：解析器由 net 步骤写 /etc/resolv.conf，这里再存一份只会漂
@@ -112,7 +115,7 @@ pub enum StepKind {
         ipv6_prefix: Option<String>,
         /// 是否网关：走带 NAT 的网关脚本，内网口 eth0 / 上联口 eth1
         is_gateway: bool,
-        /// 是否需要默认路由。网关与分析机需要（要出网装包），靶机不要
+        /// 是否需要默认路由。网关与监控机需要（要出网装包），普通主机不要
         default_route: bool,
         /// 解析器列表（来自 spec，逐级继承）。空 = 用内置公共 DNS。
         dns: Vec<String>,
@@ -154,12 +157,15 @@ pub enum StepKind {
         zone: String,
         /// 源桥的实际名字（zone 名与桥名不一定相同：lab → lablab）
         bridge: String,
+        /// 抓包桥：这块网络的流量落到监控机的哪块两层桥上（`mir{zone}`）
+        capture_bridge: String,
         source_host: String,
         source_vmid: u32,
-        /// 目标所在 zone（可以不是源 zone——mirr 桥是全局的）
+        /// 目标所在 zone（可以不是源 zone——抓包口是每网络独立的）
         target_zone: String,
         target_host: String,
         target_vmid: u32,
+        /// 监控机上的抓包网卡（eth1、eth2……），只用于日志与排障
         target_iface: String,
     },
     Snapshot {
@@ -199,21 +205,29 @@ impl Plan {
     ) -> Self {
         let mut steps = Vec::new();
 
-        // ── 0. mirr 桥：有 analysis 主机才建（纯二层、无 IP、不挂网关）──
-        let has_analysis = zones
-            .iter()
-            .any(|z| z.hosts.iter().any(|h| h.role == Role::Analysis));
-        if has_analysis {
+        // ── 0. 抓包桥：每个"被监控的网络"一块独立的两层桥 ──
+        //
+        // 一个网络一块，而不是全局共用一块：共用的话监控机那几块网卡会落进
+        // 同一个广播域，两块口收到同一份流量，抓包工具分不清哪个包来自哪个
+        // 网络——而这正是"接了多个网络"唯一要回答的问题。
+        let mut mir_zones: BTreeSet<String> = BTreeSet::new();
+        for z in zones {
+            for h in &z.hosts {
+                mir_zones.extend(h.capture.iter().cloned());
+            }
+        }
+        for zn in &mir_zones {
+            let name = capture_bridge(zn);
             let kind = StepKind::Bridge {
-                zone: "mirr".into(),
-                name: "mirr".into(),
+                zone: zn.clone(),
                 mgmt_ip: String::new(),
+                name: name.clone(),
                 uplink_bridge: String::new(),
             };
             steps.push(Step {
-                key: "bridge:mirr".into(),
+                key: format!("bridge:mir:{zn}"),
                 phase: Phase::Bridge,
-                zone: "mirr".into(),
+                zone: zn.clone(),
                 input_hash: hash_of(&kind),
                 deps: vec![],
                 kind,
@@ -222,6 +236,12 @@ impl Plan {
 
         // ── 1. 桥：每个 zone 一个，先建上游 ──
         for z in zones {
+            // 外网合成 zone 的"桥"是 PVE 本来就有的 wan 桥，既不该建也不该
+            // 往里写管理地址——`ensure_bridge` 会往里塞一段 iface 配置，
+            // 那等于把宿主的上联口改了。
+            if z.external {
+                continue;
+            }
             let kind = StepKind::Bridge {
                 zone: z.name.clone(),
                 mgmt_ip: z.bridge_mgmt_ip.clone(),
@@ -288,40 +308,42 @@ impl Plan {
                     template: h.template.clone(),
                     storage: h.storage.clone(),
                     template_storage: h.template_storage.clone(),
-                    mirr_bridge: if h.role == Role::Analysis {
-                        Some("mirr".to_string())
-                    } else {
-                        None
-                    },
+                    capture_bridges: h.capture.iter().map(|z| capture_bridge(z)).collect(),
                     node: h.node.clone(),
                     bridge: z.bridge.clone(),
-                    // analysis 也要上联：它得自己 apt-get 装 apt-cacher-ng
-                    //（设计里是"可选"，但不给就没法装缓存服务）
-                    uplink_bridge: if matches!(
-                        h.role,
-                        Role::Gateway | Role::Analysis
-                    ) {
+                    // 监控机不需要额外的上联口：它在 zone 里就是个普通主机，
+                    // 出网走网关。只有网关才有第二块网卡（上联）。
+                    uplink_bridge: if h.role == Role::Gateway {
                         z.uplink_bridge.clone()
                     } else {
                         None
                     },
+                    dhcp: z.external,
                     ipv4: h.ipv4.clone(),
                     gateway,
                     ssh_keys: h.ssh_keys.clone(),
                     password: h.password.clone(),
                     hostname: format!("{}-{}", sanitize(&z.name), sanitize(&h.name)),
                 };
+                let mut deps = vec![format!(
+                    "template:{}:{}",
+                    h.template_storage, h.template
+                )];
+                // 外网 zone 没有自己的桥步骤（桥是 PVE 的 wan 桥）
+                if !z.external {
+                    deps.push(format!("bridge:{}", z.name));
+                }
+                // 抓包口要在建容器之前就绪：`pct create --net1 bridge=...` 里
+                // 写了不存在的桥，PVE 会建出一块"挂着但不通"的网卡，且不报错。
+                for c in &h.capture {
+                    deps.push(format!("bridge:mir:{c}"));
+                }
                 steps.push(Step {
                     key: format!("ct:{}:{}", z.name, h.name),
                     phase: Phase::Container,
                     zone: z.name.clone(),
                     input_hash: hash_of(&kind),
-                    deps: vec![
-                        format!("bridge:{}", z.name),
-                        format!("template:{}:{}", h.template_storage, h.template),
-                        // analysis 的 mirr 口要在建容器前就绪
-                        "bridge:mirr".to_string(),
-                    ],
+                    deps,
                     kind,
                 });
             }
@@ -329,6 +351,11 @@ impl Plan {
 
         // ── 4. 网络 ──
         for z in zones {
+            // 外网 zone 的主机地址由 DHCP 给，路由/DNS 也是 DHCP 塞进来的。
+            // 再跑一遍静态配置只会把它覆盖成一份错的。
+            if z.external {
+                continue;
+            }
             let gw_ipv4 = z
                 .hosts
                 .iter()
@@ -337,11 +364,8 @@ impl Plan {
             for h in &z.hosts {
                 let vmid = h.vmid.unwrap_or_else(|| vmid_for(&z.name, &h.name));
                 let is_gw = h.role == Role::Gateway;
-                // 网关要出网（走 eth1），分析机要装包，靶机必须隔离
-                let wants_route = matches!(
-                    h.role,
-                    Role::Gateway | Role::Analysis
-                );
+                // 网关要出网（走 eth1），监控机要装包/上报，其余主机必须隔离
+                let wants_route = matches!(h.role, Role::Gateway | Role::Monitor);
                 let kind = StepKind::Net {
                     zone: z.name.clone(),
                     host: h.name.clone(),
@@ -372,8 +396,8 @@ impl Plan {
         // 为前提。没配 provisioner 的按 "none" 走，只跑 base bootstrap。
         //
         // 但有一条隐式依赖必须显式化：`apt_mirror` 指向内网缓存时，缓存那台
-        // 必须先装完 apt-cacher-ng。真机上撞到过——靶机的 bootstrap 与缓存的
-        // provisioner 同时在跑，靶机 apt update 打到一个还没人监听的 3142，
+        // 必须先装完 apt-cacher-ng。真机上撞到过——主机的 bootstrap 与缓存的
+        // provisioner 同时在跑，主机 apt update 打到一个还没人监听的 3142，
         // 整步失败，而"网络没问题"的表象会让人怀疑到错的地方去。
         let mut apt_source: HashMap<(String, String), String> = HashMap::new();
         for z in zones {
@@ -486,20 +510,29 @@ impl Plan {
         }
 
         // ── 7. 镜像链路：解析层已经展开成确定的连线表 ──
-        // 计划层只负责补 vmid 与依赖。跨 zone 的连线在这里和同 zone 的没有区别——
-        // mirr 桥是全局的，源桥由解析层给。
+        // 计划层只负责补 vmid、抓包桥与依赖。跨 zone 的连线在这里和同 zone
+        // 的没有区别——每条连线自带它该落的抓包桥。
+        //
+        // 哈希里要含脚本内容：`labmirror.sh` 改了而哈希没变，已经"完成"的
+        // 步骤全部跳过，宿主编排里跑的还是旧脚本——这种不一致在界面上完全
+        // 看不出来（所有步骤都是 done）。bootstrap 早就这么做了，这里补上。
+        let mirror_script_hash = crate::resources::assets::Assets::text("base/labmirror.sh")
+            .map(|s| sha256_hex(s.as_bytes()))
+            .unwrap_or_default();
         for m in mirrors {
             let kind = StepKind::Mirror {
                 zone: m.from_zone.clone(),
                 bridge: m.src_bridge.clone(),
+                capture_bridge: m.capture_bridge.clone(),
                 source_host: m.from_host.clone(),
                 source_vmid: vmid_for(&m.from_zone, &m.from_host),
                 target_zone: m.to_zone.clone(),
                 target_host: m.to_host.clone(),
                 target_vmid: vmid_for(&m.to_zone, &m.to_host),
-                // 落点是 analysis 在 mirr 桥上的宿主侧 veth，执行时探测
-                target_iface: String::new(),
+                target_iface: m.to_iface.clone(),
             };
+            let mut hsh = hash_of(&kind);
+            hsh.push_str(&mirror_script_hash);
             steps.push(Step {
                 key: format!(
                     "mirror:{}:{}->{}:{}",
@@ -507,11 +540,13 @@ impl Plan {
                 ),
                 phase: Phase::Mirror,
                 zone: m.from_zone.clone(),
-                input_hash: hash_of(&kind),
+                input_hash: sha256_hex(hsh.as_bytes()),
                 deps: vec![
+                    // 源主机要活着（veth 才存在）
                     format!("bootstrap:{}:{}", m.from_zone, m.from_host),
-                    format!("net:{}:{}", m.to_zone, m.to_host),
-                    "bridge:mirr".to_string(),
+                    // 目标监控机要把抓包网卡建出来（ct 步骤负责网卡）
+                    format!("ct:{}:{}", m.to_zone, m.to_host),
+                    format!("bridge:mir:{}", m.from_zone),
                 ],
                 kind,
             });
@@ -723,9 +758,9 @@ zones:
         };
         // (is_gateway, default_route)
         assert_eq!(get("gateway"), (true, true), "网关是网关，且要出网");
-        assert_eq!(get("analysis"), (false, true), "分析机不是网关，但要装包");
-        assert_eq!(get("server1"), (false, false), "靶机不要默认路由");
-        assert_eq!(get("client1"), (false, false), "靶机不要默认路由");
+        assert_eq!(get("analysis"), (false, true), "监控机不是网关，但要装包");
+        assert_eq!(get("server1"), (false, false), "普通主机不要默认路由");
+        assert_eq!(get("client1"), (false, false), "普通主机不要默认路由");
     }
 
     #[test]
@@ -894,8 +929,8 @@ zones:
 
     #[test]
     fn apt_mirror_host_waits_for_the_cache() {
-        // 真机上撞到的竞态：靶机的 apt_mirror 指向内网缓存，而缓存的
-        // apt-cacher-ng 还没装完，靶机 apt update 直接 connection refused。
+        // 真机上撞到的竞态：主机的 apt_mirror 指向内网缓存，而缓存的
+        // apt-cacher-ng 还没装完，主机 apt update 直接 connection refused。
         // 依赖必须显式写出来，靠并发调度"大概先跑"是不行的。
         let y = r#"
 defaults: { cores: 1, memory: 512, disk: 4, template: debian-13, storage: local-lvm }
@@ -913,7 +948,7 @@ zones:
         let c = p.steps.iter().find(|s| s.key == "bootstrap:main:client1").unwrap();
         assert!(
             c.deps.contains(&"bootstrap:main:cache".to_string()),
-            "指向内网缓存的靶机必须等缓存装完: {:?}",
+            "指向内网缓存的主机必须等缓存装完: {:?}",
             c.deps
         );
         let o = p.steps.iter().find(|s| s.key == "bootstrap:main:other").unwrap();
