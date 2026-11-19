@@ -882,13 +882,15 @@ ttyd 自己不做认证，因为它只监听内网地址——外部伪造不了
 | 200 请求 / 20 并发 | 7.5 MB | 不变 | **HWM 纹丝不动**，只涨 0.7 MB RSS |
 | 8 个并发登录 | 7.7 MB | 39.0–39.2 MB | 只涨 **1.1 MB**——`hash_gate` 生效的直接证据 |
 
-最后一行是这次新增的关键测量。**8 个并发登录只涨 1.1 MB，说明 32 MB 哈希区是被复用而不是复制的**；若串行化没生效，8 × 32 MB 会把峰值推到 256 MB 以上，`MemoryMax=64M` 必然 OOM。这条不是推断，是量出来的。
+最后一行是这次新增的关键测量。**8 个并发登录只涨 1.1 MB，说明 32 MB 哈希区是被复用而不是复制的**；若串行化没生效，8 × 32 MB 会把峰值推到 256 MB 以上，`MemoryMax` 再大也扛不住。这条不是推断，是量出来的。
 
 所以正确的描述是：**常驻 7 MB，峰值 38 MB，差额 31 MB 是一次性的哈希工作区**。这和 Go 的"峰值由 GC 水位决定"是两回事——它是可预测的、固定的、且只在登录那一瞬间存在。另一个附带结论：glibc 把这块 32 MB 用 `mmap` 直取直还，`free` 后 RSS 立刻回落（压测后 7.5 MB，不是 38 MB），所以 `memory.current` 也不会长期挂在 38 MB。
 
 **这个发现改了三件事**（都是实测推翻了估算）：
 
-1. `MemoryMax` 不能按"常驻 × 2"取。若取 16 MB，第一次登录就会被内核杀掉。**64 MB 是必须的**：32 MB 哈希 + 7 MB 常驻 + 余量（实测峰值 ≈39 MB，余量 25 MB）。
+1. `MemoryMax` 不能按"常驻 × 2"取，也不能只按"峰值 + 一点余量"取——**cgroup 的账里有页缓存**。最初按"32 MB 哈希 + 7 MB 常驻 + 25 MB 余量"定成 64 MB，同一份预算在容器里的基线测算是够的；放到宿主上跑了整晚（多轮 apply + 4 MB 的 DB WAL + `pct exec` 输出堆出来的页缓存）之后，`journalctl` 里出现 `64M memory peak, 602.5M memory swap peak`——**cgroup 内存顶到上限、swap 被大量使用**，随后登录开始稳定返回"密码错误"，重启即恢复。现在取 **192 MB**，并加 `MemorySwapMax=256M`；192 MB 相对宿主仍是零头，但足够让一次哈希全程待在内存里。
+
+   > 因果链要说清楚哪一段是确证的：**现象**（长跑后 401、重启恢复、`MemoryPeak` 顶到 64 M、swap 峰值 602 M）是日志与实测里的事实；**"scrypt 工作区分配失败导致 verify 返回 false"是推断**——最直接的旁证是提高上限、重启之后连续 40 次登录全通过（`MemoryPeak` 34 MB），但没抓到失败那一次的内核或分配器证据。写在这里，免得下次有人把它当成结论。
 2. **密码哈希必须串行**。两个并发登录 = 64 MB 工作区，正好顶穿限制。已实现 `hash_gate`（容量 1）+ `spawn_blocking`，避免卡住 runtime worker。
 3. **preview 也要限流**。虽然实测显示它只涨 0.7 MB，但那是 6 台机的规格；规格放大到 50 台机时，解析 + 规划的对象量会线性增长。闸门固定 4。
 
@@ -1058,21 +1060,23 @@ Rust 默认使用系统 malloc（Linux 上是 glibc 的 ptmalloc2）。它在**�
 | 7 | 拓扑轮询 ≥ 10 秒 + 页面隐藏时暂停 | **部分实现**。轮询间隔：拓扑 15 s、运行历史 10 s、概览 10 s、主机 8 s、网关 6 s；`visibilitychange` 暂停**没做** |
 | 8 | 日志 + DB > 5 GB 自动清理 | **不适用**。没有日志文件；DB 只有 `step_state` / `vmids` / `runs` / `run_steps` / `retired` 五张小表，每步一行，增长以 KB 计 |
 
-唯一"不依赖代码正确性"的兜底是 `systemd` 的资源上限（`MemoryMax=64M` / `CPUQuota=50%` /
-`IOWeight=50` / `TasksMax=256`），由 `installer/install.sh` 写进 unit，见 §7.6.6。
+唯一"不依赖代码正确性"的兜底是 `systemd` 的资源上限（`MemoryMax=192M` / `MemorySwapMax=256M` /
+`CPUQuota=50%` / `IOWeight=50` / `TasksMax=256`），由 `installer/install.sh` 写进 unit，见 §7.6.6。
 
 #### 7.6.6 用 systemd 兜底（唯一不依赖代码正确性的措施）
 
 ```ini
 [Service]
-MemoryHigh=40M
-MemoryMax=64M
+MemoryMax=192M
+MemorySwapMax=256M
 CPUQuota=50%
 IOWeight=50
 TasksMax=256
 ```
 
-代码可能写错（比如某天忘了给某个 channel 设容量）。有了这几行，内核会先杀 labyard，而不是拖死宿主——**保宿主优先于保服务**，这是一个管理平台应有的默认值。Rust 没有 GC 可以调，所以只有 `MemoryMax` 这一层。**64 MB 这个值是算出来的，不是拍的**：32 MB（scrypt 工作内存）+ 7 MB（常驻）+ 25 MB 余量。取小了会在第一次登录时被 OOM kill——这是实测发现的，不是推测。
+代码可能写错（比如某天忘了给某个 channel 设容量）。有了这几行，内核会先杀 labyard，而不是拖死宿主——**保宿主优先于保服务**，这是一个管理平台应有的默认值。Rust 没有 GC 可以调，所以只有 `MemoryMax` 这一层。
+
+**192 MB 这个值是调出来的，而且调过两次。** 第一版按"32 MB（scrypt 工作区）+ 7 MB（常驻）+ 25 MB 余量"取 64 MB，在容器里跑压测没问题；但那是干净基线——宿主的 cgroup 里还挂着页缓存，跑久了之后 journal 里出现 `602.5M memory swap peak`，scrypt 的工作区被换出去，登录开始报"密码错误"。第二版取 192 MB 并限制 `MemorySwapMax=256M`：**允许一点换页兜底，但不让 32 MB 的热工作区被整体换出**。这个教训写在 §7.5 的内存段里。
 
 #### 7.6.7 apply 前的资源预检
 
@@ -1090,7 +1094,7 @@ TasksMax=256
 
 | 维度 | 常规 | 峰值 | 硬上限 |
 |---|---|---|---|
-| labyard RSS | 14 MB | ~30 MB（实测 18.3 + SSE/终端/文件面板余量） | 64 MB（`MemoryMax`） |
+| labyard RSS | 12 MB（VmRSS） | ~45 MB（`VmHWM` 44.8 MB，登录瞬间的 scrypt 工作区） | 192 MB（`MemoryMax`，含页缓存口径） |
 | labyard CPU | < 1% | ~5%（日志序列化密集时） | 50%（`CPUQuota`） |
 | 磁盘写 | 可忽略 | 全在子进程 | `ionice` 降级 |
 | 磁盘空间 | ~200 MB | 日志累积 | 5 GB 触发清理 |
@@ -1652,7 +1656,7 @@ nft/VPN 脚本（v3 就是这次把两者落成开机单元的改动）。
 **C. 我按默认执行，随时可改（纯参数）**
 
 - 并发：apply 批内 3（`--concurrency`）、计划闸 4、scrypt 闸 1（§7.6.4）
-- `systemd`：`MemoryMax=64M`、`CPUQuota=50%`、`IOWeight=50`、`TasksMax=256`
+- `systemd`：`MemoryMax=192M`、`MemorySwapMax=256M`、`CPUQuota=50%`、`IOWeight=50`、`TasksMax=256`
 - 前端轮询：拓扑 15 s、运行历史 10 s、概览 10 s、主机 8 s、网关 6 s
 
 ---

@@ -138,10 +138,13 @@ labyard apply -f examples/main.yaml              # 再跑一次：全部跳过
 `128·N·r = 32 MB`，只在启动生成密码和登录的那一瞬间存在。实测确认——`VmHWM`
 在登录完成时就已封顶，之后反复刷新拓扑 / 规格 / 主机列表，常驻稳定在
 12.0–12.1 MB（12024 → 12092 kB）。这也是登录必须串行化（`hash_gate`）的原因：
-并发 scrypt 会把 64 MB 的 `MemoryMax` 顶穿。
+并发 scrypt 会把工作区复制成 8 份。
 
-因此 `systemd` 的 `MemoryMax` 取 **64 MB**（32 + 12 + 余量），并且密码哈希与规格解析
-都做了串行/限流。取 16 MB 会在第一次登录时被 OOM kill。
+因此 `systemd` 的 `MemoryMax` 取 **192 MB**（32 + 12 + 页缓存与突发余量），
+`MemorySwapMax=256M` 兜住极端情况，并且密码哈希与规格解析都做了串行/限流。
+取 16 MB 会在第一次登录时被 OOM kill；**取 64 MB 也曾翻车**：宿主 cgroup 里还有页缓存，
+跑久了 `swap peak` 到 602 MB，scrypt 的 32 MB 工作区被换出去，登录开始稳定报
+"密码错误"（`verify` 返回 false），重启才恢复——详细过程写在 `docs/design.md` §7.5 与 §7.6.6。
 
 **内存分配器**：实测**不用换**。glibc 默认 4.4 MB / churn 后 5.5 MB，jemalloc 是
 6.2 / 10.8，mimalloc 是 10.4 / 27.5。复现见 `bench/alloc/`。

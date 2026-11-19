@@ -161,8 +161,13 @@ Restart=on-failure
 RestartSec=3
 WorkingDirectory=/var/lib/labyard
 
-# 保宿主优先于保服务：内存到顶先杀自己
-MemoryMax=64M
+# 保宿主优先于保服务：内存到顶先杀自己。
+# 192M = 32M(scrypt 工作区) + 12M(常驻) + 页缓存/突发余量。
+# 曾经取 64M，真机上把 scrypt 的 32M 工作区挤进了 swap
+# （journal 里 swap peak 602M），跑几小时后登录开始回"密码错误"
+# （工作区分配失败 → verify 返 false），重启才恢复。SwapMax 兜住极端情况。
+MemoryMax=192M
+MemorySwapMax=256M
 CPUQuota=50%
 IOWeight=50
 TasksMax=256
