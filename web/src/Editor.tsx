@@ -323,6 +323,11 @@ export default function Editor() {
               }}
             />
           )}
+          {mode === "visual" && (
+            <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 10 }}>
+              预览与执行用的是已经保存的规格——在可视化里改完，先点上面的「保存」。
+            </Text>
+          )}
           <Space style={{ marginTop: 12 }} wrap>
             <Button
               icon={<EyeOutlined />}
