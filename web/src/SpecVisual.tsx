@@ -521,7 +521,7 @@ export default function SpecVisual({
                         </Field>
                       </Col>
                       <Col span={7}>
-                        <Field label="管理口挂在" hint="监控机自己的管理网卡接哪：默认本网段，也可以挂到外网或别的网络（边界采集）">
+                        <Field label="管理口挂在" hint="监控机自己的管理网卡接哪：默认本网段，也可以挂到外网或别的网络（边界采集）。监控机自身的接口不会被镜像；它的 IP（默认 .10 起）与 CT 号都自动分配，不用填。">
                           <Select
                             size="small"
                             style={{ width: "100%" }}

@@ -205,7 +205,7 @@ docs/operations.md  安装、升级、备份恢复、排障
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | **101 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
+| ✅ 单元测试通过 | **102 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
 | ✅ 真机逐接口回归 | 90 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 监控机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
 | ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.7 MB，含 1.48 MB 前端）与内存（常驻 12.0 MiB / 峰值 44.8 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |

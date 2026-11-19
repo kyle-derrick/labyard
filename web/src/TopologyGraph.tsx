@@ -1,10 +1,15 @@
 /** 全局拓扑图：react-flow 只负责画，语义全在后端。
  *
  * 后端给的是两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
- * 方向都是数据流方向。这里做三件事：
- *   1. 用 dagre 算层级（外网 → 网关 → 内网 → 主机），只算一次
- *   2. 把 kind / role / 状态映射成视觉
- *   3. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单
+ * 方向都是数据流方向。这里做四件事：
+ *   1. 用 dagre 算层级（外网 → 网关 → 内网 → 主机），**只用 attach 边**——
+ *      镜像线从主机指向监控机，参与布局的话监控机会被推到所有主机后面
+ *      一档，看起来像"挂在别的机器下面"。镜像线只负责画，不负责布局。
+ *   2. 主机节点底部画出**每个网口**（chip），所有边都锚到具体网口上：
+ *      attach 边接主机的 eth0/eth1，镜像线从源主机的内网口出发、接到
+ *      监控机上对应的抓包口。"线从哪块口出发"和"图上哪块口"是同一个东西。
+ *   3. 把 kind / role / 状态映射成视觉
+ *   4. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单
  *
  * **布局只在结构变化时重算**：轮询每 15 秒来一次数据，如果每次都重排，
  * 用户刚拖好的位置会被抹掉、图会跳一下——这也是"用起来卡"的观感来源之一。
@@ -28,12 +33,13 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "dagre";
-import type { TopoEdge, TopoNode } from "./api";
+import type { TopoEdge, TopoIface, TopoNode } from "./api";
 
-/** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。 */
+/** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。
+ * host 高度含底部的网口 chip 行（单行 22px，两行也放得下）。 */
 const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
   network: { w: 190, h: 70 },
-  host: { w: 196, h: 62 },
+  host: { w: 196, h: 94 },
 };
 
 export const ROLE_LABEL: Record<string, string> = {
@@ -52,12 +58,42 @@ type Data = {
   retired: boolean;
   vmidLabel: string;
   meta: Record<string, unknown>;
+  ifaces: TopoIface[];
   /** 被选中 / 被 hover 高亮时的淡化 */
   selected: boolean;
   dimmed: boolean;
 };
 
 type GNode = Node<Data, "lab">;
+
+/** 网口 chip。两枚不可见的 handle 叠在 chip 底部中点：
+ * `s:{name}` 供出边（镜像线、网关内网口）用，`t:{name}` 供入边用。 */
+function IfaceChip({ f }: { f: TopoIface }) {
+  const tip = f.capture
+    ? `${f.name} · 抓包（${f.net} 的流量）`
+    : `${f.name} · ${f.net}${f.ip ? ` ${f.ip.replace(/\/\d+$/, "")}` : ""}`;
+  return (
+    <div
+      className={`iface${f.capture ? " iface-cap" : ""}`}
+      title={tip}
+    >
+      <Handle
+        type="source"
+        id={`s:${f.name}`}
+        position={Position.Bottom}
+        style={{ left: "50%", bottom: -4, width: 6, height: 6, opacity: 0 }}
+      />
+      <Handle
+        type="target"
+        id={`t:${f.name}`}
+        position={Position.Bottom}
+        style={{ left: "50%", bottom: -4, width: 6, height: 6, opacity: 0 }}
+      />
+      <span className="iface-name">{f.name}</span>
+      {f.capture && <span className="iface-net">{f.net}</span>}
+    </div>
+  );
+}
 
 function LabNode({ data }: NodeProps<GNode>) {
   const dim = DIM[data.kind];
@@ -81,6 +117,7 @@ function LabNode({ data }: NodeProps<GNode>) {
 
   return (
     <>
+      {/* 网络节点的默认接入点：左边收、右边发 */}
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
       <div className={cls} style={{ width: dim.w, height: dim.h }}>
         {data.kind === "network" && (
@@ -127,6 +164,11 @@ function LabNode({ data }: NodeProps<GNode>) {
               {data.vmidLabel}
               {data.vmidLabel && data.retired ? " · " : ""}
               {data.retired ? "已废弃" : ""}
+            </div>
+            <div className="ifaces">
+              {data.ifaces.map((f) => (
+                <IfaceChip key={f.name} f={f} />
+              ))}
             </div>
           </>
         )}
@@ -192,7 +234,11 @@ function build(
     const d = DIM[n.kind] ?? DIM.host;
     g.setNode(n.id, { width: d.w, height: d.h });
   }
+  // 布局只吃 attach 边：镜像线把主机连向监控机，参与布局会把监控机推到
+  // 所有主机后面一档——图上看就成了"监控机挂在别的机器后面"。镜像线在
+  // 一个网络里的语义是"平行存在于每台主机与监控机之间"，不该影响层级。
   for (const e of edges) {
+    if (e.kind !== "attach") continue;
     if (e.from === e.to || !uniq.has(e.from) || !uniq.has(e.to)) continue;
     g.setEdge(e.from, e.to);
   }
@@ -215,6 +261,7 @@ function build(
         retired: n.retired,
         vmidLabel: n.vmid ? `CT ${n.vmid}` : "",
         meta: n.meta as Record<string, unknown>,
+        ifaces: n.ifaces ?? [],
         selected: selected.has(n.id),
         dimmed: dimmed.has(n.id),
       },
@@ -231,6 +278,9 @@ function build(
         id,
         source: e.from,
         target: e.to,
+        // 端点锚到具体网口：主机侧有网口名的边都走 chip 上的 handle
+        sourceHandle: e.source_iface ? `s:${e.source_iface}` : undefined,
+        targetHandle: e.target_iface ? `t:${e.target_iface}` : undefined,
         type: "smoothstep",
         ...edgeSpec(e, hotMirror.has(id)),
       };

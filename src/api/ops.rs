@@ -869,11 +869,13 @@ pub async fn list_mirrors(
     headers: axum::http::HeaderMap,
     Query(q): Query<SpecQuery>,
 ) -> Response {
-    render((|| {
+    render_async(async {
         authed(&state, &headers)?;
         let items = collect_mirrors(&state, q.spec.as_deref()).map_err(|e| e)?;
-        Ok(Json(serde_json::json!({ "mirrors": items })))
-    })())
+        let reconcile = state.reconcile.lock().await.clone();
+        Ok(Json(serde_json::json!({ "mirrors": items, "reconcile": reconcile })))
+    })
+    .await
 }
 
 #[derive(Deserialize, Default)]

@@ -181,7 +181,12 @@ async fn serve_with(cfg: Config, concurrency: usize) -> Result<(), Box<dyn std::
         // run 串行闸：一个 run 批内并发 3 个 pct exec（各 ~176 MB），两个
         // run 并发就是 1 GB+，真机被 oom-kill 过。见 spawn_plan 的注释。
         run_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        reconcile: Arc::new(tokio::sync::Mutex::new(Default::default())),
     });
+
+    // 后台镜像巡检：每 5 分钟对一次账，规格说该有的镜像实例漏了就补装，
+    // 宿主上多出来的孤儿单元就停掉。
+    api::reconcile::spawn(state.clone());
 
     let app = api::router(state);
 

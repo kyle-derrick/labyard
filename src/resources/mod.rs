@@ -802,6 +802,19 @@ impl Executor {
         self.stop_units(&[instance], cancel).await
     }
 
+    /// 按实例名批量移除镜像单元（后台巡检清孤儿用）。
+    /// 与 [`Self::remove_mirror_instance`] 走同一条"停 + 删配置"路径。
+    pub async fn remove_mirror_instances(
+        &self,
+        instances: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        if instances.is_empty() {
+            return Ok(());
+        }
+        self.stop_units(instances, cancel).await
+    }
+
     /// 停掉指定前缀的全部镜像实例，返回停掉的实例名。
     /// `prefix` 形如 `main-`（整个 zone）或 `main-1001-`（某台主机当源）。
     /// 停掉匹配给定 glob 的镜像实例（宿主侧 `labmirror@` 单元）。

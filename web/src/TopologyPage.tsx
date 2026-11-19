@@ -1,13 +1,14 @@
 /** 拓扑页：一张图看完整环境，点节点直接改。
  *
  * 设计上只有一件事要守住：**图是入口，不是截图**。看到网关的"出网"是关的，
- * 就在这张图上打开；看到某台机停了，就在这里起来；想把几台主机的流量交给
- * 监控机，就框选然后右键。改结构（加 zone、加主机）仍然要去「编排」，
- * 因为那是在改文件，不是在改运行态。
+ * 就在这张图上打开；看到某台机停了，就在这里起来；想把某个网络的流量交给
+ * 监控机，在网络节点上右键"开启整网流量监控"。改结构（加 zone、加主机）
+ * 仍然要去「编排」，因为那是在改文件，不是在改运行态。
  *
- * 镜像的添加入口从底部的表单挪到了右键菜单：底部表单只解决了"加一条"，
- * 而真正常见的是"这几台一起加"，框选比在下拉框里一个个挑快得多。
- * 底部表格保留，作为"现在到底抓了谁"的总账。
+ * 流量采集的入口收敛到**网络级**：整网监控由每个网络的开关控制（规格里的
+ * `monitor:` 字段），主机级别的零散连线不再提供——那是老设计，和"一个网络
+ * 一个抓包口、自动覆盖全网主机"的总体设计冲突。后台巡检每 5 分钟对一次账，
+ * 规格里说该有的镜像实例漏了会自动补装。
  */
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -25,6 +26,7 @@ import {
   Popconfirm,
   Select,
   Space,
+  Switch,
   Table,
   Tag,
   Tooltip,
@@ -38,7 +40,7 @@ import {
   ThunderboltOutlined,
 } from "@ant-design/icons";
 import TopologyGraph, { ROLE_LABEL } from "./TopologyGraph";
-import { api, type GatewayStatus, type MirrorRow, type TopoNode } from "./api";
+import { api, type GatewayStatus, type MirrorRow, type ReconcileInfo, type TopoEdge, type TopoNode } from "./api";
 
 const { Text } = Typography;
 
@@ -77,9 +79,13 @@ export default function TopologyPage() {
   const nodes = topo.data?.nodes ?? [];
   const edges = topo.data?.edges ?? [];
   const rows = mirrors.data?.mirrors ?? [];
+  const reconcile = mirrors.data?.reconcile;
 
   const hosts = useMemo(() => nodes.filter((n) => n.kind === "host"), [nodes]);
-  const monitors = useMemo(() => hosts.filter((n) => n.role === "monitor"), [hosts]);
+  const networks = useMemo(
+    () => nodes.filter((n) => n.kind === "network" && !(n.meta as Record<string, unknown>).external),
+    [nodes],
+  );
   /** 网关面板：只有打开网络节点的抽屉时才查，避免每次进页面都打一次 pvesh */
   const pickedZone = picked?.kind === "network" && picked.zone ? picked.zone : null;
   const gw = useQuery({
@@ -88,15 +94,6 @@ export default function TopologyPage() {
     enabled: !!pickedZone,
     retry: 0,
   });
-
-  /** 当前在多选里的主机（排除监控机自身：它不能抓自己） */
-  const selectedHosts = useMemo(
-    () =>
-      selected
-        .map((id) => nodes.find((n) => n.id === id))
-        .filter((n): n is TopoNode => !!n && n.kind === "host" && n.role !== "monitor"),
-    [nodes, selected],
-  );
 
   // 右键菜单：点别处关掉
   useEffect(() => {
@@ -121,25 +118,6 @@ export default function TopologyPage() {
     // 网关/电源是异步起 run 的，给它一点时间再刷图
     setTimeout(refresh, 1200);
     qc.invalidateQueries({ queryKey: ["hosts"] });
-  };
-
-  const addMirrors = async (target: TopoNode) => {
-    if (selectedHosts.length === 0) return;
-    setBusy(true);
-    let ok = 0;
-    const fail: string[] = [];
-    for (const h of selectedHosts) {
-      try {
-        await api.addMirror(`${h.zone}:${h.label}`, `${target.zone}:${target.label}`, spec);
-        ok += 1;
-      } catch (e) {
-        fail.push(`${h.label}: ${(e as Error).message}`);
-      }
-    }
-    setBusy(false);
-    setMenu(null);
-    if (ok) afterChange(`已把 ${ok} 台主机的流量交给 ${target.label}`);
-    if (fail.length) message.warning(fail.join("；"));
   };
 
   /** 右键开关某网络的整网流量监控（写规格 + 立刻落地抓包口） */
@@ -226,8 +204,6 @@ export default function TopologyPage() {
 
   // ─────────────────────────── 右键菜单 ───────────────────────────
   const menuNode = menu?.node ?? null;
-  const menuIsHost = menuNode?.kind === "host";
-  const targets = menuIsHost && !selected.includes(menuNode!.id) ? [menuNode!] : selectedHosts;
 
   const menuItems: { key: string; label: React.ReactNode; danger?: boolean; onClick: () => void }[] = [];
 
@@ -335,7 +311,7 @@ export default function TopologyPage() {
             <span>全局拓扑</span>
             <Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>
               {nodes.filter((n) => n.kind === "network").length} 网络 /{" "}
-              {hosts.length} 主机 · 点节点看详情，悬停监控机看采集链路，框选后右键采集
+              {hosts.length} 主机 · 点节点看详情，悬停监控机看采集链路；整网监控在网络节点上右键开关
             </Text>
           </Space>
         }
@@ -429,26 +405,6 @@ export default function TopologyPage() {
               {it.label}
             </div>
           ))}
-          {targets.length > 0 && monitors.length > 0 && (
-            <>
-              <div className="ctx-sep" />
-              <div className="ctx-title">
-                {targets.length > 1
-                  ? `把 ${targets.length} 台的流量交给…`
-                  : "把这台的流量交给…"}
-              </div>
-              {monitors.map((a) => (
-                <div
-                  key={a.id}
-                  className="ctx-item"
-                  onClick={() => addMirrors(a)}
-                  title={`${a.zone} / ${a.label}`}
-                >
-                  → {a.zone} / {a.label}
-                </div>
-              ))}
-            </>
-          )}
         </div>
       )}
 
@@ -559,28 +515,14 @@ export default function TopologyPage() {
             </Space>
 
             {detail.role === "monitor" && (
-              <Card size="small" title="抓到的流量">
-                {edges.filter((e) => e.kind === "mirror" && e.to === detail.id).length === 0 ? (
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    还没有采集连线。框选几台主机 → 右键 → 把流量交给它；或在编排里打开整网监控。
-                  </Text>
-                ) : (
-                  <Space direction="vertical" size={4}>
-                    {edges
-                      .filter((e) => e.kind === "mirror" && e.to === detail.id)
-                      .map((e) => (
-                        <div key={`${e.from}`}>
-                          <Text className="mono">{e.from.replace(/^host:/, "")}</Text>
-                          <Text type="secondary" className="mono">
-                            {" "}
-                            · {e.source_iface ?? "eth0"} → {e.target_iface ?? "?"}
-                            {e.capture_bridge ? ` @ ${e.capture_bridge}` : ""}
-                          </Text>
-                        </div>
-                      ))}
-                  </Space>
-                )}
-              </Card>
+              <MonitorNetworks
+                monitor={detail}
+                networks={networks}
+                edges={edges}
+                busy={busy}
+                onChange={afterChange}
+                onError={(e) => message.error(e)}
+              />
             )}
           </Space>
         )}
@@ -613,21 +555,24 @@ export default function TopologyPage() {
         </Form>
       </Modal>
 
-      {/* 镜像总账：谁抓了谁。添加入口在右键菜单里。 */}
+      {/* 镜像总账：谁抓了谁。入口在网络右键"整网监控"与监控机抽屉里。 */}
       <Card
         size="small"
         title={
           <Space size={8}>
             <span>流量镜像</span>
             <Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>
-              源主机接口的双向流量复制到监控机的抓包口
+              源主机网口的双向流量复制到监控机的抓包口
             </Text>
+            {reconcile && <ReconcileBadge info={reconcile} />}
           </Space>
         }
         extra={
-          <Button size="small" icon={<PlusOutlined />} onClick={() => setMenu(null)} disabled>
-            在图里框选后右键添加
-          </Button>
+          <Tooltip title="规格改动后巡检 5 分钟内自动接线；点刷新立即重读">
+            <Button size="small" icon={<ReloadOutlined />} onClick={refresh}>
+              刷新
+            </Button>
+          </Tooltip>
         }
       >
         <Table
@@ -694,6 +639,152 @@ export default function TopologyPage() {
         />
       </Card>
     </Space>
+  );
+}
+
+/** 后台巡检状态的小徽标：上次对账时间与结果。 */
+function ReconcileBadge({ info }: { info: ReconcileInfo }) {
+  if (info.error) {
+    return (
+      <Tooltip title={info.error}>
+        <Tag color="red">巡检出错</Tag>
+      </Tooltip>
+    );
+  }
+  if (info.skipped) {
+    return (
+      <Tooltip title={info.skipped}>
+        <Tag>巡检跳过</Tag>
+      </Tooltip>
+    );
+  }
+  if (!info.at) return null;
+  const t = info.at.replace(/^.*T/, "").replace(/:\d\d$/, "");
+  const delta =
+    info.applied || info.removed
+      ? `（补 ${info.applied} / 清 ${info.removed}）`
+      : "";
+  return (
+    <Tooltip title={`后台每 5 分钟对账一次：规格说该有的镜像漏了自动补装，孤儿单元自动清理`}>
+      <Tag color="default">
+        巡检 {t}
+        {delta}
+      </Tag>
+    </Tooltip>
+  );
+}
+
+/** 监控机的采集管理：列出所有网络，逐个开关"这个网络的流量交给这台监控机"。
+ *
+ * 管理的粒度只有**网络**：打开一个网络的开关，系统自动把该网络下所有主机
+ * 的接口接到对应抓包口（规格里的 monitor: {use: ...}），不需要逐台挑。
+ * 哪台机、几块抓包口由系统推导，图和后台巡检负责保持一致。
+ */
+function MonitorNetworks({
+  monitor,
+  networks,
+  edges,
+  busy,
+  onChange,
+  onError,
+}: {
+  monitor: TopoNode;
+  networks: TopoNode[];
+  edges: TopoEdge[];
+  busy: boolean;
+  onChange: (msg: string) => void;
+  onError: (msg: string) => void;
+}) {
+  const [pending, setPending] = useState<string | null>(null);
+
+  const toggle = async (net: TopoNode, on: boolean) => {
+    if (!net.zone) return;
+    setPending(net.id);
+    try {
+      if (on) {
+        await api.setMonitor(net.zone, true, { use: `${monitor.zone}:${monitor.label}` });
+        onChange(`已把 ${net.label} 的流量交给 ${monitor.label}`);
+      } else {
+        await api.setMonitor(net.zone, false);
+        onChange(`已停止采集 ${net.label}`);
+      }
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setPending(null);
+    }
+  };
+
+  /** 这个网络上现在有几台被抓 + 落在哪块抓包口 */
+  const captureInfo = (net: TopoNode) => {
+    const lines = edges.filter(
+      (e) => e.kind === "mirror" && e.to === monitor.id && e.from.startsWith(`host:${net.zone}:`),
+    );
+    if (lines.length === 0) return null;
+    const iface = lines[0].target_iface ?? "?";
+    const bridge = lines[0].capture_bridge ?? "";
+    return `${lines.length} 台 · ${iface}${bridge ? ` @ ${bridge}` : ""}`;
+  };
+
+  return (
+    <Card
+      size="small"
+      title="采集的网络"
+      extra={
+        <Text type="secondary" style={{ fontSize: 11 }}>
+          开关即自动接线
+        </Text>
+      }
+    >
+      {networks.length === 0 ? (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          还没有任何内网网络。
+        </Text>
+      ) : (
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          {networks.map((net) => {
+            const m = net.meta as Record<string, unknown>;
+            const monitored = typeof m.monitor === "string" && m.monitor !== "";
+            const mine = m.monitor === monitor.label;
+            const info = captureInfo(net);
+            return (
+              <div key={net.id} className="mon-net-row">
+                <div className="mon-net-text">
+                  <span className="mono">{net.label}</span>
+                  <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
+                    {" "}
+                    {String(m.cidr ?? "")}
+                  </Text>
+                  {info && (
+                    <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
+                      {" "}
+                      · 已抓 {info}
+                    </Text>
+                  )}
+                  {monitored && !mine && (
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      {" "}
+                      · 归 {String(m.monitor)}
+                    </Text>
+                  )}
+                </div>
+                <Switch
+                  size="small"
+                  checked={monitored}
+                  disabled={busy || (monitored && !mine) || pending === net.id}
+                  loading={pending === net.id}
+                  onChange={(on) => toggle(net, on)}
+                />
+              </div>
+            );
+          })}
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            开启 = 该网络全部主机的接口镜像到这台监控机（每网络一块抓包口）；
+            新加入网络的主机由后台巡检自动接线。
+          </Text>
+        </Space>
+      )}
+    </Card>
   );
 }
 

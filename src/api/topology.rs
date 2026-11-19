@@ -22,6 +22,23 @@
 use crate::core::spec::{ResolvedSpec, Role};
 use serde::Serialize;
 
+/// 外网在网口归属里的哨兵值（与 `core::spec::WAN_ZONE` 同语义，图层面只读）
+const WAN_NET: &str = "wan";
+
+/// 主机上的一块网口。拓扑图的节点要把它画出来，边要锚到具体网口上——
+/// "镜像从哪块口出发"这个问题，答案必须和连线端点是同一个东西。
+#[derive(Debug, Serialize)]
+pub struct Iface {
+    /// 容器内网卡名（eth0、eth1……）
+    pub name: String,
+    /// 接在哪张网络上：zone 名，或 `wan`
+    pub net: String,
+    /// 口上的地址；抓包口没有（抓包口是两层桥上的一张"嗅探脸"，无 IP）
+    pub ip: Option<String>,
+    /// 是不是抓包口（监控机上接 `mir{zone}` 桥的那些口）
+    pub capture: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Node {
     pub id: String,
@@ -36,6 +53,8 @@ pub struct Node {
     pub retired: bool,
     /// 画布上要显示的次要信息（网段、桥名、NAT、出网、映射条数……）
     pub meta: serde_json::Value,
+    /// 主机的网口清单。网络节点是空列表。
+    pub ifaces: Vec<Iface>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,9 +67,9 @@ pub struct Edge {
     /// attach 边的接口角色：uplink（接上层网络）| inner（接本 zone 内网）
     /// | mgmt（挂在外网桥上的管理口）
     pub port: Option<String>,
-    /// mirror 边：源主机上的哪块网卡（恒为 eth0——它在所连网络里的那块脸）
+    /// 主机作为**发送端**时的网口名（网关 → 内网那条 attach 边）
     pub source_iface: Option<String>,
-    /// mirror 边：监控机上的哪块抓包网卡（eth1、eth2……）
+    /// 主机作为**接收端**时的网口名（网络 → 主机；mirror 边是监控机的抓包口）
     pub target_iface: Option<String>,
     /// mirror 边落到的两层桥（`mir{zone}`），抽屉里显示用
     pub capture_bridge: Option<String>,
@@ -82,6 +101,7 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
             "external": true,
             "cidr": null,
         }),
+        ifaces: Vec::new(),
     });
 
     for (spec_name, spec) in specs {
@@ -137,12 +157,45 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         "vpn": vpn,
                         "external": false,
                     }),
+                    ifaces: Vec::new(),
                 });
             }
 
             for h in &z.hosts {
                 let retired = (st.retired)(&z.name, &h.name);
                 let status = h.vmid.and_then(|v| (st.status)(v));
+
+                // 网口清单：eth0 恒为"它在所属网络里的那块脸"；网关多一块
+                // 上联口 eth1；监控机再按抓包的网络各一块抓包口（eth1 起）。
+                // 编号规则与 pct create / 镜像脚本完全一致——图上的 ethN
+                // 就是容器里 `ip addr` 看到的 ethN。
+                let mut ifaces = vec![Iface {
+                    name: "eth0".into(),
+                    net: if z.external {
+                        WAN_NET.into()
+                    } else {
+                        z.name.clone()
+                    },
+                    ip: Some(h.ipv4.clone()),
+                    capture: false,
+                }];
+                if h.role == Role::Gateway {
+                    ifaces.push(Iface {
+                        name: "eth1".into(),
+                        net: z.uplink.clone().unwrap_or_else(|| WAN_NET.into()),
+                        ip: None,
+                        capture: false,
+                    });
+                }
+                for (i, c) in h.capture.iter().enumerate() {
+                    ifaces.push(Iface {
+                        name: format!("eth{}", i + 1),
+                        net: c.clone(),
+                        ip: None,
+                        capture: true,
+                    });
+                }
+
                 nodes.push(Node {
                     id: format!("host:{}:{}", z.name, h.name),
                     kind: "host".into(),
@@ -162,6 +215,7 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         "capture": h.capture,
                         "external_zone": z.external,
                     }),
+                    ifaces,
                 });
 
                 let host_id = format!("host:{}:{}", z.name, h.name);
@@ -178,7 +232,7 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         label: Some("eth0 · DHCP".into()),
                         port: Some("mgmt".into()),
                         source_iface: None,
-                        target_iface: None,
+                        target_iface: Some("eth0".into()),
                         capture_bridge: None,
                     });
                 } else if h.role == Role::Gateway {
@@ -196,7 +250,7 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         label: Some("eth1".into()),
                         port: Some("uplink".into()),
                         source_iface: None,
-                        target_iface: None,
+                        target_iface: Some("eth1".into()),
                         capture_bridge: None,
                     });
                     // 内网口：从网关指向本 zone 内网（数据流进去）
@@ -206,7 +260,7 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         kind: "attach".into(),
                         label: Some(format!("eth0 · {ip}")),
                         port: Some("inner".into()),
-                        source_iface: None,
+                        source_iface: Some("eth0".into()),
                         target_iface: None,
                         capture_bridge: None,
                     });
@@ -218,7 +272,7 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
                         label: Some(ip.to_string()),
                         port: Some("inner".into()),
                         source_iface: None,
-                        target_iface: None,
+                        target_iface: Some("eth0".into()),
                         capture_bridge: None,
                     });
                 }
@@ -382,6 +436,44 @@ zones:
         // 两个网络各给 probe 一块抓包口
         let t = probe.meta["capture"].as_array().unwrap();
         assert_eq!(t.len(), 2, "core 与 lab 各一块：{t:?}");
+    }
+
+    #[test]
+    fn hosts_list_their_interfaces_and_edges_anchor_to_them() {
+        let (n, e) = run();
+        // 网关：eth0 内网 + eth1 上联
+        let gw = n.iter().find(|x| x.id == "host:main:gateway").unwrap();
+        let names: Vec<&str> = gw.ifaces.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["eth0", "eth1"], "网关两块口: {:?}", gw.ifaces);
+        assert_eq!(gw.ifaces[0].net, "main");
+        assert_eq!(gw.ifaces[1].net, "wan");
+        // 监控机：管理口 + 每个被监控网络一块抓包口
+        let probe = n.iter().find(|x| x.id == "host:edge:probe").unwrap();
+        let cap: Vec<&str> = probe
+            .ifaces
+            .iter()
+            .filter(|f| f.capture)
+            .map(|f| f.net.as_str())
+            .collect();
+        // probe 被 main 抓（monitor.use），抓包口 eth1 归 main
+        assert_eq!(cap, vec!["main"], "{:?}", probe.ifaces);
+        // attach 边要锚到具体网口：网络→主机 的边写 target_iface，
+        // 网关→内网 的边写 source_iface——前端据此把线接到网口图标上
+        let inner = e
+            .iter()
+            .find(|x| x.kind == "attach" && x.to == "host:main:web")
+            .unwrap();
+        assert_eq!(inner.target_iface.as_deref(), Some("eth0"));
+        let out = e
+            .iter()
+            .find(|x| x.kind == "attach" && x.from == "host:main:gateway")
+            .unwrap();
+        assert_eq!(out.source_iface.as_deref(), Some("eth0"));
+        let up = e
+            .iter()
+            .find(|x| x.kind == "attach" && x.to == "host:main:gateway")
+            .unwrap();
+        assert_eq!(up.target_iface.as_deref(), Some("eth1"));
     }
 
     #[test]

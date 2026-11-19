@@ -170,7 +170,7 @@ check("主机清单", "GET", "/api/hosts", keys=["hosts"])
 check("拓扑", "GET", "/api/topology", keys=["nodes", "edges", "specs"])
 check("网关状态", "GET", f"/api/zones/{q(ZONE)}/gateway/status",
       keys=["zone", "spec", "gateway"])
-check("镜像列表", "GET", "/api/mirrors", keys=["mirrors"])
+check("镜像列表", "GET", "/api/mirrors", keys=["mirrors", "reconcile"])
 check("OpenAPI", "GET", "/api/openapi.json", keys=["openapi", "paths"])
 
 # 主机：从清单里挑一台非网关的，后面生命周期/电源/快照都用它。

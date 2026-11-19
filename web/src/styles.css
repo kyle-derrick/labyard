@@ -224,6 +224,45 @@ body {
   color: #6d28d9;
 }
 
+/* ── 拓扑节点上的网口 chip ──
+   所有边都锚到具体网口上：镜像线从源主机的内网口出发，接到监控机的抓包口。 */
+.ifaces {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 3px;
+  min-width: 0;
+}
+
+.iface {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: #f1f5f9;
+  border: 1px solid #dbe3ec;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.iface-cap {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #b45309;
+}
+
+.iface-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.iface-net {
+  font-weight: 600;
+}
+
 .tn-dot {
   width: 7px;
   height: 7px;

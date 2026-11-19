@@ -234,7 +234,7 @@ export const api = {
 
   // ── 镜像连线 ──
   mirrors: (spec?: string) =>
-    req<{ mirrors: MirrorRow[] }>(
+    req<{ mirrors: MirrorRow[]; reconcile?: ReconcileInfo }>(
       `/api/mirrors${spec ? `?spec=${encodeURIComponent(spec)}` : ""}`,
     ),
 
@@ -385,6 +385,18 @@ export type RetireResp = {
   note: string;
 };
 
+/** 主机上的一块网口（拓扑节点底部的 chip）。 */
+export type TopoIface = {
+  /** 容器内网卡名（eth0、eth1……） */
+  name: string;
+  /** 接在哪张网络上：zone 名或 "wan" */
+  net: string;
+  /** 口上的地址；抓包口没有 */
+  ip: string | null;
+  /** 是不是监控机的抓包口（接 mir{zone} 桥） */
+  capture: boolean;
+};
+
 export type TopoNode = {
   id: string;
   /** 只有两类：网络（外网 / 各 zone 的内网）与主机 */
@@ -397,6 +409,8 @@ export type TopoNode = {
   status: string | null;
   retired: boolean;
   meta: Record<string, unknown>;
+  /** 主机的网口清单；网络节点为空 */
+  ifaces?: TopoIface[];
 };
 
 export type TopoEdge = {
@@ -407,8 +421,10 @@ export type TopoEdge = {
   label: string | null;
   /** attach 边的接口角色：uplink（接上层网络）| inner（接本 zone 内网）| mgmt（挂外网桥） */
   port: "uplink" | "inner" | "mgmt" | null;
-  /** mirror 边：源主机的采集口（eth0）与监控机的抓包口（eth1…） */
+  /** 发送端的网口名（镜像边 = 源主机的采集口；attach 边 = 网关的内网口）。
+   * 前端据此把边锚到节点上的具体网口 chip。 */
   source_iface?: string;
+  /** 接收端的网口名（镜像边 = 监控机的抓包口；attach 边 = 主机接入网络的口） */
   target_iface?: string;
   /** mirror 边落到的两层抓包桥 */
   capture_bridge?: string;
@@ -422,6 +438,15 @@ export type MirrorRow = {
   capture_bridge?: string;
   source_iface?: string;
   target_iface?: string;
+};
+
+/** 后台镜像巡检的状态（/api/mirrors 带出）。 */
+export type ReconcileInfo = {
+  at: string | null;
+  applied: number;
+  removed: number;
+  skipped: string | null;
+  error: string | null;
 };
 
 /** VPN 客户端配置的下载地址（后端现读容器里的私钥现拼，平台不存副本）。 */

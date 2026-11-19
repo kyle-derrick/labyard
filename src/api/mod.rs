@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod ops;
+pub mod reconcile;
 pub mod specs;
 pub mod topology;
 
@@ -63,6 +64,8 @@ pub struct AppState {
     /// 并发就是 1 GB+，真机上 768M + 192M swap 都被吃满然后 oom-kill。
     /// 串行是刻意的：排队的 run 等 permit，用户端表现是操作依次生效。
     pub run_gate: Arc<tokio::sync::Semaphore>,
+    /// 后台镜像巡检的状态：`/api/mirrors` 带出去给前端显示"上次巡检"。
+    pub reconcile: Arc<Mutex<reconcile::ReconcileInfo>>,
 }
 
 pub struct RunHandle {
