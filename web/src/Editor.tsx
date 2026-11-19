@@ -63,8 +63,8 @@ zones:
     monitor: { name: probe, mgmt: wan }
     hosts:
       gateway:   { role: gateway }
-      server1:   { role: server }
-      client1:   { role: client }
+      web1:      { role: host }
+      host2:     { role: host }
 
   # 嵌套：sub 的上联是 main 的网关
   sub:
@@ -74,11 +74,11 @@ zones:
     monitor: { use: "main:probe" }
     hosts:
       gateway: { role: gateway }
-      client1: { role: client }
+      win1:    { role: host }
 
 # 精确连线：某台主机的流量复制到某台监控机（可跨网络）
 mirrors:
-  - { from: "sub:client1", to: "main:probe" }
+  - { from: "sub:win1", to: "main:probe" }
 `;
 
 type LogLine = { cls: string; text: string };

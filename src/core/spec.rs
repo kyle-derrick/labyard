@@ -362,8 +362,11 @@ pub enum Role {
     /// 这类域-specific 的说法，不该让已经存在的规格因此解析失败。
     #[serde(alias = "analysis", alias = "Analysis")]
     Monitor,
-    Server,
-    Client,
+    /// 网内主机。对网络来说服务端和终端都是主机，不值得区分——区分只会让
+    /// 用户在"这台到底是 server 还是 client"上浪费时间。老规格的
+    /// `server` / `client` 保留成别名照常解析，落盘统一写成 `host`。
+    #[serde(alias = "server", alias = "Server", alias = "client", alias = "Client")]
+    Host,
 }
 
 impl Role {
@@ -371,8 +374,7 @@ impl Role {
         match self {
             Role::Gateway => "gateway",
             Role::Monitor => "monitor",
-            Role::Server => "server",
-            Role::Client => "client",
+            Role::Host => "host",
         }
     }
 
@@ -381,8 +383,7 @@ impl Role {
         match self {
             Role::Gateway => 1,
             Role::Monitor => 10,
-            Role::Server => 20,
-            Role::Client => 30,
+            Role::Host => 20,
         }
     }
 
@@ -392,8 +393,7 @@ impl Role {
         match self {
             Role::Gateway => "网关",
             Role::Monitor => "流量监控",
-            Role::Server => "服务器",
-            Role::Client => "终端",
+            Role::Host => "主机",
         }
     }
 }
@@ -591,7 +591,7 @@ pub enum SpecError {
     MonitorBoth(String),
     #[error("zone `{0}` 的监控机 `{1}` 与已有主机重名——给它换个名字（monitor.name）")]
     MonitorNameConflict(String, String),
-    #[error("监控机 `{0}` 不存在。可用的监控机：{1}。注意：`use` 只能指向 role 为 monitor 的主机或某个 zone 的新建声明（monitor.name）；不能引用本 zone 自己的新建声明，那等价于直接写 `name`")]
+    #[error("监控机 `{0}` 不存在。可用的监控机：{1}。`use` 可以写 `zone:host` 指向一台 role 为 monitor 的主机，也可以写 `zone:名字` 引用某个网络的新建声明（monitor.name）——监控机实际建在哪个网络由该声明的 mgmt 决定，引用时不用管")]
     MonitorUnknown(String, String),
     #[error("监控机 `{0}` 有歧义：多个 zone 里都有这个主机名，请写成 zone:host")]
     MonitorAmbiguous(String),
@@ -1102,10 +1102,36 @@ impl Spec {
         }
 
         // ── 第三步：`use`（复用已有监控机）要等 zone 解析完才能查 ──
+        //
+        // 除了直接指向一台 role: monitor 的主机，`use` 还允许引用**某个
+        // zone 的新建声明**（`lab:monitor` = lab 的 monitor.name 声明）。
+        // 这不是多余的语法糖：监控机实际落在哪个网络由声明的 `mgmt` 决定
+        // （比如 mgmt: wan 时它建在 wan 里），引用者根本不该知道这些——
+        // 按声明所在的 zone 写就行。没有这条回退，前端"复用已有"下拉里
+        // 的声明选项保存必报"不存在"，用户会觉得系统瞎了。
+        let mut decls: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+        for (zone_name, z) in &self.zones {
+            if let Some(m) = &z.monitor {
+                if m.existing.is_none() {
+                    let name = m.name.clone().unwrap_or_else(|| DEFAULT_MONITOR.to_string());
+                    let mgmt = m.mgmt.clone().unwrap_or_else(|| zone_name.clone());
+                    decls.insert((zone_name.clone(), name.clone()), (mgmt, name));
+                }
+            }
+        }
         for (zone_name, z) in &self.zones {
             let Some(m) = &z.monitor else { continue };
             let Some(r) = &m.existing else { continue };
-            let (mz, mh) = lookup_monitor(&out, r)?;
+            let (mz, mh) = match lookup_monitor(&out, r) {
+                Ok(v) => v,
+                Err(e) => match r.split_once(':') {
+                    Some((dz, dh)) => decls
+                        .get(&(dz.to_string(), dh.to_string()))
+                        .cloned()
+                        .ok_or(e)?,
+                    None => return Err(e),
+                },
+            };
             links.push((zone_name.clone(), m.targets.clone(), mz, mh));
         }
 
@@ -1997,6 +2023,81 @@ zones:
         let r = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
         let m = &r.zones[0].hosts[0];
         assert_eq!(m.ipv4, "10.77.0.55/24");
+    }
+
+    #[test]
+    fn monitor_use_can_reference_a_declaration() {
+        // 回归：l2 复用 lab 的新建声明，而监控机实际建在 wan（mgmt: wan）。
+        // `lab:monitor` 这种写法必须能解析——按声明所在的 zone 写引用，
+        // 不该要求用户知道 mgmt 把机器带到哪儿去了。
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  lab:
+    uplink: wan
+    v4: 10.77.0.0/24
+    monitor: { name: monitor, mgmt: wan }
+    hosts: { gw: { role: gateway }, t1: { role: server } }
+  l2:
+    uplink: lab
+    v4: 10.30.1.0/24
+    monitor: { use: "lab:monitor" }
+    hosts: { gateway: { role: gateway }, w1: { role: client } }
+"#;
+        let r = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
+        let l2 = r.zones.iter().find(|z| z.name == "l2").unwrap();
+        assert_eq!(l2.monitor.as_deref(), Some("monitor"));
+        assert!(
+            r.mirrors
+                .iter()
+                .any(|m| m.from_zone == "l2" && m.to_zone == "wan" && m.to_host == "monitor"),
+            "l2 的镜像应指向 wan 里那台 monitor: {:?}",
+            r.mirrors
+        );
+        // lab 自己的新建声明也照常连线（含监控机自镜像）
+        assert!(r.mirrors.iter().any(|m| m.from_zone == "lab" && m.to_zone == "wan"));
+    }
+
+    #[test]
+    fn monitor_use_to_unknown_declaration_still_fails() {
+        // 引用一个不存在的声明要报错，且报错要列出现有的监控机
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  lab:
+    uplink: wan
+    v4: 10.77.0.0/24
+    monitor: { name: monitor, mgmt: wan }
+    hosts: { gw: { role: gateway } }
+  l2:
+    uplink: lab
+    v4: 10.30.1.0/24
+    monitor: { use: "lab:probe" }
+    hosts: { gateway: { role: gateway } }
+"#;
+        let err = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap_err();
+        assert!(matches!(err, SpecError::MonitorUnknown(_, _)), "实际: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("wan:monitor"), "报错要列出 wan:monitor: {msg}");
+    }
+
+    #[test]
+    fn server_and_client_roles_resolve_to_host() {
+        // 角色 Simplification：server / client 都是 host（老写法保留成别名）
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 4, template: t, storage: s }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      a: { role: server }
+      b: { role: client }
+      c: { role: host }
+"#;
+        let z = Spec::parse(y).unwrap().resolve("vmbr0").unwrap();
+        let roles: Vec<&str> = z[0].hosts.iter().map(|h| h.role.as_str()).collect();
+        assert_eq!(roles, vec!["host", "host", "host"]);
     }
 
     #[test]

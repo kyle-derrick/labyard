@@ -54,15 +54,16 @@ const { Text } = Typography;
 const ROLE_LABEL: Record<string, string> = {
   gateway: "网关",
   monitor: "流量监控",
-  server: "服务主机",
-  client: "终端主机",
+  host: "主机",
+  // 老数据兜底（后端已把 server/client 归并为 host）
+  server: "主机",
+  client: "主机",
 };
 
 const ROLE_COLOR: Record<string, string> = {
   gateway: "blue",
   monitor: "orange",
-  server: "green",
-  client: "default",
+  host: "green",
 };
 
 function statusTag(status: string, retired: boolean) {

@@ -300,9 +300,14 @@ pub fn zone_snippet(doc: &str, zone: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("zone `{zone}` 序列化失败: {e}"))
 }
 
+/// 出网开关：**同时**控制网关转发（`gateway.egress`）与地址伪装（zone 的
+/// `nat`）。对使用者来说这是同一件事——"这个网段能不能到上游"；拆成两个
+/// 开关只会让人问"这俩什么关系"。YAML 保留两个字段是给高级场景用的
+/// （上游已经路由了整段时可以只关 nat）。
 pub fn set_egress(doc: &str, zone: &str, on: bool) -> Result<String, String> {
     let d = parse(doc)?;
     gateway_of(&d, zone)?.set("egress", on);
+    zone_of(&d, zone)?.set("nat", on);
     Ok(d.to_string())
 }
 
@@ -530,6 +535,7 @@ zones:
         let out = set_egress(DOC, "main", false).unwrap();
         assert!(out.contains("gateway:"), "没有 gateway 时要自动建:\n{out}");
         assert!(out.contains("egress: false"));
+        assert!(out.contains("nat: false"), "出网开关要同步关掉 nat:\n{out}");
         assert!(valid(&out));
 
         let out = add_pub(&out, "main", "{ proto: tcp, port: 2222, to: \"10.10.1.20:22\" }").unwrap();

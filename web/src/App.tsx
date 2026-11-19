@@ -166,15 +166,16 @@ export default function App() {
           height: 56,
         }}
       >
-        <Space size={24}>
+        <div style={{ display: "flex", alignItems: "center", gap: 24, flex: 1, minWidth: 0 }}>
           <Text strong style={{ fontSize: 16, letterSpacing: 0.3 }}>
             labyard
           </Text>
           <Menu
             mode="horizontal"
+            disabledOverflow
             selectedKeys={[page]}
             onClick={(e) => setPage(e.key as Page)}
-            style={{ borderBottom: "none", minWidth: 420 }}
+            style={{ flex: 1, minWidth: 0, borderBottom: "none", background: "transparent" }}
             items={[
               {
                 key: "editor",
@@ -203,7 +204,7 @@ export default function App() {
               },
             ]}
           />
-        </Space>
+        </div>
         <Space size={8}>
           <Dropdown
             menu={{

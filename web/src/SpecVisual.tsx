@@ -102,9 +102,18 @@ type Model = {
 const ROLES = [
   { value: "gateway", label: "网关" },
   { value: "monitor", label: "流量监控" },
-  { value: "server", label: "服务主机" },
-  { value: "client", label: "终端主机" },
+  { value: "host", label: "主机" },
 ];
+
+/** 角色下拉的选项：YAML 里可能还写着老的 server / client——后端按别名
+ * 接受，但下拉里裸显示一个不在选项里的值会让人以为是坏数据，补一条
+ * "（旧写法）"让用户知道它等价于主机。 */
+function roleOptions(cur?: string) {
+  if (cur && (cur === "server" || cur === "client") && !ROLES.some((r) => r.value === cur)) {
+    return [...ROLES, { value: cur, label: "主机（旧写法）" }];
+  }
+  return ROLES;
+}
 
 function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
   return (
@@ -279,9 +288,9 @@ export default function SpecVisual({
   const roleOf = (z: ZoneM) =>
     Object.values(z.hosts ?? {}).find((h) => h.role === "gateway") ?? null;
 
-  /** 全部规格里 role=monitor 的主机（zone:host），供"复用已有"下拉用。
-   * 本 zone 的"将新建"声明不能进这个列表——use 指向自己等于什么都没指，
-   * 会产生一个永远解析不过的规格（正是这个坑让用户白配了半天）。 */
+  /** 全部规格里 role=monitor 的主机 + 各 zone 的新建声明，供"复用已有"下拉用。
+   * 声明可以跨 zone 引用（后端认 `zone:名字`，监控机实际落点由声明的 mgmt 决定）；
+   * 但本 zone 自己的声明不能选——use 指向自己等于什么都没指。 */
   const monitorChoices = useMemo(() => {
     const out: { value: string; label: string }[] = [];
     for (const zn of zoneNames) {
@@ -291,7 +300,11 @@ export default function SpecVisual({
       const m = zones[zn].monitor;
       if (m?.name && !m.use) {
         const v = `${zn}:${m.name}`;
-        if (!out.some((o) => o.value === v)) out.push({ value: v, label: `${zn} / ${m.name}（本 zone 将新建）` });
+        if (!out.some((o) => o.value === v))
+          out.push({
+            value: v,
+            label: `${zn} / ${m.name}（将新建${m.mgmt ? `，管理口挂 ${m.mgmt}` : ""}）`,
+          });
       }
     }
     return out;
@@ -480,7 +493,7 @@ export default function SpecVisual({
             }
           >
             <Row gutter={10}>
-              <Col span={7}>
+              <Col span={8}>
                 <Field label="上联">
                   <Select
                     size="small"
@@ -496,7 +509,7 @@ export default function SpecVisual({
                   />
                 </Field>
               </Col>
-              <Col span={7}>
+              <Col span={9}>
                 <Field label="网段（CIDR）">
                   <Input
                     size="small"
@@ -507,24 +520,17 @@ export default function SpecVisual({
                   />
                 </Field>
               </Col>
-              <Col span={5}>
-                <Field label="NAT">
-                  <Switch
-                    size="small"
-                    checked={z.nat !== false}
-                    onChange={(v) => patchZone(zn, { nat: v })}
-                  />
-                </Field>
-              </Col>
-              <Col span={5}>
-                <Field label="网关出网">
-                  <Tooltip title="网关容器里 nft masquerade，关掉后这个网段不能访问外网">
+              <Col span={7}>
+                <Field label="出网">
+                  <Tooltip title="本网段的主机能否访问上游/外网。开 = 网关转发 + NAT 一起生效；关 = 立即断外网。高级场景（上游已手动路由整段、只想去掉 NAT）请改 YAML 里的 nat 字段。">
                     <Switch
                       size="small"
-                      checked={!!z.gateway?.egress}
-                      disabled={!gw}
+                      checked={z.nat !== false && z.gateway?.egress !== false}
                       onChange={(v) =>
-                        patchZone(zn, { gateway: { ...(z.gateway ?? {}), egress: v } })
+                        patchZone(zn, {
+                          nat: v,
+                          gateway: { ...(z.gateway ?? {}), egress: v },
+                        })
                       }
                     />
                   </Tooltip>
@@ -726,9 +732,9 @@ export default function SpecVisual({
                     <Select
                       size="small"
                       style={{ width: "100%" }}
-                      value={v ?? "server"}
+                      value={v ?? "host"}
                       onChange={(nv) => patchHost(zn, r.name, { role: nv })}
-                      options={ROLES}
+                      options={roleOptions(v)}
                     />
                   ),
                 },
@@ -737,7 +743,7 @@ export default function SpecVisual({
                   dataIndex: "ip",
                   width: 76,
                   render: (v: number | undefined, r) => (
-                    <Tooltip title="主机号（网段的最后一段）。留空按角色自动分配：网关 .1、流量监控 .10、服务 .20、终端 .30">
+                    <Tooltip title="主机号（网段的最后一段）。留空按角色自动分配：网关 .1、流量监控 .10、主机 .20">
                       <InputNumber
                         size="small"
                         min={1}
@@ -940,7 +946,7 @@ export default function SpecVisual({
           >
             <Input placeholder="web1" className="mono" />
           </Form.Item>
-          <Form.Item name="role" label="角色" initialValue="server">
+          <Form.Item name="role" label="角色" initialValue="host">
             <Select options={ROLES} />
           </Form.Item>
         </Form>

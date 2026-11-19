@@ -159,7 +159,7 @@ zones:
     v4: 10.10.1.0/24
     hosts:
       gateway: { role: gateway }
-      server1: { role: server }
+      host1:   { role: host }
 "#;
 
 pub async fn get_spec_named(

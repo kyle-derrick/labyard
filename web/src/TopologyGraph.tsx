@@ -46,8 +46,10 @@ const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
 export const ROLE_LABEL: Record<string, string> = {
   gateway: "网关",
   monitor: "流量监控",
-  server: "服务",
-  client: "终端",
+  host: "主机",
+  // 老数据兜底：后端已把 server/client 归并为 host，这两个只是防旧缓存
+  server: "主机",
+  client: "主机",
 };
 
 type Data = {
@@ -146,7 +148,6 @@ function LabNode({ data }: NodeProps<GNode>) {
             <span className="tn-neticon" data-external={flag("external") ? "1" : "0"} />
             <span className="tn-title">{data.label}</span>
             <span className="tn-chips">
-              {flag("nat") && <span className="tn-chip chip-nat">NAT</span>}
               {flag("egress") && <span className="tn-chip chip-egress">出网</span>}
               {(meta.pubs as number) > 0 && (
                 <span className="tn-chip chip-pub">映射 {String(meta.pubs)}</span>

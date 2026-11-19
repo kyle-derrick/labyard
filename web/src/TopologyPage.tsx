@@ -1014,7 +1014,6 @@ function NetworkDetail({
                 </Text>
               ) : null}
             </Descriptions.Item>
-            <Descriptions.Item label="NAT">{m.nat ? "开" : "关"}</Descriptions.Item>
             <Descriptions.Item label="网关主机">
               {String(m.gateway_host ?? "—")}
             </Descriptions.Item>
@@ -1176,7 +1175,8 @@ function NetworkDetail({
             }
           >
             <Text type="secondary" style={{ fontSize: 12 }}>
-              关闭后这个网段的主机立刻断掉外部访问（规则插在 established 之前，不等超时）。
+              开 = 网关转发 + NAT，本网段主机可访问上游/外网；关 = 立即断掉外部访问
+              （规则插在 established 之前，不等超时）。
             </Text>
           </Card>
 

@@ -182,12 +182,12 @@ if not HOST and isinstance(hosts, dict):
     cands = [h for h in hosts.get("hosts", [])
              if h.get("zone") == ZONE and h.get("vmid") and h.get("host")]
     # 优先普通主机：网关不能当镜像源，分析机当源会变成"自己镜像自己"
-    for want_roles in (("server", "client"), ()):
+    for want_roles in (("host", "server", "client"), ()):
         for h in cands:
             role = h.get("role") or ""
             if want_roles and role not in want_roles:
                 continue
-            if not want_roles and role in ("gateway", "analysis"):
+            if not want_roles and role in ("gateway", "analysis", "monitor"):
                 continue
             HOST = h.get("host")
             break
@@ -288,6 +288,32 @@ if PW:
     record(link not in left, "删后列表里不再有", "GET /api/mirrors", 200, str(left)[:110])
     check("再删一次失败", "DELETE", f"/api/mirrors/{q(link)}", want=400)
     check("删镜像用的 zone", "DELETE", f"/api/specs/{q(TMP)}/zones/zt", keys=["ok"])
+
+    # ── monitor.use 引用其它 zone 的新建声明 ──
+    # 回归：监控机声明 mgmt: wan 时实际建在 wan 里，`za:monitor` 这种按
+    # 声明所在 zone 的写法曾误报"不存在"，用户白配半天。
+    check("监控声明+跨网引用-保存", "PUT", f"/api/specs/{q(TMP)}", {"yaml":
+        "defaults:\n  cores: 1\n  memory: 512\n  disk: 4\n"
+        "  template: debian-13-standard\n  storage: local-lvm\n"
+        "zones:\n"
+        "  za:\n    uplink: wan\n    v4: 10.99.4.0/24\n"
+        "    monitor: { name: monitor, mgmt: wan }\n"
+        "    hosts:\n      gw: { role: gateway }\n"
+        "  zb:\n    uplink: za\n    v4: 10.99.5.0/24\n"
+        "    monitor: { use: \"za:monitor\" }\n"
+        "    hosts:\n      gw: { role: gateway }\n"},
+        keys=["ok"])
+    check("引用不存在的声明-被拒", "PUT", f"/api/specs/{q(TMP)}", {"yaml":
+        "defaults:\n  cores: 1\n  memory: 512\n  disk: 4\n"
+        "  template: debian-13-standard\n  storage: local-lvm\n"
+        "zones:\n"
+        "  za:\n    uplink: wan\n    v4: 10.99.4.0/24\n"
+        "    monitor: { name: monitor, mgmt: wan }\n"
+        "    hosts:\n      gw: { role: gateway }\n"
+        "  zb:\n    uplink: za\n    v4: 10.99.5.0/24\n"
+        "    monitor: { use: \"za:probe\" }\n"
+        "    hosts:\n      gw: { role: gateway }\n"},
+        want=400)
 
     check("删临时规格", "DELETE", f"/api/specs/{q(TMP)}", keys=["ok"])
     # 删除后的读不是 404，而是 exists:false——前端靠这个字段决定显示"新建"还是"编辑"
