@@ -30,6 +30,14 @@ pub struct Pve {
     ///
     /// 存 `Value` 而不是 `T`：`get_json` 是泛型的，缓存不能按类型分装。
     cache: Mutex<HashMap<String, (Instant, Duration, serde_json::Value)>>,
+    /// 后台刷新队列。见 `get_json_view`：过期缓存还给它一个"先返回旧值"的
+    /// 机会，真正的 `pvesh` 由 `start_refresher` 起的那个任务慢慢跑。
+    /// 队列容量无上限是因为生产端只会在"缓存过期 + 有人点开"时投递，
+    /// 而消费端一条一条跑，重复的 key 会被 `inflight` 挡掉。
+    refresh_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<RefreshJob>>>,
+    /// 正在后台刷新的 key。没有它，用户连点五下就会排出五个 `pvesh`，
+    /// 每个都是 ~1 秒的 perl 进程——那就等于把缓存省下的内存又还回去了。
+    inflight: Mutex<std::collections::HashSet<String>>,
     /// `pct exec` 串行闸。单个 `pct exec`（lxc-attach）实测峰值 ~176 MB，全部
     /// 记在 labpanel 的 cgroup 上；编排批内并发 3 个 + preview 的 pvesh 就是
     /// OOM 的直接来源。所有 exec 走这一个闸，容量 1 = 全局串行：峰值从
@@ -60,6 +68,35 @@ fn cache_ttl(path: &str) -> Duration {
     } else {
         Duration::from_secs(15)
     }
+}
+
+/// 过期缓存还能"先拿去给人看"的上限。
+///
+/// 超过这个年龄就不再兜旧值，宁可让请求去等——一个五分钟前的容器列表
+/// 已经不该被当成现状了。
+const STALE_MAX: Duration = Duration::from_secs(300);
+
+/// 一次后台刷新请求。用 `key` 回来清 `inflight`。
+struct RefreshJob {
+    key: String,
+    path: String,
+    extra: Vec<String>,
+}
+
+/// 缓存键：路径 + 参数。参数是空的就不留尾空格，免得同一件事两个键。
+fn cache_key(path: &str, extra: &[&str]) -> String {
+    if extra.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path} {}", extra.join(" "))
+    }
+}
+
+fn from_value<T: DeserializeOwned>(path: &str, v: serde_json::Value) -> Result<T, PveError> {
+    serde_json::from_value(v).map_err(|source| PveError::Json {
+        cmd: format!("pvesh get {path}"),
+        source,
+    })
 }
 
 /// `pvesh get /version`
@@ -195,40 +232,86 @@ impl Pve {
             runner,
             node: node.into(),
             cache: Mutex::new(HashMap::new()),
+            refresh_tx: Mutex::new(None),
+            inflight: Mutex::new(std::collections::HashSet::new()),
             exec_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
-    /// 丢掉全部读缓存。写操作（建/删/关机）之后调一次，免得界面拿着
-    /// 4 秒前的状态说"还没变"。
+    /// 把全部读缓存**标记为过期**（而不是删掉）。写操作（建/删/关机、apply）
+    /// 之后调一次。
+    ///
+    /// 为什么不是 `clear()`：删了之后第一次打开主机页/体检页又是冷启动
+    /// （实测 1.0 秒 / 4.2 秒），而用户刚点完 apply 正是最想马上看一眼的时候。
+    /// 标记过期就两全：严格读（执行器）立刻重取，展示读先给旧值、后台补新。
     pub fn clear_cache(&self) {
         if let Ok(mut m) = self.cache.lock() {
-            m.clear();
+            // 有效期清零 = 一律算过期；真正的 `ttl` 在下次取值时重新写入。
+            for (_, (_, ttl, _)) in m.iter_mut() {
+                *ttl = Duration::ZERO;
+            }
         }
     }
 
-    /// `pvesh get ... --output-format json`
+    /// `pvesh get ... --output-format json`。**过期就必须等**——执行器
+    /// 用这条路径判断"容器在不在"，拿旧快照去做决定会越做越错。
     async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
         extra: &[&str],
         cancel: &CancellationToken,
     ) -> Result<T, PveError> {
-        let key = format!("{path} {}", extra.join(" "));
+        let value = self.get_json_mode(path, extra, cancel, false).await?;
+        from_value(path, value)
+    }
+
+    /// 同上，但**过期缓存先给旧值**，同时把一个刷新任务丢进后台队列。
+    ///
+    /// 只给"给人看"的接口用（主机页、体检页）。真机上这两页的冷启动分别是
+    /// 1.0 秒和 4.2 秒——慢的不是计算，是等 perl 进程和 `/etc/pve` 的
+    /// 单线程 FUSE 往返。可这些数据本来就是"几秒前的现状"，让人盯着转圈
+    /// 去换那几秒的新鲜度不值当：先画出来，下一秒再悄悄换成新的。
+    async fn get_json_view<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        extra: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<T, PveError> {
+        let value = self.get_json_mode(path, extra, cancel, true).await?;
+        from_value(path, value)
+    }
+
+    async fn get_json_mode(
+        &self,
+        path: &str,
+        extra: &[&str],
+        cancel: &CancellationToken,
+        allow_stale: bool,
+    ) -> Result<serde_json::Value, PveError> {
+        let key = cache_key(path, extra);
         // 锁不跨 await：命中判断在一段同步代码里做完，拿不到锁就当作没缓存
         // （缓存坏了不该让请求失败）。
-        let hit = self.cache.lock().ok().and_then(|m| {
-            m.get(&key)
-                .filter(|(at, ttl, _)| at.elapsed() < *ttl)
-                .map(|(_, _, v)| v.clone())
-        });
-        if let Some(v) = hit {
-            return serde_json::from_value(v).map_err(|source| PveError::Json {
-                cmd: format!("pvesh get {path}"),
-                source,
-            });
+        let hit = self.cache.lock().ok().and_then(|m| m.get(&key).cloned());
+        if let Some((at, ttl, v)) = hit {
+            let age = at.elapsed();
+            if age < ttl {
+                return Ok(v);
+            }
+            if allow_stale && age < STALE_MAX {
+                self.queue_refresh(&key, path, extra);
+                return Ok(v);
+            }
         }
+        self.fetch_value(path, extra, cancel).await
+    }
 
+    /// 真的去问 PVE，并把结果写进缓存。首次读取与后台刷新共用这一条。
+    async fn fetch_value(
+        &self,
+        path: &str,
+        extra: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<serde_json::Value, PveError> {
         let mut args: Vec<String> = vec![
             "get".into(),
             path.into(),
@@ -249,12 +332,84 @@ impl Pve {
             if m.len() >= 128 {
                 m.clear();
             }
-            m.insert(key, (Instant::now(), cache_ttl(path), value.clone()));
+            m.insert(
+                cache_key(path, extra),
+                (Instant::now(), cache_ttl(path), value.clone()),
+            );
         }
-        serde_json::from_value(value).map_err(|source| PveError::Json {
-            cmd: format!("pvesh get {path}"),
-            source,
-        })
+        Ok(value)
+    }
+
+    /// 把一次"补新"排进后台，同一个 key 同时只会有一个在跑。
+    fn queue_refresh(&self, key: &str, path: &str, extra: &[&str]) {
+        let Some(tx) = self.refresh_tx.lock().ok().and_then(|g| g.clone()) else {
+            // 没起后台任务（CLI 路径、单测）就当作没有这回事。
+            return;
+        };
+        let Ok(mut flying) = self.inflight.lock() else {
+            return;
+        };
+        if !flying.insert(key.to_string()) {
+            return;
+        }
+        drop(flying);
+        let job = RefreshJob {
+            key: key.to_string(),
+            path: path.to_string(),
+            extra: extra.iter().map(|s| s.to_string()).collect(),
+        };
+        if tx.send(job).is_err() {
+            if let Ok(mut f) = self.inflight.lock() {
+                f.remove(key);
+            }
+        }
+    }
+
+    /// 起后台刷新线程。**一个**，串行跑——`pvesh` 是 perl 进程，并发几个就会
+    /// 把 systemd 的 MemoryMax 顶穿（真机上 OOM 过）。
+    pub fn start_refresher(self: &Arc<Self>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RefreshJob>();
+        if let Ok(mut g) = self.refresh_tx.lock() {
+            *g = Some(tx);
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
+                let cancel = CancellationToken::new();
+                // 失败了就把缓存留着让它自然过老——下次点开还会再试一次，
+                // 不必在这里重试到天荒地老。
+                let _ = me.fetch_value(&job.path, &extra, &cancel).await;
+                if let Ok(mut f) = me.inflight.lock() {
+                    f.remove(&job.key);
+                }
+            }
+        });
+    }
+
+    /// 开机预热：服务刚起来时"体检页/主机页"的缓存是空的，第一次点开
+    /// 就得等 1 秒到 4 秒。启动后空闲时按顺序把它们问一遍，等管理员
+    /// 真去点的时候已经有值了。
+    pub fn warm(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let net = format!("/nodes/{}/network", me.node);
+            let st = format!("/nodes/{}/storage", me.node);
+            let jobs: Vec<(String, Vec<&'static str>)> = vec![
+                ("/version".to_string(), vec![]),
+                ("/nodes".to_string(), vec![]),
+                (net, vec![]),
+                (st, vec![]),
+                ("/cluster/resources".to_string(), vec!["--type", "vm"]),
+            ];
+            for (path, extra) in jobs {
+                // 每条之间让出一点时间：这是背景活，不该和用户刚发起的
+                // 请求抢 `pvesh`。
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let cancel = CancellationToken::new();
+                let _ = me.fetch_value(&path, &extra, &cancel).await;
+            }
+        });
     }
 
     /// 跑一条会改变状态的命令。**非零退出码一律当失败。**
@@ -297,6 +452,11 @@ impl Pve {
         self.get_json("/version", &[], cancel).await
     }
 
+    /// `version` 的展示版：过期先给旧值。只给体检页用。
+    pub async fn version_view(&self, cancel: &CancellationToken) -> Result<Version, PveError> {
+        self.get_json_view("/version", &[], cancel).await
+    }
+
     /// 严格的版本门槛：低于 9.0 直接拒绝（不做 8.x 兼容层）。
     pub async fn require_pve9(&self, cancel: &CancellationToken) -> Result<Version, PveError> {
         let v = self.version(cancel).await?;
@@ -318,13 +478,23 @@ impl Pve {
             .await
     }
 
+    /// `cluster_vms` 的展示版：过期先给旧值，后台补新。**执行器别用**。
+    pub async fn cluster_vms_view(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ClusterResource>, PveError> {
+        self.get_json_view("/cluster/resources", &["--type", "vm"], cancel)
+            .await
+    }
+
+    /// 节点名列表。只有体检页用，所以走"过期先给旧值"的读法。
     pub async fn nodes(&self, cancel: &CancellationToken) -> Result<Vec<String>, PveError> {
         #[derive(Deserialize)]
         struct N {
             #[serde(default)]
             node: String,
         }
-        let v: Vec<N> = self.get_json("/nodes", &[], cancel).await?;
+        let v: Vec<N> = self.get_json_view("/nodes", &[], cancel).await?;
         Ok(v.into_iter().map(|n| n.node).collect())
     }
 
@@ -335,6 +505,14 @@ impl Pve {
     pub async fn bridges(&self, cancel: &CancellationToken) -> Result<Vec<Iface>, PveError> {
         let v: Vec<Iface> = self
             .get_json(&format!("/nodes/{}/network", self.node), &[], cancel)
+            .await?;
+        Ok(v.into_iter().filter(|i| i.kind == "bridge").collect())
+    }
+
+    /// `bridges` 的展示版：过期先给旧值。只给体检页用。
+    pub async fn bridges_view(&self, cancel: &CancellationToken) -> Result<Vec<Iface>, PveError> {
+        let v: Vec<Iface> = self
+            .get_json_view(&format!("/nodes/{}/network", self.node), &[], cancel)
             .await?;
         Ok(v.into_iter().filter(|i| i.kind == "bridge").collect())
     }
@@ -364,6 +542,12 @@ impl Pve {
 
     pub async fn storages(&self, cancel: &CancellationToken) -> Result<Vec<Storage>, PveError> {
         self.get_json(&format!("/nodes/{}/storage", self.node), &[], cancel)
+            .await
+    }
+
+    /// `storages` 的展示版：过期先给旧值。只给体检页用。
+    pub async fn storages_view(&self, cancel: &CancellationToken) -> Result<Vec<Storage>, PveError> {
+        self.get_json_view(&format!("/nodes/{}/storage", self.node), &[], cancel)
             .await
     }
 

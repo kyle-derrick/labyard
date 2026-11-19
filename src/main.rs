@@ -144,6 +144,10 @@ async fn serve_with(cfg: Config, concurrency: usize) -> Result<(), Box<dyn std::
 
     let runner = Arc::new(RealRunner::new());
     let pve = Arc::new(Pve::new(runner.clone(), cfg.pve.node.clone()));
+    // 读缓存的后台补新线程 + 开机预热：让"点开就有"成为常态，
+    // 而不是每次过了缓存期都要看着转圈。
+    pve.start_refresher();
+    pve.warm();
 
     let secret = Arc::new(api::auth::load_or_create_secret(&cfg.server.secret_file)?);
 

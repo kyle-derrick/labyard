@@ -25,10 +25,14 @@ use crate::resources::Executor;
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
 
-/// 网关面板状态缓存（8 秒）。抽屉一开就要问容器"VPN 真的在跑吗"，
+/// 网关面板状态缓存（30 秒）。抽屉一开就要问容器"VPN 真的在跑吗"，
 /// 而 `pct exec` 还要排在全局 exec 闸后面——run 正在跑的时候，打开面板
 /// 会干等几十秒才有第一个像素。缓存让打开面板立刻出数，实时性靠
-/// `?fresh=1`（刷新按钮）和 8 秒自然过期来保证。
+/// `?fresh=true`（刷新按钮）和 30 秒自然过期来保证。
+///
+/// 为什么不是 8 秒：8 秒只够"连着点两下"，正常人隔十几秒再点开一次
+/// 就又吃满 0.8 秒。30 秒能覆盖"看一看、关掉、过会儿再看"的常见节奏，
+/// 而所有写操作都会立刻踢缓存，不会出现"点了没反应"。
 static GW_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (Instant, serde_json::Value)>>,
 > = std::sync::OnceLock::new();
@@ -37,7 +41,7 @@ fn gw_cache_get(zone: &str) -> Option<serde_json::Value> {
     let c = GW_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let g = c.lock().ok()?;
     let (at, v) = g.get(zone)?;
-    (at.elapsed() < Duration::from_secs(8)).then(|| v.clone())
+    (at.elapsed() < Duration::from_secs(30)).then(|| v.clone())
 }
 
 fn gw_cache_put(zone: &str, v: serde_json::Value) {
@@ -926,7 +930,7 @@ pub async fn topology_view(
 
         let vms = state
             .pve
-            .cluster_vms(&CancellationToken::new())
+            .cluster_vms_view(&CancellationToken::new())
             .await
             .unwrap_or_default();
         let status_fn = |vmid: u32| {

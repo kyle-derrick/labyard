@@ -785,7 +785,7 @@ async fn apply_core(state: Arc<AppState>, yaml: String, snapshot: bool) -> Respo
 async fn hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     require_auth!(state, headers);
     let cancel = CancellationToken::new();
-    let vms = state.pve.cluster_vms(&cancel).await.unwrap_or_default();
+    let vms = state.pve.cluster_vms_view(&cancel).await.unwrap_or_default();
 
     // DB 只知道 (zone, host) → vmid；角色与地址在规格里。运维页要能直接看到
     // "哪台是网关、地址是多少、属于哪份规格"，所以在这一层补齐。
@@ -1389,10 +1389,10 @@ async fn doctor(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     //
     // 所以这里串行，快的部分靠两件事补：`storages` 只取一次（以前问三遍），
     // 以及 `get_json` 的读缓存（60 秒），第二次打开概览页是毫秒级。
-    let ver = state.pve.version(&cancel).await;
+    let ver = state.pve.version_view(&cancel).await;
     let nds = state.pve.nodes(&cancel).await;
-    let brs = state.pve.bridges(&cancel).await;
-    let sts = state.pve.storages(&cancel).await;
+    let brs = state.pve.bridges_view(&cancel).await;
+    let sts = state.pve.storages_view(&cancel).await;
 
     let mut items = Vec::new();
 
