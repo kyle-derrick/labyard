@@ -92,6 +92,47 @@ fn cache_key(path: &str, extra: &[&str]) -> String {
     }
 }
 
+/// 解析 `pct config` 里的一行挂载点：`mp0: local-lvm:vm-102-disk-1,mp=/data,size=2G`
+/// → (序号, 挂载点, 容量 GB, 卷名)。
+///
+/// 冒号后面那个空格必须吃掉：不 trim 会把卷名解析成 `" local-lvm:..."`，
+/// 拼回命令行就得多一个前导空格，`pct set` 直接 255（真机踩过）。
+fn parse_mp_line(line: &str) -> Option<(u32, String, Option<u64>, String)> {
+    let rest = line.trim().strip_prefix("mp")?;
+    let (idx, val) = rest.split_once(':')?;
+    let idx = idx.parse::<u32>().ok()?;
+    let mut mount = String::new();
+    let mut size_gb = None;
+    let mut volid = String::new();
+    for kv in val.split(',') {
+        let kv = kv.trim();
+        if let Some(m) = kv.strip_prefix("mp=") {
+            mount = m.to_string();
+        } else if let Some(sz) = kv.strip_prefix("size=") {
+            size_gb = parse_pve_size(sz);
+        } else if kv.contains(':') && volid.is_empty() {
+            volid = kv.to_string();
+        }
+    }
+    Some((idx, mount, size_gb, volid))
+}
+
+/// PVE 的容量写法（`2G`、`512M`、纯字节数）→ GB。
+fn parse_pve_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(v) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
+        return v.trim().parse::<u64>().ok();
+    }
+    if let Some(v) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        // 向上取整：512M 也要算 1G 才不会误判"容量已够"而跳过扩容
+        return v.trim().parse::<u64>().ok().map(|m| (m + 1023) / 1024);
+    }
+    if let Some(v) = s.strip_suffix('T').or_else(|| s.strip_suffix('t')) {
+        return v.trim().parse::<u64>().ok().map(|t| t * 1024);
+    }
+    s.parse::<u64>().ok().map(|b| (b + (1 << 30) - 1) / (1 << 30))
+}
+
 fn from_value<T: DeserializeOwned>(path: &str, v: serde_json::Value) -> Result<T, PveError> {
     serde_json::from_value(v).map_err(|source| PveError::Json {
         cmd: format!("pvesh get {path}"),
@@ -221,6 +262,8 @@ pub enum PveError {
     },
     #[error("PVE 版本 {0} 低于要求（9.0），拒绝继续")]
     TooOld(String),
+    #[error("{0}")]
+    Bad(String),
     #[error("`{cmd}` 被取消")]
     Cancelled { cmd: String },
 }
@@ -687,8 +730,109 @@ fi
         Ok(())
     }
 
-    /// 容器现有的网卡槽位（`net0`、`net1`……）。
+    /// 数据盘收敛：把规格里的 `disks` 落成 mp0、mp1……
     ///
+    /// 规则很克制，因为一步做错就是删数据：
+    /// - 挂载点一致、容量够 → 什么都不做（幂等）
+    /// - 挂载点一致、容量变大 → 扩容（PVE 允许在线扩 mp 卷）
+    /// - 挂载点不存在 → 新建
+    /// - 同序号但挂载点不同 → **报错**，不覆盖。这种多半是规格里插了一行
+    ///   导致序号错位，静默覆盖等于把 A 盘的数据挂到 B 目录上。
+    ///
+    /// 不做缩容、不做删除：那两件事必须由人来决定（数据没了就真没了）。
+    pub async fn ensure_disks(
+        &self,
+        vmid: u32,
+        disks: &[crate::core::spec::ResolvedDisk],
+        cancel: &CancellationToken,
+    ) -> Result<(), PveError> {
+        if disks.is_empty() {
+            return Ok(());
+        }
+        let out = self
+            .runner
+            .run(
+                &format!("ct-config:{vmid}"),
+                &CommandSpec::new("pct", vec!["config".into(), vmid.to_string()])
+                    .with_timeout(Duration::from_secs(20)),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+
+        // `mp0: local-lvm:vm-102-disk-1,mp=/data,size=2G`
+        let mut cur: std::collections::HashMap<u32, (String, Option<u64>, String)> =
+            std::collections::HashMap::new();
+        for line in out.stdout.lines() {
+            if let Some((idx, mount, size, volid)) = parse_mp_line(line) {
+                cur.insert(idx, (mount, size, volid));
+            }
+        }
+
+        for (i, d) in disks.iter().enumerate() {
+            let idx = i as u32;
+            let want = d.size as u64;
+            match cur.get(&idx) {
+                Some((mount, size, _)) if mount == &d.mount => {
+                    let have = size.unwrap_or(0);
+                    if have >= want {
+                        continue; // 幂等：已经够大
+                    }
+                    // 扩容要用 `pct resize`，不能用 `pct set -mpX volid,size=`：
+                    // 后者只把 LVM 卷撑大，容器里的 ext4 还是旧容量，`df` 一点没变；
+                    // 而未特权容器里拿不到 /dev/mapper 的块设备节点，进容器
+                    // `resize2fs` 会 "No such file or directory"。
+                    // `pct resize` 在宿主侧连卷带文件系统一起扩，真机实测一步到位。
+                    self.cmd(
+                        &format!("ct-mp{idx}:grow"),
+                        CommandSpec::new(
+                            "pct",
+                            vec![
+                                "resize".into(),
+                                vmid.to_string(),
+                                format!("mp{idx}"),
+                                format!("{want}G"),
+                            ],
+                        )
+                        .with_timeout(Duration::from_secs(300)),
+                        cancel,
+                    )
+                    .await?;
+                }
+                Some((mount, _, _)) => {
+                    return Err(PveError::Bad(
+                        format!(
+                            "CT {vmid} 的 mp{idx} 已经挂在 `{mount}`，规格里却要求 `{}`。\
+                             为了不把数据挂错地方，这里不覆盖——请先把规格里的数据盘顺序调整回去，\
+                             或手工 `pct set {vmid} -mp{idx} ...` 处理掉旧挂载点。",
+                            d.mount
+                        ),
+                    ));
+                }
+                None => {
+                    self.cmd(
+                        &format!("ct-mp{idx}:add"),
+                        CommandSpec::new(
+                            "pct",
+                            vec![
+                                "set".into(),
+                                vmid.to_string(),
+                                format!("-mp{idx}"),
+                                format!("{}:{},mp={}", d.storage, want, d.mount),
+                            ],
+                        )
+                        .with_timeout(Duration::from_secs(180)),
+                        cancel,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 容器现有的网卡槽位（`net0`、`net1`……）。
     /// 只在"更新一台已有容器"时调用：网卡列表变短了（比如监控机不再抓某个
     /// 网络的流量），多出来的 `netN` 必须删掉——`pct set` 不传就等于保留，
     /// 于是容器里会留着一块谁都不认的网卡，镜像脚本还在往上灌流量。
@@ -894,6 +1038,29 @@ fi
     }
 
     /// 容器内执行。返回完整输出。
+    /// 容器起来了但 DHCP 没拿到地址时补一脚。
+    ///
+    /// 真机现象：外网监控机的 eth0 是 `ip=dhcp`，容器里的 `ifup` 在 veth 就绪
+    /// 之前就跑过一遍，之后没人再试——容器一直只有 `lo`，面板上写着 `dhcp`
+    /// 却连 `ping` 都发不出去（`Network is unreachable`）。这里对仍然没有 v4
+    /// 地址的口补一次 `dhclient -1`；没有该命令就跳过，不把容器弄失败。
+    pub async fn ct_ensure_dhcp(
+        &self,
+        vmid: u32,
+        cancel: &CancellationToken,
+    ) -> Result<(), PveError> {
+        let script = r#"for i in $(ls /sys/class/net | grep -E '^eth'); do ip -4 -o addr show "$i" 2>/dev/null | grep -q "inet " || { command -v dhclient >/dev/null 2>&1 && dhclient -1 -q "$i" 2>/dev/null; }; done"#;
+        self.ct_exec(
+            "dhcp:ensure",
+            vmid,
+            &["sh", "-c", script],
+            Duration::from_secs(25),
+            cancel,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn ct_exec(
         &self,
         key: &str,
@@ -1448,6 +1615,23 @@ pub fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mp_line_parsing_handles_the_leading_space() {
+        // 真机踩过：冒号后的空格没吃掉，卷名带着前导空格拼回命令行 → pct set 255
+        let (idx, mount, size, volid) =
+            parse_mp_line("mp0: local-lvm:vm-102-disk-1,mp=/data,size=2G").unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(mount, "/data");
+        assert_eq!(size, Some(2));
+        assert_eq!(volid, "local-lvm:vm-102-disk-1");
+        assert!(!volid.starts_with(' '), "卷名不能带前导空格");
+
+        // 顺序不同也要能认（PVE 的字段顺序不保证）
+        let (i2, m2, s2, v2) = parse_mp_line("mp3: mp=/var/lib/x,local:3,size=512M").unwrap();
+        assert_eq!((i2, m2.as_str(), s2, v2.as_str()), (3, "/var/lib/x", Some(1), "local:3"));
+        assert!(parse_mp_line("rootfs: local-lvm:vm-100-disk-0,size=2G").is_none());
+    }
 
     #[test]
     fn base64_matches_known_values() {

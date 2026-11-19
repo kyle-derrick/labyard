@@ -479,6 +479,11 @@ async fn apply_step(
                 cancel,
             )
             .await?;
+            // 走 DHCP 的口（外网监控机）经常"ifup 跑过了但没拿到租约"，
+            // 补一次不致命的重试；失败留给 doctor 去报，不阻断整轮 apply。
+            if *dhcp {
+                let _ = pve.ct_ensure_dhcp(*vmid, cancel).await;
+            }
         }
 
         StepKind::Net {
@@ -556,6 +561,17 @@ async fn apply_step(
                 )
                 .await?;
             }
+        }
+
+        StepKind::Disks {
+            zone: disks_zone,
+            host: disks_host,
+            vmid,
+            disks,
+        } => {
+            pve.ensure_disks(*vmid, disks, cancel).await.map_err(|e| {
+                format!("主机 {disks_zone}:{disks_host}（CT {vmid}）挂数据盘失败: {e}")
+            })?;
         }
 
         StepKind::Bootstrap {

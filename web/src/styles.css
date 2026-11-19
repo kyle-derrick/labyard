@@ -310,17 +310,34 @@ body {
   background: #a78bfa;
 }
 
-/* 主机按角色上色：网关绿、分析机蓝、靶机白（与用户心里的"网关/分析机"对应） */
+/* 主机按角色上色：网关绿、流量监控青、普通主机白。
+   注意类名是 `tn-role-{role}`，角色值叫 monitor——以前这里只有 analysis，
+   于是流量监控机在图上完全没有颜色（改名前的老类名保留成别名）。 */
 .tn-role-gateway {
   background: #f0fdf4;
   border-color: #86efac;
   border-left: 3px solid #16a34a;
 }
 
+.tn-role-monitor,
 .tn-role-analysis {
-  background: #eff6ff;
-  border-color: #bfdbfe;
-  border-left: 3px solid #2563eb;
+  background: #ecfeff;
+  border-color: #67e8f9;
+  border-left: 3px solid #0891b2;
+}
+
+/* 监控机在图上要一眼认出来：标题条也染一下 */
+.tn-role-monitor .tn-title,
+.tn-role-analysis .tn-title {
+  color: #0e7490;
+  font-weight: 600;
+}
+
+.tn-role-monitor .tn-chip,
+.tn-role-analysis .tn-chip {
+  background: #cffafe;
+  border-color: #67e8f9;
+  color: #0e7490;
 }
 
 .tn-role-server,

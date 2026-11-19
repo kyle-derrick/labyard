@@ -186,6 +186,7 @@ fn blank_host(role: Role) -> HostSpec {
         vmid: None,
         provisioner: None,
         mirror: MirrorRole::None,
+        disks: None,
     }
 }
 
@@ -316,6 +317,14 @@ impl<'de> Deserialize<'de> for V6Mode {
     }
 }
 
+/// 落地形态的数据盘：存储已补默认值，挂载点已校验。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedDisk {
+    pub size: u32,
+    pub mount: String,
+    pub storage: String,
+}
+
 /// 一台主机。全部资源字段可覆盖上层。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -350,6 +359,25 @@ pub struct HostSpec {
     /// 是否加入镜像链路（作为源或目标）
     #[serde(default)]
     pub mirror: MirrorRole,
+    /// rootfs 之外的数据盘。按顺序映射成 PVE 的 mp0、mp1……
+    #[serde(default)]
+    pub disks: Option<Vec<DiskSpec>>,
+}
+
+/// 一块额外的数据盘（rootfs 之外）。
+///
+/// PVE 用 `mpX` 表达容器挂载点，所以这里不需要"盘符"：给大小和挂载点，
+/// 执行层按顺序落成 mp0/mp1……。**只增不减**——缩盘等于删数据，平台不做
+/// 这种"顺手帮忙"；要减就自己 `pct set -mpX` 或删主机。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskSpec {
+    /// 大小 GB
+    pub size: u32,
+    /// 容器内挂载点，必须以 / 开头，如 /data
+    pub mount: String,
+    /// 落在哪个存储；不写则跟随主机 rootfs 的 storage
+    pub storage: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -436,6 +464,8 @@ pub struct ResolvedHost {
     pub ipv6_prefix: Option<String>,
     pub provisioner: Option<String>,
     pub mirror: MirrorRole,
+    /// rootfs 之外的数据盘，按顺序落成 mp0、mp1……
+    pub disks: Vec<ResolvedDisk>,
     /// 这台监控机要抓哪些网络的流量。一个网络一块抓包网卡，按 zone 名
     /// 排序后从 eth1 起编号（eth0 永远是管理口）。
     ///
@@ -593,6 +623,8 @@ pub enum SpecError {
     MirrorTargetNotAnalysis(String, String),
     #[error("镜像连线 `{0}` → `{1}`：把自己镜像到自己没有意义（会生成 100-100 这种空转单元）")]
     MirrorSelfLoop(String, String),
+    #[error("主机 `{0}` 的数据盘配置有问题：{1}")]
+    BadDisk(String, String),
     #[error("zone 名 `wan` 是保留字（表示外网），换一个名字")]
     ZoneNameReserved(String),
     #[error("zone `{0}` 的 monitor 里 `name` 与 `use` 只能写一个")]
@@ -903,6 +935,39 @@ fn resolve_zone(
             }
         }
 
+        // 数据盘：挂载点重复 = 两块盘抢同一个目录，PVE 会拒绝但报错很难看，
+        // 在这里先拦住并把出问题的主机名带出来。
+        let disks: Vec<ResolvedDisk> = {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for d in h.disks.clone().unwrap_or_default() {
+                if !d.mount.starts_with('/') || d.mount.len() < 2 {
+                    return Err(SpecError::BadDisk(
+                        format!("{zone_name}:{host_name}"),
+                        format!("挂载点要写绝对路径（如 /data），写了 `{}`", d.mount),
+                    ));
+                }
+                if d.size == 0 {
+                    return Err(SpecError::BadDisk(
+                        format!("{zone_name}:{host_name}"),
+                        format!("{} 的大小必须 ≥ 1 GB", d.mount),
+                    ));
+                }
+                if !seen.insert(d.mount.clone()) {
+                    return Err(SpecError::BadDisk(
+                        format!("{zone_name}:{host_name}"),
+                        format!("挂载点 `{}` 写了两次", d.mount),
+                    ));
+                }
+                out.push(ResolvedDisk {
+                    size: d.size,
+                    mount: d.mount,
+                    storage: d.storage.clone().unwrap_or_else(|| storage.clone()),
+                });
+            }
+            out
+        };
+
         hosts.push(ResolvedHost {
             name: host_name.clone(),
             zone: zone_name.to_string(),
@@ -944,6 +1009,7 @@ fn resolve_zone(
             ipv6_prefix: v6_prefix.clone(),
             provisioner: h.provisioner.clone(),
             mirror: h.mirror,
+            disks,
             // 抓包口在 resolve_all 的最后一步回填：要等所有连线齐了才知道
             // 这台监控机一共接了几个网络
             capture: Vec::new(),
@@ -1233,8 +1299,32 @@ impl Spec {
         // 上联是另一个 labyard zone 时，那座桥是平台自己建的，上面**没有
         // DHCP 服务**。以前这里一律 eth1 走 dhcp，结果嵌套网关永远拿不到
         // 地址 → 整段内网没有出口 → bootstrap 的 apt 每次都失败，run 一跑
-        // 就是好几分钟且永不收敛。这里按父 zone 网段给一个静态地址（.253，
-        // 避开 .1 网关与 .254 宿主管理口），默认路由指向父网关。
+        // 就是好几分钟且永不收敛。这里按父 zone 网段给一个静态地址（.253
+        // 起，避开 .1 网关与 .254 宿主管理口），默认路由指向父网关。
+        //
+        // **必须跨 zone 全局去重**：两个 zone 的 uplink 都指向同一个父 zone
+        // 时（如 l2 与 l5 都挂在 lab 下），各自从 .253 往下找会在同一座桥上
+        // 分到同一个 IP——两个 MAC 抢同一个地址，ARP 反复改判，表现出来就是
+        // "时通时不通"。所以先按父 zone 建一张已用表，再逐个分配、分配完就
+        // 登记，后面的 zone 自然避开。
+        let mut used_by_parent: std::collections::HashMap<String, std::collections::HashSet<u32>> =
+            std::collections::HashMap::new();
+        for z in &out {
+            let set = used_by_parent.entry(z.name.clone()).or_default();
+            for h in &z.hosts {
+                if let Some(last) = h.ipv4.split('.').nth(3) {
+                    if let Ok(v) = last.split('/').next().unwrap_or("").parse::<u32>() {
+                        set.insert(v);
+                    }
+                }
+            }
+            // 宿主在桥上的管理口也算占位
+            if let Some(last) = z.bridge_mgmt_ip.split('.').nth(3) {
+                if let Ok(v) = last.split('/').next().unwrap_or("").parse::<u32>() {
+                    set.insert(v);
+                }
+            }
+        }
         for i in 0..out.len() {
             let Some(parent_name) = out[i].uplink.clone() else {
                 continue;
@@ -1248,21 +1338,22 @@ impl Spec {
                 .iter()
                 .find(|h| h.role == Role::Gateway)
                 .map(|h| h.ipv4.clone());
-            // 父网段里已经用掉的最后一段，避免撞车
-            let used: Vec<String> = parent
-                .hosts
-                .iter()
-                .filter_map(|h| h.ipv4.split('.').nth(3).map(|s| s.split('/').next().unwrap_or("").to_string()))
-                .collect();
             let (net, prefix) = parent_cidr.split_once('/').unwrap_or((&parent_cidr, "24"));
             let mut parts: Vec<String> = net.split('.').map(|s| s.to_string()).collect();
             if parts.len() != 4 {
                 continue;
             }
+            let used = used_by_parent.entry(parent_name.clone()).or_default();
             let mut octet = 253u32;
-            while used.iter().any(|u| u == &octet.to_string()) && octet > 2 {
+            while used.contains(&octet) && octet > 2 {
                 octet -= 1;
             }
+            if octet <= 2 {
+                // 253..3 全被占光：网段太挤，宁可不给地址让上层报错，
+                // 也不要静默分一个撞车的出来。
+                continue;
+            }
+            used.insert(octet);
             parts[3] = octet.to_string();
             out[i].uplink_ip = Some(format!("{}/{}", parts.join("."), prefix));
             out[i].uplink_gw = parent_gw
@@ -1591,6 +1682,94 @@ zones:
       gateway: { role: gateway }
       server1: { role: server }
 "#;
+
+    /// 同一父 zone 下挂两个嵌套网关时，上联地址**必须互不相同**。
+    ///
+    /// 这条曾经在真机上翻过车：l2 与 l5 都 `uplink: lab`，各自从 .253 往下找，
+    /// 结果两台网关的 eth1 都拿到 10.77.0.253。同一个桥上两个 MAC 抢一个 IP，
+    /// ARP 来回改判，表现就是内网"时通时不通"。
+    #[test]
+    fn nested_uplinks_get_distinct_addresses() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 2, template: t, storage: s }
+zones:
+  lab:
+    uplink: wan
+    v4: 10.77.0.0/24
+    hosts:
+      gateway: { role: gateway }
+  a:
+    uplink: lab
+    v4: 10.30.1.0/24
+    hosts:
+      gateway: { role: gateway }
+  b:
+    uplink: lab
+    v4: 10.30.3.0/24
+    hosts:
+      gateway: { role: gateway }
+"#;
+        let zs = Spec::parse(y).unwrap().resolve("vmbr0").unwrap();
+        let pick = |n: &str| {
+            zs.iter()
+                .find(|z| z.name == n)
+                .and_then(|z| z.uplink_ip.clone())
+                .unwrap()
+        };
+        let (a, b) = (pick("a"), pick("b"));
+        assert_ne!(a, b, "两个嵌套网关分到了同一个上联地址: {a}");
+        assert!(a.starts_with("10.77.0.") && b.starts_with("10.77.0."));
+        // 都要避开父网段的网关 .1 与宿主管理口 .254
+        for ip in [&a, &b] {
+            assert!(!ip.starts_with("10.77.0.1/"), "撞了父网关: {ip}");
+            assert!(!ip.starts_with("10.77.0.254/"), "撞了宿主管理口: {ip}");
+        }
+    }
+
+    /// 数据盘：存储不给就跟随 rootfs 的 storage；挂载点重复要在解析期就拒绝。
+    #[test]
+    fn host_disks_resolve_and_validate() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 2, template: t, storage: local-lvm }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      s1:
+        role: host
+        disks:
+          - { size: 4, mount: /data }
+          - { size: 8, mount: /var/lib/cache, storage: local }
+"#;
+        let zs = Spec::parse(y).unwrap().resolve("vmbr0").unwrap();
+        let s1 = zs[0].hosts.iter().find(|h| h.name == "s1").unwrap();
+        assert_eq!(s1.disks.len(), 2);
+        assert_eq!(s1.disks[0].size, 4);
+        assert_eq!(s1.disks[0].mount, "/data");
+        // 不写 storage：跟随主机 rootfs
+        assert_eq!(s1.disks[0].storage, "local-lvm");
+        assert_eq!(s1.disks[1].storage, "local");
+
+        let dup = y.replace("- { size: 8, mount: /var/lib/cache, storage: local }", "- { size: 8, mount: /data }");
+        let err = Spec::parse(&dup)
+            .unwrap()
+            .resolve("vmbr0")
+            .err()
+            .expect("重复挂载点必须报错")
+            .to_string();
+        assert!(err.contains("写了两次"), "{err}");
+
+        let bad = y.replace("mount: /data", "mount: data");
+        let err = Spec::parse(&bad)
+            .unwrap()
+            .resolve("vmbr0")
+            .err()
+            .expect("相对路径必须报错")
+            .to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+    }
 
     #[test]
     fn merge_three_layers() {

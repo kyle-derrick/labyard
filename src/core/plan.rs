@@ -113,6 +113,17 @@ pub enum StepKind {
         /// 哈希里，升级后所有容器步骤重跑一次，顺带把这类漂移修正掉。
         net_rev: u8,
     },
+    /// 数据盘（rootfs 之外的 mpX 挂载点）。
+    ///
+    /// 单独一步而不是塞进 Container：加盘不需要重建容器，而且盘的大小
+    /// 变化要能被哈希门控单独捕捉到（改大小就重跑这一步，不牵连建机）。
+    Disks {
+        zone: String,
+        host: String,
+        vmid: u32,
+        /// 按顺序落成 mp0、mp1……，内容是哈希的一部分
+        disks: Vec<crate::core::spec::ResolvedDisk>,
+    },
     Net {
         zone: String,
         host: String,
@@ -362,6 +373,24 @@ impl Plan {
                     deps,
                     kind,
                 });
+
+                // 数据盘：建完机再加，单独一步（见 StepKind::Disks 的注释）
+                if !h.disks.is_empty() {
+                    let dk = StepKind::Disks {
+                        zone: z.name.clone(),
+                        host: h.name.clone(),
+                        vmid,
+                        disks: h.disks.clone(),
+                    };
+                    steps.push(Step {
+                        key: format!("disk:{}:{}", z.name, h.name),
+                        phase: Phase::Container,
+                        zone: z.name.clone(),
+                        input_hash: hash_of(&dk),
+                        deps: vec![format!("ct:{}:{}", z.name, h.name)],
+                        kind: dk,
+                    });
+                }
             }
         }
 
@@ -787,6 +816,58 @@ zones:
         //  主机根本没有路由，apt 装包必然失败。）
         assert_eq!(get("server1"), (false, true), "nat 开的网络里主机要能出网");
         assert_eq!(get("client1"), (false, true), "nat 开的网络里主机要能出网");
+    }
+
+    #[test]
+    fn disks_step_exists_and_hash_tracks_size() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 2, template: t, storage: local-lvm }
+zones:
+  main:
+    uplink: wan
+    v4: 10.10.1.0/24
+    hosts:
+      gateway: { role: gateway }
+      s1:
+        role: host
+        disks:
+          - { size: 4, mount: /data }
+"#;
+        let p = build(y);
+        let st = p
+            .steps
+            .iter()
+            .find(|s| matches!(s.kind, StepKind::Disks { .. }))
+            .expect("配了 disks 就该有数据盘步骤");
+        assert_eq!(st.key, "disk:main:s1");
+        // 必须排在容器之后：盘挂在容器上，容器不存在时 pct set 会失败
+        assert_eq!(st.deps, vec!["ct:main:s1".to_string()]);
+        match &st.kind {
+            StepKind::Disks { disks, .. } => {
+                assert_eq!(disks.len(), 1);
+                assert_eq!(disks[0].size, 4);
+                assert_eq!(disks[0].storage, "local-lvm");
+            }
+            _ => unreachable!(),
+        }
+
+        // 改大小 → 哈希变（否则 apply 会认为"没变化"而跳过扩容）
+        let p2 = build(&y.replace("size: 4", "size: 8"));
+        let h2 = p2
+            .steps
+            .iter()
+            .find(|s| matches!(s.kind, StepKind::Disks { .. }))
+            .unwrap()
+            .input_hash
+            .clone();
+        assert_ne!(st.input_hash, h2, "改盘大小必须让步骤重跑");
+
+        // 没配 disks 的主机不该凭空多出这一步
+        let plain = build(Y);
+        assert!(!plain
+            .steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Disks { .. })));
     }
 
     #[test]

@@ -60,6 +60,8 @@ type HostM = {
   disk?: number;
   provisioner?: string;
   mirror?: string;
+  /** rootfs 之外的数据盘，按顺序落成 mp0、mp1…… */
+  disks?: { size: number; mount: string; storage?: string }[];
 };
 
 type MonitorM = {
@@ -146,6 +148,11 @@ export default function SpecVisual({
   const [err, setErr] = useState<string | null>(null);
   const [zoneOpen, setZoneOpen] = useState(false);
   const [hostFor, setHostFor] = useState<string | null>(null);
+  /** 数据盘编辑器：正在给哪台主机配盘 */
+  const [diskFor, setDiskFor] = useState<{ zn: string; host: string } | null>(null);
+  const [diskDraft, setDiskDraft] = useState<
+    { size: number; mount: string; storage?: string }[]
+  >([]);
   const [zoneForm] = Form.useForm();
   const [hostForm] = Form.useForm();
   /** 草稿恢复提示：上次没保存成功的编辑还留在 localStorage 里 */
@@ -790,6 +797,26 @@ export default function SpecVisual({
                   ),
                 },
                 {
+                  title: "数据盘",
+                  width: 78,
+                  render: (_, r) => (
+                    <Button
+                      size="small"
+                      type="link"
+                      style={{ padding: 0 }}
+                      onClick={() => {
+                        const cur = (model?.zones?.[zn]?.hosts?.[r.name]?.disks ?? []).map((d) => ({
+                          ...d,
+                        }));
+                        setDiskDraft(cur.length ? cur : [{ size: 10, mount: "/data" }]);
+                        setDiskFor({ zn, host: r.name });
+                      }}
+                    >
+                      {r.disks?.length ? `${r.disks.length} 块` : "添加"}
+                    </Button>
+                  ),
+                },
+                {
                   title: "",
                   width: 40,
                   render: (_, r) => (
@@ -845,6 +872,134 @@ export default function SpecVisual({
           ? ` · ${model!.mirrors!.length} 条镜像连线（在「拓扑」页增删）`
           : ""}
       </Text>
+
+      <Modal
+        open={!!diskFor}
+        title={diskFor ? `${diskFor.zn}:${diskFor.host} 的数据盘` : "数据盘"}
+        onCancel={() => setDiskFor(null)}
+        onOk={() => {
+          if (!diskFor) return;
+          // 空挂载点/0 容量在这里就拦住，别等 apply 才报
+          for (const d of diskDraft) {
+            if (!/^\/.+/.test(d.mount.trim())) {
+              message.error(`挂载点要写绝对路径（如 /data），当前是 \`${d.mount}\``);
+              return;
+            }
+            if (!d.size || d.size < 1) {
+              message.error(`${d.mount} 的大小必须 ≥ 1 GB`);
+              return;
+            }
+          }
+          patchHost(diskFor.zn, diskFor.host, {
+            disks: diskDraft.length
+              ? diskDraft.map((d) => ({
+                  size: d.size,
+                  mount: d.mount.trim(),
+                  ...(d.storage ? { storage: d.storage } : {}),
+                }))
+              : undefined,
+          });
+          setDiskFor(null);
+        }}
+        okText="保存到规格"
+        width={640}
+        destroyOnClose
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 10 }}
+          message="数据盘挂在 rootfs 之外，按顺序落成 mp0、mp1……"
+          description="只能加和扩容，不能在这里缩容或删除（缩盘等于删数据）。改完要 apply 才生效。"
+        />
+        <Table
+          size="small"
+          pagination={false}
+          rowKey={(_, i) => String(i)}
+          dataSource={diskDraft}
+          locale={{ emptyText: "还没有数据盘" }}
+          columns={[
+            {
+              title: "挂载点",
+              render: (_, r, i) => (
+                <Input
+                  size="small"
+                  className="mono"
+                  value={r.mount}
+                  onChange={(e) => {
+                    const n = [...diskDraft];
+                    n[i] = { ...n[i], mount: e.target.value };
+                    setDiskDraft(n);
+                  }}
+                />
+              ),
+            },
+            {
+              title: "容量 GB",
+              width: 110,
+              render: (_, r, i) => (
+                <InputNumber
+                  size="small"
+                  min={1}
+                  style={{ width: "100%" }}
+                  value={r.size}
+                  onChange={(v) => {
+                    const n = [...diskDraft];
+                    n[i] = { ...n[i], size: Number(v ?? 0) };
+                    setDiskDraft(n);
+                  }}
+                />
+              ),
+            },
+            {
+              title: "存储",
+              width: 170,
+              render: (_, r, i) => (
+                <Select
+                  size="small"
+                  allowClear
+                  style={{ width: "100%" }}
+                  placeholder="跟随 rootfs"
+                  value={r.storage}
+                  options={withFallback(
+                    diskStorageOptions,
+                    r.storage,
+                  )}
+                  onChange={(v) => {
+                    const n = [...diskDraft];
+                    n[i] = { ...n[i], storage: v || undefined };
+                    setDiskDraft(n);
+                  }}
+                />
+              ),
+            },
+            {
+              title: "",
+              width: 40,
+              render: (_, __, i) => (
+                <Button
+                  size="small"
+                  type="text"
+                  danger
+                  icon={<DeleteOutlined />}
+                  onClick={() => setDiskDraft(diskDraft.filter((_, k) => k !== i))}
+                />
+              ),
+            },
+          ]}
+        />
+        <Button
+          size="small"
+          type="dashed"
+          icon={<PlusOutlined />}
+          style={{ marginTop: 8, width: "100%" }}
+          onClick={() =>
+            setDiskDraft([...diskDraft, { size: 10, mount: `/data${diskDraft.length + 1}` }])
+          }
+        >
+          再加一块
+        </Button>
+      </Modal>
 
       <Modal
         open={zoneOpen}

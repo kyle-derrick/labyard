@@ -485,8 +485,28 @@ function GraphInner({
 
   // 高亮靠 **hover** 而不是点击：点击节点要开抽屉，两个事件会撞在一起。
   // 悬停监控机节点 = 它的所有镜像线高亮；悬停某条镜像线 = 只高亮那条。
+  //
+  // 退出用"延迟清除"：鼠标从节点滑到贴在它边缘的抓包口/连线上时，浏览器会
+  // 先发 mouseleave 再发 mouseenter，立刻置空就表现为"高亮闪一下就没"——
+  // 也就是"hover 时灵时不灵"。给 160ms 的容差，进入新目标时撤销。
   const [hoverNode, setHoverNode] = useState<string | null>(null);
   const [hoverEdge, setHoverEdge] = useState<string | null>(null);
+  const leaveTimer = useRef<number | null>(null);
+  const cancelLeave = () => {
+    if (leaveTimer.current !== null) {
+      window.clearTimeout(leaveTimer.current);
+      leaveTimer.current = null;
+    }
+  };
+  const scheduleLeave = () => {
+    cancelLeave();
+    leaveTimer.current = window.setTimeout(() => {
+      leaveTimer.current = null;
+      setHoverNode(null);
+      setHoverEdge(null);
+    }, 160);
+  };
+  useEffect(() => cancelLeave, []);
 
   const mirrorIds = useMemo(() => {
     const m = new Map<string, string[]>();
@@ -500,9 +520,19 @@ function GraphInner({
 
   const hotMirror = useMemo(() => {
     if (hoverEdge) return new Set([hoverEdge]);
-    if (hoverNode && mirrorIds.has(hoverNode)) return new Set(mirrorIds.get(hoverNode));
-    return new Set<string>();
-  }, [hoverEdge, hoverNode, mirrorIds]);
+    if (!hoverNode) return new Set<string>();
+    // 悬停监控机：点亮它吃进来的所有镜像线
+    const inbound = mirrorIds.get(hoverNode);
+    if (inbound) return new Set(inbound);
+    // 悬停普通主机：点亮它发出去的镜像线——"我到底被谁在抓"一眼可见
+    const out = new Set<string>();
+    edges.forEach((e, i) => {
+      if (e.kind === "mirror" && e.from === hoverNode) {
+        out.add(`${e.kind}:${e.from}->${e.to}:${i}`);
+      }
+    });
+    return out;
+  }, [hoverEdge, hoverNode, mirrorIds, edges]);
 
   const dimmed = useMemo(() => {
     if (!hoverNode || !mirrorIds.has(hoverNode) || hoverEdge) return new Set<string>();
@@ -608,10 +638,17 @@ function GraphInner({
         onNodeClick={(_, n) => pick(n.id)}
         onPaneClick={() => pick(undefined)}
         // hover 高亮：监控机节点与镜像线都接住鼠标
-        onNodeMouseEnter={(_, n) => setHoverNode(n.id)}
-        onNodeMouseLeave={() => setHoverNode(null)}
-        onEdgeMouseEnter={(_, e) => setHoverEdge(e.id)}
-        onEdgeMouseLeave={() => setHoverEdge(null)}
+        onNodeMouseEnter={(_, n) => {
+          cancelLeave();
+          setHoverNode(n.id);
+          setHoverEdge(null);
+        }}
+        onNodeMouseLeave={() => scheduleLeave()}
+        onEdgeMouseEnter={(_, e) => {
+          cancelLeave();
+          setHoverEdge(e.id);
+        }}
+        onEdgeMouseLeave={() => scheduleLeave()}
         onNodeContextMenu={(ev, n) => {
           ev.preventDefault();
           const orig = nodes.find((x) => x.id === n.id) ?? null;
@@ -632,7 +669,7 @@ function GraphInner({
             const d = n.data as Data;
             if (d?.kind === "network") return d.meta?.external ? "#a5b4fc" : "#ddd6fe";
             if (d?.role === "gateway") return "#bbf7d0";
-            if (d?.role === "monitor") return "#bfdbfe";
+            if (d?.role === "monitor") return "#a5f3fc";
             return "#e2e8f0";
           }}
           maskColor="rgba(245,246,248,0.72)"

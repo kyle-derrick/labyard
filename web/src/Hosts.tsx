@@ -62,7 +62,7 @@ const ROLE_LABEL: Record<string, string> = {
 
 const ROLE_COLOR: Record<string, string> = {
   gateway: "blue",
-  monitor: "orange",
+  monitor: "cyan",
   host: "green",
 };
 
