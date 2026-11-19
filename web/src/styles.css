@@ -28,8 +28,10 @@ body {
   color: #d6deeb;
   border-radius: 8px;
   padding: 12px 14px;
-  height: 100%;
-  min-height: 320px;
+  /* 定高滚动：日志再长也不把页面顶下去 */
+  height: auto;
+  min-height: 200px;
+  max-height: 480px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;

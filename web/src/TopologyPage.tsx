@@ -40,7 +40,7 @@ import {
   ThunderboltOutlined,
 } from "@ant-design/icons";
 import TopologyGraph, { ROLE_LABEL } from "./TopologyGraph";
-import { api, type GatewayStatus, type MirrorRow, type ReconcileInfo, type TopoEdge, type TopoNode } from "./api";
+import { api, vpnClientUrl, type GatewayStatus, type MirrorRow, type ReconcileInfo, type TopoEdge, type TopoNode } from "./api";
 
 const { Text } = Typography;
 
@@ -82,6 +82,23 @@ export default function TopologyPage() {
   const reconcile = mirrors.data?.reconcile;
 
   const hosts = useMemo(() => nodes.filter((n) => n.kind === "host"), [nodes]);
+  const monitors = useMemo(() => hosts.filter((n) => n.role === "monitor"), [hosts]);
+
+  /** 总账分组：监控机 → 被采集网络 → 逐口行。 */
+  const mirrorGroups = useMemo(() => {
+    const byMon = new Map<string, MirrorRow[]>();
+    for (const r of rows) {
+      (byMon.get(r.to) ?? byMon.set(r.to, []).get(r.to)!).push(r);
+    }
+  return [...byMon.entries()].map(([mon, rs]) => ({
+    mon,
+    rows: rs,
+    nets: [...new Set(rs.map((r) => r.from.split(":")[0]))].map((zone) => ({
+      zone,
+      rows: rs.filter((r) => r.from.startsWith(`${zone}:`)),
+    })),
+  }));
+  }, [rows]);
   const networks = useMemo(
     () => nodes.filter((n) => n.kind === "network" && !(n.meta as Record<string, unknown>).external),
     [nodes],
@@ -352,7 +369,13 @@ export default function TopologyPage() {
             edges={edges}
             selected={selected}
             onPick={(n) => setPicked(n)}
-            onSelect={setSelected}
+            onSelect={(ids) =>
+              // 内容没变就不更新：React Flow 在节点对象被整体替换后会重新
+              // 触发 onSelectionChange，这里再无条件 setState 就是死循环
+              setSelected((prev) =>
+                prev.length === ids.length && prev.every((v, i) => v === ids[i]) ? prev : ids,
+              )
+            }
             onContextMenu={(e, n) => setMenu({ x: e.clientX, y: e.clientY, node: n })}
           />
         )}
@@ -429,7 +452,9 @@ export default function TopologyPage() {
             gw={gw.data}
             loading={gw.isLoading}
             busy={busy}
+            monitors={monitors}
             mirrorRows={rows}
+            onAfterChange={afterChange}
             onRefreshMirrors={() => mirrors.refetch()}
             onEgress={toggleEgress}
             onAddPub={() => setPubOpen(true)}
@@ -522,10 +547,7 @@ export default function TopologyPage() {
                 networks={networks}
                 edges={edges}
                 mirrorRows={rows}
-                busy={busy}
                 onRefresh={() => mirrors.refetch()}
-                onChange={afterChange}
-                onError={(e) => message.error(e)}
               />
             )}
           </Space>
@@ -579,96 +601,93 @@ export default function TopologyPage() {
           </Tooltip>
         }
       >
-        <Table
-          size="small"
-          rowKey={(r) => `${r.spec}:${r.from}->${r.to}`}
-          dataSource={rows}
-          pagination={false}
-          loading={mirrors.isLoading}
-          locale={{
-            emptyText: (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有镜像连线" />
-            ),
-          }}
-          columns={[
-            {
-              title: "规格",
-              dataIndex: "spec",
-              width: 110,
-              render: (v: string) => <Tag className="mono">{v}</Tag>,
-            },
-            {
-              title: "源主机",
-              dataIndex: "from",
-              render: (v: string, r) => (
-                <code>
-                  {v}
-                  {r.source_iface ? ` · ${r.source_iface}` : ""}
-                </code>
-              ),
-            },
-            {
-              title: "监控机",
-              dataIndex: "to",
-              render: (v: string, r) => (
-                <code>
-                  {v}
-                  {r.target_iface ? ` · ${r.target_iface}` : ""}
-                </code>
-              ),
-            },
-            {
-              title: "抓包桥",
-              dataIndex: "capture_bridge",
-              width: 120,
-              render: (v: string | undefined) =>
-                v ? <span className="mono">{v}</span> : <span className="mono">{""}</span>,
-            },
-            {
-              title: "状态",
-              dataIndex: "active",
-              width: 86,
-              render: (v: string) => (
-                <Tooltip
-                  title={
-                    v === "active"
-                      ? "宿主上采集单元运行中"
-                      : v === "failed"
-                        ? "采集单元已安装但运行失败，巡检/重启后会自动重试"
-                        : v === "missing"
-                          ? "宿主上还没有这个实例（容器未建或等巡检补装）"
-                          : "单元已安装但未运行"
-                  }
-                >
-                  <Tag color={v === "active" ? "green" : v === "failed" ? "red" : "default"}>
-                    {v === "active"
-                      ? "采集中"
-                      : v === "failed"
-                        ? "失败"
-                        : v === "missing"
-                          ? "未安装"
-                          : "停止"}
-                  </Tag>
-                </Tooltip>
-              ),
-            },
-            {
-              title: "",
-              width: 50,
-              render: (_: unknown, r: MirrorRow) => (
-                <Popconfirm
-                  title="删除这条镜像？"
-                  description="规格里会一并删掉，监控机上的采集实例也会停。"
-                  okText="删除"
-                  okButtonProps={{ danger: true }}
-                  onConfirm={() => delMirror(r)}
-                >
-                  <Button size="small" danger type="text" icon={<DeleteOutlined />} />
-                </Popconfirm>
-              ),
-            },
-          ]}
-        />
+        {rows.length === 0 && !mirrors.isLoading ? (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有镜像连线" />
+        ) : (
+          mirrorGroups.map((g) => (
+            <div key={g.mon} style={{ marginBottom: g === mirrorGroups[mirrorGroups.length - 1] ? 0 : 16 }}>
+              {/* 一级：监控机 */}
+              <div className="mon-net-row" style={{ marginBottom: 6 }}>
+                <Space size={8}>
+                  <Tag color="blue">监控机 {g.mon}</Tag>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {g.rows.length} 条连线 · {g.nets.length} 个网络
+                  </Text>
+                </Space>
+              </div>
+              {/* 二级：被采集的网络 */}
+              {g.nets.map((net) => {
+                const netNode = nodes.find((n) => n.id === `net:${net.zone}`);
+                const nm = netNode?.meta as Record<string, unknown> | undefined;
+                return (
+                  <div key={net.zone} style={{ marginLeft: 12, marginBottom: 8 }}>
+                    <div style={{ marginBottom: 4 }}>
+                      <Text strong style={{ fontSize: 12 }}>
+                        {netNode?.label ?? `${net.zone} 内网`}
+                      </Text>
+                      <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
+                        {" "}
+                        {String(nm?.cidr ?? "")}
+                      </Text>
+                      <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
+                        {" "}
+                        · 抓包桥 {net.rows[0]?.capture_bridge ?? "—"}
+                      </Text>
+                    </div>
+                    {net.rows.map((r) => {
+                      const host = r.from.replace(/^host:[^:]+:/, "");
+                      const v = r.active;
+                      return (
+                        <div key={`${r.from}->${r.to}`} className="mon-net-row" style={{ padding: "2px 0" }}>
+                          <Space size={8}>
+                            <span className="mono" style={{ fontSize: 12 }}>
+                              {host} · {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
+                            </span>
+                            <Tag className="mono" style={{ fontSize: 10, lineHeight: "16px", padding: "0 6px" }}>
+                              {r.spec}
+                            </Tag>
+                          </Space>
+                          <Space size={8}>
+                            <Tooltip
+                              title={
+                                v === "active"
+                                  ? "宿主上采集单元运行中"
+                                  : v === "failed"
+                                    ? "采集单元已安装但运行失败，巡检/重启后会自动重试"
+                                    : v === "missing"
+                                      ? "宿主上还没有这个实例（容器未建或等巡检补装）"
+                                      : "单元已安装但未运行"
+                              }
+                            >
+                              <Tag color={v === "active" ? "green" : v === "failed" ? "red" : "default"}>
+                                {v === "active"
+                                  ? "采集中"
+                                  : v === "failed"
+                                    ? "失败"
+                                    : v === "missing"
+                                      ? "未安装"
+                                      : "停止"}
+                              </Tag>
+                            </Tooltip>
+                            <Popconfirm
+                              title="删除这条镜像？"
+                              description="规格里会一并删掉，监控机上的采集实例也会停。"
+                              okText="删除"
+                              okButtonProps={{ danger: true }}
+                              onConfirm={() => delMirror(r)}
+                            >
+                              <Button size="small" danger type="text" icon={<DeleteOutlined />} />
+                            </Popconfirm>
+                          </Space>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          ))
+        )}
       </Card>
     </Space>
   );
@@ -706,11 +725,10 @@ function ReconcileBadge({ info }: { info: ReconcileInfo }) {
   );
 }
 
-/** 监控机的采集管理：列出所有网络，逐个开关"这个网络的流量交给这台监控机"。
+/** 监控机的采集清单（**只读**）：列出它正在采集哪些网络、每个网络的逐口现状。
  *
- * 管理的粒度只有**网络**：打开一个网络的开关，系统自动把该网络下所有主机
- * 的接口接到对应抓包口（规格里的 monitor: {use: ...}），不需要逐台挑。
- * 哪台机、几块抓包口由系统推导，图和后台巡检负责保持一致。
+ * 开关/编辑不在这里做——那是"网络"的事，在网络节点的抽屉里操作（开/关/
+ * 换绑监控机）。这里只回答"这台监控机眼下在看什么、看得见吗"。
  */
 function MonitorNetworks({
   monitor,
@@ -718,9 +736,6 @@ function MonitorNetworks({
   edges,
   mirrorRows,
   onRefresh,
-  busy,
-  onChange,
-  onError,
 }: {
   monitor: TopoNode;
   networks: TopoNode[];
@@ -729,30 +744,7 @@ function MonitorNetworks({
   mirrorRows: MirrorRow[];
   /** 重新拉取镜像现状（宿主侧 systemctl 状态） */
   onRefresh: () => void;
-  busy: boolean;
-  onChange: (msg: string) => void;
-  onError: (msg: string) => void;
 }) {
-  const [pending, setPending] = useState<string | null>(null);
-
-  const toggle = async (net: TopoNode, on: boolean) => {
-    if (!net.zone) return;
-    setPending(net.id);
-    try {
-      if (on) {
-        await api.setMonitor(net.zone, true, { use: `${monitor.zone}:${monitor.label}` });
-        onChange(`已把 ${net.label} 的流量交给 ${monitor.label}`);
-      } else {
-        await api.setMonitor(net.zone, false);
-        onChange(`已停止采集 ${net.label}`);
-      }
-    } catch (e) {
-      onError((e as Error).message);
-    } finally {
-      setPending(null);
-    }
-  };
-
   /** 这个网络上现在有几台被抓 + 落在哪块抓包口 */
   const captureInfo = (net: TopoNode) => {
     const lines = edges.filter(
@@ -769,19 +761,14 @@ function MonitorNetworks({
       size="small"
       title="采集的网络"
       extra={
-        <Space size={6}>
-          <Button
-            size="small"
-            icon={<ReloadOutlined />}
-            onClick={onRefresh}
-            title="重新对账宿主上各采集实例的运行状态"
-          >
-            刷新
-          </Button>
-          <Text type="secondary" style={{ fontSize: 11 }}>
-            开关即自动接线
-          </Text>
-        </Space>
+        <Button
+          size="small"
+          icon={<ReloadOutlined />}
+          onClick={onRefresh}
+          title="重新对账宿主上各采集实例的运行状态"
+        >
+          刷新
+        </Button>
       }
     >
       {networks.length === 0 ? (
@@ -796,10 +783,10 @@ function MonitorNetworks({
             const mine = m.monitor === monitor.label;
             const info = captureInfo(net);
             // 这台监控机在这个网络里逐主机的采集现状（来自 /api/mirrors 的
-            // 宿主侧状态，不是图上的意图）
+            // 宿主侧状态，不是图上的意图；行 from 是 `zone:host` 格式）
             const hostRows = mine
               ? mirrorRows.filter(
-                  (r) => r.to === `${monitor.zone}:${monitor.label}` && r.from.startsWith(`host:${net.zone}:`),
+                  (r) => r.to === `${monitor.zone}:${monitor.label}` && r.from.startsWith(`${net.zone}:`),
                 )
               : [];
             return (
@@ -820,6 +807,12 @@ function MonitorNetworks({
                     <Text type="secondary" style={{ fontSize: 11 }}>
                       {" "}
                       · 归 {String(m.monitor)}
+                    </Text>
+                  )}
+                  {!monitored && (
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      {" "}
+                      · 未采集
                     </Text>
                   )}
                   {mine && hostRows.length > 0 && (
@@ -850,19 +843,18 @@ function MonitorNetworks({
                     </div>
                   )}
                 </div>
-                <Switch
-                  size="small"
-                  checked={monitored}
-                  disabled={busy || (monitored && !mine) || pending === net.id}
-                  loading={pending === net.id}
-                  onChange={(on) => toggle(net, on)}
-                />
+                {monitored &&
+                  (mine ? (
+                    <Tag color="blue">本机采集</Tag>
+                  ) : (
+                    <Tag>归 {String(m.monitor)}</Tag>
+                  ))}
               </div>
             );
           })}
           <Text type="secondary" style={{ fontSize: 11 }}>
-            开启 = 该网络全部主机的接口镜像到这台监控机（每网络一块抓包口）；
-            新加入网络的主机由后台巡检自动接线。
+            这份清单是只读的。要开/关某个网络的采集、换绑监控机，去点对应的
+            网络节点，在它的抽屉里操作；新加入网络的主机由后台巡检自动接线。
           </Text>
         </Space>
       )}
@@ -870,13 +862,15 @@ function MonitorNetworks({
   );
 }
 
-/** 网络节点的抽屉：这个网段怎么配的、网关开着什么、VPN 与流量监控的现状。 */
+/** 网络节点的抽屉：网段配置、网关出网/映射/VPN、流量监控的开关与现状。 */
 function NetworkDetail({
   node,
   gw,
   loading,
   busy,
+  monitors,
   mirrorRows,
+  onAfterChange,
   onRefreshMirrors,
   onEgress,
   onAddPub,
@@ -886,22 +880,64 @@ function NetworkDetail({
   gw?: GatewayStatus;
   loading: boolean;
   busy: boolean;
+  /** 图上的全部监控机：开启/换绑用 */
+  monitors: TopoNode[];
   /** 全部镜像连线（带宿主上的运行状态），用于本网络的逐口对账 */
   mirrorRows: MirrorRow[];
+  /** 改了规格类配置（监控/VPN）后刷新图与总账 */
+  onAfterChange: (msg: string) => void;
   onRefreshMirrors: () => void;
   onEgress: (on: boolean) => void;
   onAddPub: () => void;
   onDelPub: (idx: number) => void;
 }) {
+  const [monPending, setMonPending] = useState(false);
+  const [vpnPending, setVpnPending] = useState<string | null>(null);
+  const { message } = AntApp.useApp();
   const m = node.meta as Record<string, unknown>;
   const external = m.external === true;
   const pubs = gw?.pubs ?? [];
   const zone = node.zone ?? "";
 
   /** 本网络各主机的镜像现状：源主机 → 实例状态。规格说该抓（有边）但
-   * 宿主上单元不在/挂了，就标红——"哪些口镜像了哪些没有"一眼可见。 */
-  const zoneMirrors = mirrorRows.filter((r) => r.from.startsWith(`host:${zone}:`));
+   * 宿主上单元不在/挂了，就标红——"哪些口镜像了哪些没有"一眼可见。
+   * 注意 /api/mirrors 行的 from 是 `zone:host`（拓扑边才是 host:zone:host）。 */
+  const zoneMirrors = mirrorRows.filter((r) => r.from.startsWith(`${zone}:`));
   const monitorName = typeof m.monitor === "string" ? m.monitor : "";
+
+  /** 开/关/换绑整网监控。开启默认选第一台监控机，也可以从下拉里换。 */
+  const switchMonitor = async (on: boolean, use?: string) => {
+    setMonPending(true);
+    try {
+      await api.setMonitor(zone, on, use ? { use } : undefined);
+      onAfterChange(
+        on
+          ? `已开启 ${node.label} 的整网流量监控${use ? `（→ ${use}）` : ""}，抓包口安装中`
+          : `已关闭 ${node.label} 的流量监控`,
+      );
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setMonPending(false);
+    }
+  };
+
+  /** VPN 开关。写规格 + 走 gateway 变更流程，和编排页是同一条路。 */
+  const toggleVpn = async (proto: "wireguard" | "openvpn", on: boolean) => {
+    setVpnPending(proto);
+    try {
+      await api.setVpn(zone, proto, on ? "on" : "off");
+      onAfterChange(`${proto === "wireguard" ? "WireGuard" : "OpenVPN"} 已${on ? "开启" : "关闭"}`);
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setVpnPending(null);
+    }
+  };
+
+  const monitorOptions = monitors
+    .filter((x) => !(x.zone === node.zone && x.label === monitorName))
+    .map((x) => ({ value: `${x.zone}:${x.label}`, label: `${x.zone} / ${x.label}` }));
 
   return (
     <Space direction="vertical" size={14} style={{ width: "100%" }}>
@@ -940,40 +976,60 @@ function NetworkDetail({
         </Text>
       ) : (
         <>
-          {gw?.vpn && (gw.vpn.wireguard || gw.vpn.openvpn) && (
-            <Card size="small" title="VPN">
-              <Space direction="vertical" size={6} style={{ width: "100%" }}>
-                {gw.vpn.wireguard && (
-                  <div>
-                    <Tag color={gw.vpn.wireguard_active ? "green" : "red"}>
-                      WireGuard {gw.vpn.wireguard_active ? "运行中" : "已停止"}
-                    </Tag>
-                    {gw.vpn.clients.length > 0 && (
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        客户端 {gw.vpn.clients.length} 个
-                      </Text>
-                    )}
+          <Card size="small" title="VPN">
+            <Space direction="vertical" size={8} style={{ width: "100%" }}>
+              {(["wireguard", "openvpn"] as const).map((proto) => {
+                const v = gw?.vpn;
+                const enabled = proto === "wireguard" ? !!v?.wireguard : !!v?.openvpn;
+                const active = proto === "wireguard" ? !!v?.wireguard_active : !!v?.openvpn_active;
+                const label = proto === "wireguard" ? "WireGuard" : "OpenVPN";
+                return (
+                  <div key={proto} className="mon-net-row">
+                    <Space size={6}>
+                      <span style={{ fontSize: 13 }}>{label}</span>
+                      {enabled ? (
+                        <Tag color={active ? "green" : "red"}>
+                          {active ? "运行中" : "已启用 · 未运行"}
+                        </Tag>
+                      ) : (
+                        <Tag>未开启</Tag>
+                      )}
+                    </Space>
+                    <Space size={6}>
+                      {enabled && (
+                        <a href={vpnClientUrl(zone, proto)} target="_blank" rel="noreferrer">
+                          <Button size="small">下载配置</Button>
+                        </a>
+                      )}
+                      <Button
+                        size="small"
+                        danger={enabled}
+                        loading={vpnPending === proto}
+                        disabled={busy}
+                        onClick={() => toggleVpn(proto, !enabled)}
+                      >
+                        {enabled ? "关闭" : "开启"}
+                      </Button>
+                    </Space>
                   </div>
-                )}
-                {gw.vpn.openvpn && (
-                  <div>
-                    <Tag color={gw.vpn.openvpn_active ? "green" : "red"}>
-                      OpenVPN {gw.vpn.openvpn_active ? "运行中" : "已停止"}
-                    </Tag>
-                  </div>
-                )}
+                );
+              })}
+              {!!gw?.vpn?.clients?.length && (
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  隧道配置在网关的抽屉里下载；VPN 开关在编排页。
+                  WireGuard 客户端 {gw.vpn.clients.length} 个，配置在网关的抽屉里也可逐个下载。
                 </Text>
-              </Space>
-            </Card>
-          )}
+              )}
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                开关写回规格并立即下发；隧道密钥都存这台网关自己的容器里。
+              </Text>
+            </Space>
+          </Card>
 
-          {monitorName && zoneMirrors.length > 0 && (
-            <Card
-              size="small"
-              title="流量监控"
-              extra={
+          <Card
+            size="small"
+            title="流量监控"
+            extra={
+              monitorName ? (
                 <Button
                   size="small"
                   icon={<ReloadOutlined />}
@@ -983,35 +1039,74 @@ function NetworkDetail({
                 >
                   刷新
                 </Button>
-              }
-            >
-              <Space direction="vertical" size={6} style={{ width: "100%" }}>
-                <div>
-                  <Tag color="blue">监控机 {monitorName}</Tag>
+              ) : undefined
+            }
+          >
+            <Space direction="vertical" size={6} style={{ width: "100%" }}>
+              <div className="mon-net-row">
+                <Space size={8}>
+                  <Switch
+                    size="small"
+                    checked={!!monitorName}
+                    loading={monPending}
+                    disabled={busy}
+                    onChange={(on) => switchMonitor(on)}
+                  />
+                  {monitorName ? (
+                    <Tag color="blue">监控机 {monitorName}</Tag>
+                  ) : (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      未开启——开启后本网段全部主机的接口都镜像给监控机
+                    </Text>
+                  )}
+                </Space>
+              </div>
+
+              {monitorName && monitorOptions.length > 0 && (
+                <div className="mon-net-row">
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    每台主机的内网口双向复制到它的抓包口
+                    换一台监控机
                   </Text>
+                  <Select
+                    size="small"
+                    style={{ width: 200 }}
+                    placeholder="选择其他监控机"
+                    options={monitorOptions}
+                    onChange={(v) => switchMonitor(true, v)}
+                  />
                 </div>
-                {zoneMirrors.map((r) => {
-                  const host = r.from.replace(/^host:[^:]+:/, "");
-                  const ok = r.active === "active";
-                  return (
-                    <div key={`${r.from}->${r.to}`} className="mon-net-row">
-                      <span className="mono" style={{ fontSize: 12 }}>
-                        {host} · {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
-                      </span>
-                      <Tag color={ok ? "green" : r.active === "failed" ? "red" : "default"}>
-                        {ok ? "采集中" : r.active === "failed" ? "失败" : "未安装"}
-                      </Tag>
-                    </div>
-                  );
-                })}
-                <Text type="secondary" style={{ fontSize: 11 }}>
-                  后台巡检每 5 分钟自动对账：缺的补装、挂的拉起、孤儿清理。
+              )}
+
+              {monitorName && zoneMirrors.length > 0 && (
+                <>
+                  {zoneMirrors.map((r) => {
+                    const host = r.from.replace(/^host:[^:]+:/, "");
+                    const ok = r.active === "active";
+                    return (
+                      <div key={`${r.from}->${r.to}`} className="mon-net-row">
+                        <span className="mono" style={{ fontSize: 12 }}>
+                          {host} · {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
+                        </span>
+                        <Tag color={ok ? "green" : r.active === "failed" ? "red" : "default"}>
+                          {ok ? "采集中" : r.active === "failed" ? "失败" : "未安装"}
+                        </Tag>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+
+              {!monitorName && monitors.length === 0 && (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  环境里还没有监控机：去「编排」页给任意网络打开"流量监控-新建"创建一台，
+                  然后回到这里开启。
                 </Text>
-              </Space>
-            </Card>
-          )}
+              )}
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                后台巡检每 5 分钟自动对账：缺的补装、挂的拉起、孤儿清理。逐台挑主机抓取在「编排」页配置。
+              </Text>
+            </Space>
+          </Card>
 
           <Card
             size="small"

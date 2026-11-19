@@ -355,7 +355,12 @@ function GraphInner({
   onSelect?: (ids: string[]) => void;
   onContextMenu?: (e: React.MouseEvent, n: TopoNode | null) => void;
 }) {
-  const sel = useMemo(() => new Set(selected), [selected]);
+  // sel 只按"选中了哪些 id"失效，不按数组身份：父组件每次渲染给一个新的
+  // 数组（哪怕内容相同），如果按身份比较，built 会跟着变 → setRfNodes 整体
+  // 换掉节点对象 → React Flow 重新触发 onSelectionChange → 死循环，节点
+  // 永不稳定，边永远量不出 handle 位置（表现为"连线全没了"）。
+  const selKey = selected.join("\n");
+  const sel = useMemo(() => new Set(selected), [selKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const rf = useReactFlow();
 
   // 高亮靠 **hover** 而不是点击：点击节点要开抽屉，两个事件会撞在一起。
@@ -417,11 +422,6 @@ function GraphInner({
         const p = await layoutPositions(nodes, edges);
         if (!alive) return;
         setPos(p);
-        if (!fitted.current) {
-          fitted.current = true;
-          // 等一帧让节点真正落位，再取景
-          requestAnimationFrame(() => rf.fitView({ padding: 0.16, duration: 200 }));
-        }
       } catch {
         // 布局失败就保持旧位置：图乱一点总比消失好
       }
@@ -448,7 +448,13 @@ function GraphInner({
   useEffect(() => {
     setRfNodes(built.nodes);
     setRfEdges(built.edges);
-  }, [built, setRfNodes, setRfEdges]);
+    // 首次拿到布局后取景：此时 setState 已在本轮 flush，rAF 回调能看到
+    // 带坐标的节点。放在布局 effect 里会赶在节点落位前跑，fitView 变空操作。
+    if (!fitted.current && built.nodes.length > 0 && pos.size > 0) {
+      fitted.current = true;
+      requestAnimationFrame(() => rf.fitView({ padding: 0.16, duration: 200 }));
+    }
+  }, [built, setRfNodes, setRfEdges, pos, rf]);
 
   // 拖动结束的位置落一笔，重算 data 时沿用
   const handleNodesChange = (changes: Parameters<typeof onNodesChange>[0]) => {
