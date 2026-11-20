@@ -19,6 +19,23 @@ pub fn gateway_addressing(
     uplink_gw: Option<&str>,
     dns: &[String],
 ) -> String {
+    gateway_addressing_routed(gw_v4, v6_prefix, uplink, uplink_ip, uplink_gw, &[], dns)
+}
+
+/// 带下游路由的版本。
+///
+/// `routes` 是 `(目标网段, 下一跳)`，出口固定 `eth0`：下游 zone 是挂在**本
+/// zone 网段**上的，不是挂在上联口。没有这些路由，父 zone 与兄弟 zone 都
+/// 到不了子网段——默认路由只朝上，树只能单向走。
+pub fn gateway_addressing_routed(
+    gw_v4: &str,
+    v6_prefix: Option<&str>,
+    uplink: &str,
+    uplink_ip: Option<&str>,
+    uplink_gw: Option<&str>,
+    routes: &[(String, String)],
+    dns: &[String],
+) -> String {
     let mut s = String::new();
     s.push_str("set -eu\n");
     s.push_str("# 网关：内网口 = eth0，上联口 = eth1\n");
@@ -50,7 +67,22 @@ pub fn gateway_addressing(
             ));
         }
     }
+    // 下游 zone 的静态路由。出口是 eth0（本 zone 网段），不是上联口：
+    // 子网关的上联地址就长在这座桥上。
+    for (cidr, via) in routes {
+        s.push_str(&format!("ip route replace {cidr} via {via} dev eth0\n"));
+    }
     s.push_str("sysctl -qw net.ipv4.ip_forward=1\n");
+    // 网关**不许发 ICMP redirect**。
+    //
+    // 下游路由的下一跳和入接口在同一条桥上（父 zone 网段），内核默认会给
+    // 源主机回一个 redirect："下次直接发给它"。主机照办之后包就绕过了本网关：
+    // 本 zone 的转发策略、出网开关、镜像规则全部落空，而且子网关会把这种
+    // "从 uplink 直接进来的包"当入向丢弃（`iif eth1 oif eth0 drop`），
+    // 现象是"父 zone 到子网段 100% 丢包，子网段却能出来"。
+    s.push_str("sysctl -qw net.ipv4.conf.all.send_redirects=0\n");
+    s.push_str("sysctl -qw net.ipv4.conf.eth0.send_redirects=0\n");
+
     s.push_str("sysctl -qw net.ipv6.conf.all.forwarding=1\n");
     // 网关自己也要能解析（apt 装包、provisioner 用）
     s.push_str(&resolv_conf(dns));
@@ -178,5 +210,46 @@ mod tests {
         assert!(s.contains("net.ipv4.ip_forward=1"));
         assert!(s.contains("net.ipv6.conf.all.forwarding=1"));
         assert!(s.contains("ip -6 addr replace fd00:1::1/64 dev eth0"));
+        // ICMP redirect 会让主机绕开网关直连下一跳，转发策略与镜像一并失效
+        assert!(
+            s.contains("net.ipv4.conf.all.send_redirects=0"),
+            "网关不能发 redirect:\n{s}"
+        );
+    }
+
+    #[test]
+    fn downstream_routes_go_out_the_lan_iface() {
+        // 子网挂在**本 zone 网段**上，下一跳就是子网关的上联地址，
+        // 出口是 eth0 而不是 uplink——写成 eth1 的话路由黑洞，
+        // 表现是"父 zone 进不去子网，子网却能一路出来"。
+        let routes = vec![
+            ("10.30.1.0/24".to_string(), "10.77.0.253".to_string()),
+            ("10.30.2.0/24".to_string(), "10.77.0.253".to_string()),
+        ];
+        let s = gateway_addressing_routed(
+            "10.77.0.1/24",
+            None,
+            "eth1",
+            Some("192.168.33.201/24"),
+            Some("192.168.33.1"),
+            &routes,
+            &[],
+        );
+        assert!(
+            s.contains("ip route replace 10.30.1.0/24 via 10.77.0.253 dev eth0"),
+            "缺下游路由:\n{s}"
+        );
+        assert!(
+            s.contains("ip route replace 10.30.2.0/24 via 10.77.0.253 dev eth0"),
+            "孙网段也要指向直接子网关:\n{s}"
+        );
+        // 默认路由不受影响
+        assert!(s.contains("ip route replace default via 192.168.33.1 dev eth1"));
+    }
+
+    #[test]
+    fn no_downstream_routes_means_no_extra_lines() {
+        let s = gateway_addressing("10.10.1.1/24", None, "eth1", None, None, &[]);
+        assert!(!s.contains("ip route replace 10."), "没有下游就不该写路由:\n{s}");
     }
 }

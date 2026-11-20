@@ -57,7 +57,9 @@ impl Phase {
 ///   1 → 初版（逐条 `nft add rule`）
 ///   2 → 原子批次 + `dnat ip to` + 映射回程 SNAT + VPN 关闭落地
 ///   3 → 地址与 nft 规则落成容器内开机单元（容器重启后自愈）
-pub const RULESET_VERSION: u32 = 3;
+///   4 → 下游 zone 静态路由 + 禁发 ICMP redirect + NAT/出网区分内网网段
+///   5 → 入向放行"源地址属于内网网段"的跨 zone 转发
+pub const RULESET_VERSION: u32 = 5;
 
 /// 一个步骤的完整描述。`kind` 里带全部参数，执行器不需要再去查 spec。
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +138,9 @@ pub enum StepKind {
         /// 上联口静态地址与默认路由（嵌套 zone 用；外网桥留 None 走 DHCP）
         uplink_ip: Option<String>,
         uplink_gw: Option<String>,
+        /// 下游网段静态路由：`(目标 CIDR, 下一跳)`，出口恒为内网口 eth0。
+        /// 只对网关有意义（非网关恒空）。
+        routes: Vec<(String, String)>,
         /// 是否需要默认路由。网关与监控机需要（要出网装包），普通主机不要
         default_route: bool,
         /// 解析器列表（来自 spec，逐级继承）。空 = 用内置公共 DNS。
@@ -171,6 +176,10 @@ pub enum StepKind {
         vpn: ResolvedVpn,
         /// 上联网卡名（容器内固定 eth1）
         uplink: String,
+        /// 规格里所有内网网段（含自己）。用来把"内网互访"从"出网"里摘出来：
+        /// 关掉 egress 只该封公网，访问父/兄弟网段仍要通；NAT 也不该把这些
+        /// 目标一起转换掉（那会让对端只看见网关地址）。
+        lan_cidrs: Vec<String>,
         /// 生成器版本，见 RULESET_VERSION
         ruleset: u32,
     },
@@ -426,6 +435,7 @@ impl Plan {
                     is_gateway: is_gw,
                     uplink_ip: if is_gw { z.uplink_ip.clone() } else { None },
                     uplink_gw: if is_gw { z.uplink_gw.clone() } else { None },
+                    routes: if is_gw { z.downstream.clone() } else { Vec::new() },
                     default_route: wants_route,
                     nat: is_gw && z.nat,
                     dns: h.dns.clone(),
@@ -529,6 +539,17 @@ impl Plan {
         // ── 6. 网关策略：每个有网关的 zone 一步 ──
         // 这一步是**全量重建** nft 规则表 + 落地 VPN，输入哈希覆盖整份策略：
         // 改一条端口映射 → 重跑；出网开关翻转 → 重跑。
+        //
+        // 所有内网网段先汇总一份：egress 关闭与 NAT 都要靠它区分
+        // "内网互访" 与 "出公网"。加/删一个 zone 会改变这张表，从而让相关
+        // 网关的哈希变化、规则随之重建——这是对的，路由表本来就该跟着拓扑走。
+        let mut lan_cidrs: Vec<String> = zones
+            .iter()
+            .filter(|z| !z.external)
+            .map(|z| z.v4_cidr.clone())
+            .collect();
+        lan_cidrs.sort();
+        lan_cidrs.dedup();
         for z in zones {
             let Some(gw) = &z.gateway else { continue };
             let Some(h) = z.hosts.iter().find(|h| h.role == Role::Gateway) else {
@@ -546,6 +567,7 @@ impl Plan {
                 pubs: gw.pubs.clone(),
                 vpn: gw.vpn.clone(),
                 uplink: "eth1".into(),
+                lan_cidrs: lan_cidrs.clone(),
                 ruleset: RULESET_VERSION,
             };
             steps.push(Step {

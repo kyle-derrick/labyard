@@ -2,12 +2,12 @@
  *
  * 后端给的是两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
  * 方向都是数据流方向。这里做四件事：
- *   1. 用 **elkjs**（Eclipse Layout Kernel）算层级与位置，只吃 attach 边——
- *      镜像线参与布局会把监控机推到所有主机后面一档。
- *      方向 LR：外网 → 网关 → 内网 → 主机。
+ *   1. **一列一个 zone** 的手工分层布局（见 `layoutPositions`）：左列上游、
+ *      右列下游，列内从上到下是"网段 → 网关 → 监控机 → 主机"。
+ *      不靠自动布局：层级算法把网段节点当普通节点排，一条链路能撑开三四列。
  *   2. **网口分侧**：外网口贴左缘、内网口贴右缘、抓包口贴下缘，均略突出
- *      节点框——线从哪个口进出一眼可见。attach 边交给 ELK 的正交路由
- *      （`elk.edgeRouting: ORTHOGONAL`）输出折线，绕开节点，不穿模。
+ *      节点框——线从哪个口进出一眼可见。路径交给 React Flow 按 handle 现算
+ *      （smoothstep），拖节点时线跟着走。
  *   3. 拖动不闪：数据轮询重建节点时**保留 RF 内部当前位置**，只换数据；
  *      拖动位置由 React Flow 自己管理，不经过重建路径。
  *   4. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单。
@@ -31,7 +31,6 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import ELK from "elkjs/lib/elk.bundled.js";
 import type { TopoEdge, TopoIface, TopoNode } from "./api";
 
 /** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。
@@ -304,42 +303,93 @@ type Layout = {
   pos: Map<string, { x: number; y: number }>;
 };
 
-/** ELK 分层布局（只决定节点位置，路径交给 React Flow 按 handle 算）。 */
-async function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Promise<Layout> {
+/** 手工分层布局：**一列一个 zone**，列内从上到下是"网段 → 网关 → 监控机 → 主机"。
+ *
+ * 为什么不用 ELK：层级布局把网段节点当成普通节点参与排序，结果 gw 在网段
+ * 左边、主机在右边，一条链路被拉成三四列，5 个 zone 就撑到近 2000px 宽——
+ * fitView 只能缩到 0.4，"看清楚整张图"和"看清一台机器"两头都做不到。
+ * 可读性靠**列语义**而不是自动优化：左列是上游，右列是下游，同列同网段。
+ *
+ * 深度从 attach 边的 `port: uplink` 推：`net:<父> → host:<子>:gateway`。
+ */
+function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
   const uniq = uniqNodes(nodes);
-  const elk = new ELK();
-  const children = [...uniq.values()].map((n) => {
-    const d = DIM[n.kind] ?? DIM.host;
-    return { id: n.id, width: d.w, height: d.h };
-  });
-  const elEdges = edges
-    .filter((e) => e.kind === "attach" && e.from !== e.to && uniq.has(e.from) && uniq.has(e.to))
-    .map((e) => ({ id: `${e.from}->${e.to}`, sources: [e.from], targets: [e.to] }));
+  const zoneOf = (n: TopoNode) => (n.kind === "network" ? n.id.slice(4) : (n.zone ?? ""));
 
-  const res = await elk.layout({
-    id: "root",
-    layoutOptions: {
-      "elk.algorithm": "layered",
-      "elk.direction": "RIGHT",
-      "elk.edgeRouting": "ORTHOGONAL",
-      "elk.spacing.nodeNode": "46",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "140",
-      "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
-      "elk.layered.mergeEdges": "true",
-      "elk.padding": "[top=40,left=60,bottom=40,right=60]",
-    },
-    children,
-    edges: elEdges,
-  });
+  const parent = new Map<string, string>();
+  for (const e of edges) {
+    if (e.kind !== "attach" || e.port !== "uplink") continue;
+    if (!e.from.startsWith("net:") || !e.to.startsWith("host:")) continue;
+    const child = e.to.split(":")[1];
+    parent.set(child, e.from.slice(4));
+  }
+  const depthOf = (zone: string) => {
+    let d = 0;
+    let cur = zone;
+    for (let guard = 0; guard < 16 && parent.has(cur); guard++) {
+      cur = parent.get(cur)!;
+      d++;
+    }
+    return d;
+  };
+
+  // zone → 该 zone 的节点（网段节点 + 主机）
+  const zones = new Map<string, TopoNode[]>();
+  for (const n of uniq.values()) {
+    const z = zoneOf(n);
+    const arr = zones.get(z) ?? [];
+    arr.push(n);
+    zones.set(z, arr);
+  }
+
+  const rank = (n: TopoNode) => {
+    if (n.kind === "network") return 0;
+    if (n.role === "gateway") return 1;
+    if (n.role === "monitor") return 2;
+    return 3;
+  };
+
+  // 列 → 该列的 zone 组。同列多个 zone（兄弟）按名字排，顺序稳定。
+  const cols = new Map<number, string[]>();
+  for (const z of zones.keys()) {
+    const d = depthOf(z);
+    const arr = cols.get(d) ?? [];
+    arr.push(z);
+    cols.set(d, arr);
+  }
+  for (const arr of cols.values()) arr.sort();
+
+  const COL_W = DIM.host.w + 96;
+  const GAP = 16;
+  const GROUP_GAP = 34;
+
+  // 先算每列高度，再整体垂直居中——否则矮列全挤在顶上，图看着"歪"
+  const colHeights = new Map<number, number>();
+  for (const [d, zs] of cols) {
+    let h = 0;
+    for (const z of zs) {
+      const list = (zones.get(z) ?? []).slice().sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
+      if (list.length === 0) continue;
+      for (const n of list) h += DIM[n.kind].h + GAP;
+      h += GROUP_GAP;
+    }
+    colHeights.set(d, h);
+  }
+  const maxH = Math.max(0, ...colHeights.values());
 
   const pos = new Map<string, { x: number; y: number }>();
-  for (const c of res.children ?? []) {
-    if (typeof c.x === "number" && typeof c.y === "number") {
-      pos.set(c.id, { x: c.x, y: c.y });
+  for (const [d, zs] of cols) {
+    const x = 40 + d * COL_W;
+    let y = 40 + Math.max(0, (maxH - (colHeights.get(d) ?? 0)) / 2);
+    for (const z of zs) {
+      const list = (zones.get(z) ?? []).slice().sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
+      for (const n of list) {
+        pos.set(n.id, { x, y });
+        y += DIM[n.kind].h + GAP;
+      }
+      y += GROUP_GAP;
     }
   }
-  // 折点不再需要：端点由 React Flow 按 handle 实时计算，
-  // 拖节点时线才会跟着走（ELK 的绝对坐标做不到这一点）。
   return { pos };
 }
 
@@ -350,6 +400,8 @@ function assemble(
   selected: Set<string>,
   hotMirror: Set<string>,
   dimmed: Set<string>,
+  /** 展开逐主机镜像线的网络（`zone->监控机`）；空 = 只画聚合主干 */
+  expand: Set<string>,
 ): { nodes: GNode[]; edges: Edge[] } {
   const uniq = uniqNodes(nodes);
 
@@ -386,56 +438,119 @@ function assemble(
     return f ? sideOf(f, n?.role ?? null) : "l";
   };
 
-  const rfEdges: Edge[] = edges
-    .filter(
-      (e) =>
-        uniq.has(e.from) &&
-        uniq.has(e.to) &&
-        // 监控机自己的内网口 → 自己的抓包口：同节点自环线画出来只会是一团
-        // 乱麻，语义在 chip 的"抓包"标注与抽屉清单里已经完整，图上省略。
-        e.from !== e.to,
-    )
-    .map((e, i) => {
-      const id = `${e.kind}:${e.from}->${e.to}:${i}`;
-      if (e.kind === "attach") {
-        // attach：端点锚在具体网口的 handle 上，让 React Flow 算路径。
-        // 以前用 ELK 的绝对折点画 polyline，节点一拖线就留在原地，
-        // 节点内容一变高端点还会悬空——看着像"线摆在那，没接上"。
-        const spec = attachSpec(e);
-        const ss = e.source_iface
-          ? handleId("s", sideOfOn(e.from, e.source_iface), e.source_iface)
-          : undefined;
-        const ts = e.target_iface
-          ? handleId("t", sideOfOn(e.to, e.target_iface), e.target_iface)
-          : undefined;
-        return {
-          id,
-          source: e.from,
-          target: e.to,
-          sourceHandle: ss,
-          targetHandle: ts,
-          type: "smoothstep",
-          pathOptions: { borderRadius: 10, offset: 16 },
-          style: { stroke: spec.stroke, strokeWidth: spec.strokeWidth },
-          markerEnd: spec.marker
-            ? { type: MarkerType.ArrowClosed, color: spec.stroke, width: 14, height: 14 }
-            : undefined,
-          zIndex: e.port === "uplink" ? 2 : 1,
-        } as Edge;
-      }
-      // mirror：从源口所在侧出、进目标口所在侧（抓包口在监控机下缘）
-      const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "l";
-      const ts = e.target_iface ? sideOfOn(e.to, e.target_iface) : "b";
-      return {
-        id,
-        source: e.from,
-        target: e.to,
-        sourceHandle: handleId("s", ss, e.source_iface ?? "eth0"),
-        targetHandle: handleId("t", ts, e.target_iface ?? "eth1"),
-        type: "smoothstep",
-        ...mirrorSpec(e, hotMirror.has(id)),
-      } as Edge;
-    });
+  const rfEdges: Edge[] = [];
+
+  /** 单条逐主机镜像线（源口 → 监控机抓包口）。聚合主干展开时才画。 */
+  const perHostMirror = (e: TopoEdge, i: number): Edge => {
+    const id = `${e.kind}:${e.from}->${e.to}:${i}`;
+    const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "l";
+    const ts = e.target_iface ? sideOfOn(e.to, e.target_iface) : "b";
+    return {
+      id,
+      source: e.from,
+      target: e.to,
+      sourceHandle: handleId("s", ss, e.source_iface ?? "eth0"),
+      targetHandle: handleId("t", ts, e.target_iface ?? "eth1"),
+      type: "smoothstep",
+      ...mirrorSpec(e, hotMirror.has(id)),
+    } as Edge;
+  };
+
+  // ── 整网采集：同网络的多条逐主机线合成一条主干 ──
+  // 一个网络开监控时，图上会出现"每台主机 → 同一块抓包口"的 N 条虚线，
+  // 全部横穿画布、互相压标签，一眼看不出这个网段到底归谁抓。语义上它本来
+  // 就是网络级开关（开在网络节点上），所以主干画 网络 → 监控机抓包口，
+  // 悬停监控机或主干时再把逐主机细线展开。
+  const groups = new Map<string, TopoEdge[]>();
+  const singles: TopoEdge[] = [];
+  for (const e of edges) {
+    if (e.kind !== "mirror") continue;
+    const zone = e.from.startsWith("host:") ? e.from.split(":")[1] : "";
+    const netId = `net:${zone}`;
+    if (zone && uniq.has(netId) && e.from !== e.to) {
+      const k = `${zone}->${e.to}`;
+      const arr = groups.get(k) ?? [];
+      arr.push(e);
+      groups.set(k, arr);
+    } else {
+      singles.push(e);
+    }
+  }
+
+  let seq = 0;
+  for (const [k, list] of groups) {
+    if (list.length < 2) {
+      // 只有一台被采（精确连线）：保持逐主机的画法，语义更强
+      singles.push(...list);
+      continue;
+    }
+    const zone = k.split("->")[0];
+    const head = list[0];
+    const iface = head.target_iface ?? "eth1";
+    const open = expand.has(k);
+    const id = `mirror-agg:${k}`;
+    rfEdges.push({
+      id,
+      source: `net:${zone}`,
+      target: head.to,
+      targetHandle: handleId("t", sideOfOn(head.to, iface), iface),
+      type: "smoothstep",
+      pathOptions: { borderRadius: 12, offset: 22 },
+      style: {
+        stroke: "#f59e0b",
+        strokeWidth: open ? 2.4 : 1.6,
+        strokeDasharray: "6 4",
+        opacity: open ? 1 : 0.75,
+      },
+      label: `整网采集 · ${list.length} 台`,
+      labelStyle: { fontSize: 10.5, fill: "#b45309" },
+      labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.94 },
+      labelBgPadding: [5, 2] as [number, number],
+      labelBgBorderRadius: 4,
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color: "#f59e0b",
+        width: 15,
+        height: 15,
+      },
+      zIndex: open ? 6 : 3,
+    } as Edge);
+    if (open) {
+      list.forEach((e, i) => rfEdges.push(perHostMirror(e, i)));
+    }
+  }
+
+  singles.forEach((e, i) => rfEdges.push(perHostMirror(e, i)));
+
+  // attach 边：端点锚在具体网口的 handle 上，让 React Flow 算路径。
+  // 以前用 ELK 的绝对折点画 polyline，节点一拖线就留在原地，
+  // 节点内容一变高端点还会悬空——看着像"线摆在那，没接上"。
+  for (const e of edges) {
+    if (e.kind !== "attach") continue;
+    if (!uniq.has(e.from) || !uniq.has(e.to) || e.from === e.to) continue;
+    const id = `attach:${e.from}->${e.to}:${seq++}`;
+    const spec = attachSpec(e);
+    const ss = e.source_iface
+      ? handleId("s", sideOfOn(e.from, e.source_iface), e.source_iface)
+      : undefined;
+    const ts = e.target_iface
+      ? handleId("t", sideOfOn(e.to, e.target_iface), e.target_iface)
+      : undefined;
+    rfEdges.push({
+      id,
+      source: e.from,
+      target: e.to,
+      sourceHandle: ss,
+      targetHandle: ts,
+      type: "smoothstep",
+      pathOptions: { borderRadius: 10, offset: 16 },
+      style: { stroke: spec.stroke, strokeWidth: spec.strokeWidth },
+      markerEnd: spec.marker
+        ? { type: MarkerType.ArrowClosed, color: spec.stroke, width: 14, height: 14 }
+        : undefined,
+      zIndex: e.port === "uplink" ? 2 : 1,
+    } as Edge);
+  }
 
   return { nodes: rfNodes, edges: rfEdges };
 }
@@ -528,7 +643,7 @@ function GraphInner({
     return out;
   }, [edges, nodes, hoverNode, hoverEdge, mirrorIds]);
 
-  // ── ELK 布局：只在结构变化时异步重算 ──
+  // ── 手工布局：只在结构变化时重算（纯函数，同步出结果）──
   const structKey = useMemo(() => {
     const nk = nodes.map((n) => n.id).sort().join(",");
     const ek = edges
@@ -542,25 +657,37 @@ function GraphInner({
   const fitted = useRef(false);
 
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const l = await layoutPositions(nodes, edges);
-        if (!alive) return;
-        setLayout(l);
-      } catch {
-        // 布局失败就保持旧位置：图乱一点总比消失好
-      }
-    })();
-    return () => {
-      alive = false;
-    };
+    try {
+      setLayout(layoutPositions(nodes, edges));
+    } catch {
+      // 布局失败就保持旧位置：图乱一点总比消失好
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [structKey]);
 
+  // 展开哪些"整网采集"主干：悬停监控机 = 全展开，悬停某条主干 = 只展开它。
+  const monitorIds = useMemo(
+    () => new Set(nodes.filter((n) => n.role === "monitor").map((n) => n.id)),
+    [nodes],
+  );
+  const expand = useMemo(() => {
+    const s = new Set<string>();
+    if (hoverEdge?.startsWith("mirror-agg:")) {
+      s.add(hoverEdge.slice("mirror-agg:".length));
+    }
+    if (hoverNode && monitorIds.has(hoverNode)) {
+      edges.forEach((e) => {
+        if (e.kind !== "mirror" || e.to !== hoverNode) return;
+        if (!e.from.startsWith("host:")) return;
+        s.add(`${e.from.split(":")[1]}->${e.to}`);
+      });
+    }
+    return s;
+  }, [hoverEdge, hoverNode, monitorIds, edges]);
+
   const built = useMemo(
-    () => assemble(nodes, edges, layout, sel, hotMirror, dimmed),
-    [nodes, edges, layout, sel, hotMirror, dimmed],
+    () => assemble(nodes, edges, layout, sel, hotMirror, dimmed, expand),
+    [nodes, edges, layout, sel, hotMirror, dimmed, expand],
   );
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode>([]);
@@ -584,9 +711,30 @@ function GraphInner({
     setRfEdges(built.edges);
     // 首次拿到布局后取景：此时 setState 已在本轮 flush，rAF 回调能看到
     // 带坐标的节点。
-    if (!fitted.current && built.nodes.length > 0 && layout.pos.size > 0) {
+    // 取景前必须确认**节点已经拿到真实坐标**：首帧那次 built 用的是空布局，
+    // 所有节点都在 (0,0)，此时 fitView 会把视口放大到单点（表现是"图里只剩
+    // 一个节点、还贴在角落"）。判断方式是"不全在原点"，而不是看布局 map 大小
+    // ——布局已经换了、built 还是旧的那一轮就是这么漏过去的。
+    const placed = built.nodes.some((n) => n.position.x !== 0 || n.position.y !== 0);
+    if (!fitted.current && built.nodes.length > 0 && placed) {
       fitted.current = true;
-      requestAnimationFrame(() => rf.fitView({ padding: 0.16, duration: 200 }));
+      // rAF 回调可能跑在 React 把新节点提交进 React Flow store **之前**
+      // ——量到的还是上一轮全在 (0,0) 的节点堆，视口顶到 maxZoom、中心对准
+      // 原点，整张图平移出画布（表现：只剩一个节点挂在角落）。所以取景前
+      // 先问 store 要一次节点：没就绪就下一帧再试，最多等半秒。
+      const tryFit = (tries: number) => {
+        const ns = rf.getNodes();
+        const ready =
+          ns.length > 0 && ns.some((n) => n.position.x !== 0 || n.position.y !== 0);
+        if (!ready) {
+          if (tries > 0) requestAnimationFrame(() => tryFit(tries - 1));
+          return;
+        }
+        // minZoom 别低于 0.55：再小下去节点里的字就成了灰块，
+        // "看清楚整张图"不如"看得清一台机器"，超出的部分让人自己拖。
+        rf.fitView({ padding: 0.12, duration: 200, minZoom: 0.55 });
+      };
+      requestAnimationFrame(() => tryFit(30));
     }
   }, [built, setRfNodes, setRfEdges, layout, rf]);
 

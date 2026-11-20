@@ -445,3 +445,109 @@ body {
   border: 1px solid #cbd5e1;
 }
 
+
+/* ── 监控机抽屉：采集的网络清单 ──
+ * 一层卡片一个网络，下面缩进列出被采集的主机。以前是纯文本行内混排
+ * （网络名 + 网段 + 台数 + 主机 + Tag 全在一行），窄抽屉里挤成一坨，
+ * 主机名还会把 zone 前缀带出来。 */
+.mon-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mon-card {
+  border: 1px solid #e6ebf2;
+  border-radius: 8px;
+  background: #fbfcfe;
+  padding: 8px 10px;
+}
+
+.mon-card-mine {
+  border-color: #cddffb;
+  background: #f7faff;
+}
+
+.mon-card-other {
+  opacity: 0.86;
+}
+
+.mon-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mon-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: #1f2937;
+}
+
+.mon-cidr,
+.mon-meta {
+  font-size: 11px;
+  color: #8a94a6;
+}
+
+.mon-flex {
+  flex: 1;
+}
+
+.mon-meta {
+  margin-top: 2px;
+}
+
+.mon-hosts {
+  margin: 6px 0 0 2px;
+  padding-left: 8px;
+  border-left: 2px solid #e6ebf2;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mon-host {
+  display: grid;
+  grid-template-columns: 8px minmax(56px, auto) 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.mon-host-name {
+  color: #374151;
+  font-weight: 600;
+}
+
+.mon-host-link {
+  color: #8a94a6;
+}
+
+.mon-host-state {
+  color: #16a34a;
+}
+
+.mon-host-bad {
+  color: #dc2626;
+}
+
+.mon-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #c3cbd8;
+}
+
+.mon-dot-on {
+  background: #22c55e;
+}
+
+.mon-dot-failed {
+  background: #ef4444;
+}
+
+.mon-dot-missing {
+  background: #f59e0b;
+}

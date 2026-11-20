@@ -1159,6 +1159,12 @@ fi
                     // 开机脚本不会再跑，只能立刻重放一次——否则这台容器从此
                     // "配置看着对，就是连不上"。
                     let _ = self.ct_replay_net(vmid, cancel).await;
+                    // 走 DHCP 的口：老 dhclient 的 socket 已经被热插拔作废，
+                    // 重放脚本里那句 `dhclient -1` 会静默失败，必须再补一次
+                    // （ct_ensure_dhcp 会先清掉旧进程）。
+                    if dhcp {
+                        let _ = self.ct_ensure_dhcp(vmid, cancel).await;
+                    }
                 }
             }
         }
@@ -1193,19 +1199,31 @@ fi
     ///
     /// 真机现象：外网监控机的 eth0 是 `ip=dhcp`，容器里的 `ifup` 在 veth 就绪
     /// 之前就跑过一遍，之后没人再试——容器一直只有 `lo`，面板上写着 `dhcp`
-    /// 却连 `ping` 都发不出去（`Network is unreachable`）。这里对仍然没有 v4
-    /// 地址的口补一次 `dhclient -1`；没有该命令就跳过，不把容器弄失败。
+    /// 却连 `ping` 都发不出去（`Network is unreachable`）。
+    ///
+    /// 两个坑都在真机上撞过：
+    /// 1. **只补 dhcp 口**。抓包口是 `inet manual`，在上面跑 dhclient 只会
+    ///    白等 25 秒超时，一轮 apply 被拖长好几倍。
+    /// 2. **必须先清掉旧 dhclient**。veth 热插拔后老进程握的是已消失的
+    ///    socket，`dhclient -1` 直接报 `send_packet: No such device or address`，
+    ///    然后"没有租约，睡一会儿"——补了等于没补。
     pub async fn ct_ensure_dhcp(
         &self,
         vmid: u32,
         cancel: &CancellationToken,
     ) -> Result<(), PveError> {
-        let script = r#"for i in $(ls /sys/class/net | grep -E '^eth'); do ip -4 -o addr show "$i" 2>/dev/null | grep -q "inet " || { command -v dhclient >/dev/null 2>&1 && dhclient -1 -q "$i" 2>/dev/null; }; done"#;
+        let script = r#"for i in $(awk '/^iface[ \t]/{iface=$2} /^[ \t]*inet[ \t]+dhcp/{print iface}' /etc/network/interfaces 2>/dev/null); do
+  ip -4 -o addr show "$i" 2>/dev/null | grep -q "inet " && continue
+  command -v dhclient >/dev/null 2>&1 || continue
+  pkill -f "dhclient\.$i\.pid" 2>/dev/null || true
+  sleep 1
+  dhclient -1 -q "$i" 2>/dev/null || true
+done"#;
         self.ct_exec(
             "dhcp:ensure",
             vmid,
             &["sh", "-c", script],
-            Duration::from_secs(25),
+            Duration::from_secs(40),
             cancel,
         )
         .await?;

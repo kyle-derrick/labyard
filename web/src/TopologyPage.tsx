@@ -500,7 +500,7 @@ export default function TopologyPage() {
       <Drawer
         open={!!detail}
         onClose={() => setPicked(null)}
-        width={430}
+        width={560}
         title={
           detail && (
             <Space>
@@ -539,7 +539,15 @@ export default function TopologyPage() {
 
         {detail?.kind === "host" && (
           <Space direction="vertical" size={14} style={{ width: "100%" }}>
-            <Descriptions size="small" column={2} bordered>
+            {/* 标签列不换行：430px 宽时 "角色"/"状态" 会被折成竖排，
+                值 "running" 也会断成 "runni/ng" */}
+            <Descriptions
+              size="small"
+              column={2}
+              bordered
+              labelStyle={{ whiteSpace: "nowrap", width: 76 }}
+              contentStyle={{ wordBreak: "keep-all" }}
+            >
               <Descriptions.Item label="Zone">
                 {detail.zone ?? "—"}
                 {typeof detail.meta.declared === "string" && (
@@ -810,9 +818,11 @@ function MonitorNetworks({
       (e) => e.kind === "mirror" && e.to === monitor.id && e.from.startsWith(`host:${net.zone}:`),
     );
     if (lines.length === 0) return null;
-    const iface = lines[0].target_iface ?? "?";
-    const bridge = lines[0].capture_bridge ?? "";
-    return `${lines.length} 台 · ${iface}${bridge ? ` @ ${bridge}` : ""}`;
+    return {
+      count: lines.length,
+      iface: lines[0].target_iface ?? "?",
+      bridge: lines[0].capture_bridge ?? "",
+    };
   };
 
   return (
@@ -835,7 +845,7 @@ function MonitorNetworks({
           还没有任何内网网络。
         </Text>
       ) : (
-        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+        <div className="mon-list">
           {networks.map((net) => {
             const m = net.meta as Record<string, unknown>;
             const monitored = typeof m.monitor === "string" && m.monitor !== "";
@@ -849,65 +859,64 @@ function MonitorNetworks({
                 )
               : [];
             return (
-              <div key={net.id} className="mon-net-row">
-                <div className="mon-net-text">
-                  <span className="mono">{net.label}</span>
-                  <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
-                    {" "}
-                    {String(m.cidr ?? "")}
-                  </Text>
-                  {info && (
-                    <Text type="secondary" className="mono" style={{ fontSize: 11 }}>
-                      {" "}
-                      · 已抓 {info}
-                    </Text>
-                  )}
-                  {monitored && !mine && (
-                    <Text type="secondary" style={{ fontSize: 11 }}>
-                      {" "}
-                      · 归 {String(m.monitor)}
-                    </Text>
-                  )}
-                  {!monitored && (
-                    <Text type="secondary" style={{ fontSize: 11 }}>
-                      {" "}
-                      · 未采集
-                    </Text>
-                  )}
-                  {mine && hostRows.length > 0 && (
-                    <div style={{ marginTop: 2 }}>
-                      {hostRows.map((r) => {
-                        const host = r.from.replace(/^host:[^:]+:/, "");
-                        const ok = r.active === "active";
-                        return (
-                          <div key={r.from} style={{ fontSize: 11, lineHeight: "18px" }}>
-                            <span className="mono">
-                              {host} · {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
-                            </span>{" "}
-                            <Tag
-                              color={ok ? "green" : r.active === "failed" ? "red" : "default"}
-                              style={{ fontSize: 10, lineHeight: "16px", padding: "0 6px" }}
-                            >
-                              {ok
-                                ? "采集中"
-                                : r.active === "failed"
-                                  ? "失败"
-                                  : r.active === "missing"
-                                    ? "未安装"
-                                    : "停止"}
-                            </Tag>
-                          </div>
-                        );
-                      })}
-                    </div>
+              <div
+                key={net.id}
+                className={`mon-card${mine ? " mon-card-mine" : ""}${monitored && !mine ? " mon-card-other" : ""}`}
+              >
+                <div className="mon-head">
+                  <span className="mono mon-name">{net.label}</span>
+                  <span className="mono mon-cidr">{String(m.cidr ?? "—")}</span>
+                  <span className="mon-flex" />
+                  {monitored ? (
+                    mine ? (
+                      <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+                        本机采集
+                      </Tag>
+                    ) : (
+                      <Tag style={{ marginInlineEnd: 0 }}>归 {String(m.monitor)}</Tag>
+                    )
+                  ) : (
+                    <Tag style={{ marginInlineEnd: 0 }}>未采集</Tag>
                   )}
                 </div>
-                {monitored &&
-                  (mine ? (
-                    <Tag color="blue">本机采集</Tag>
+                <div className="mon-meta mono">
+                  {info ? (
+                    <>
+                      抓包口 {info.iface}
+                      {info.bridge ? ` · ${info.bridge}` : ""} · 已抓 {info.count} 台
+                    </>
+                  ) : monitored && !mine ? (
+                    "由另一台监控机采集"
                   ) : (
-                    <Tag>归 {String(m.monitor)}</Tag>
-                  ))}
+                    "没有镜像连线"
+                  )}
+                </div>
+                {hostRows.length > 0 && (
+                  <div className="mon-hosts">
+                    {hostRows.map((r) => {
+                      // r.from 形如 `lab:gw`；只取主机名，别把 zone 前缀带上
+                      const host = r.from.split(":").slice(-1)[0];
+                      const ok = r.active === "active";
+                      const word = ok
+                        ? "采集中"
+                        : r.active === "failed"
+                          ? "失败"
+                          : r.active === "missing"
+                            ? "未安装"
+                            : "停止";
+                      return (
+                        <div className="mon-host" key={r.from}>
+                          <span className={`mon-dot mon-dot-${ok ? "on" : r.active ?? "off"}`} />
+                          <span className="mono mon-host-name">{host}</span>
+                          <span className="mono mon-host-link">
+                            {r.source_iface ?? "eth0"} → {r.target_iface ?? "?"}
+                          </span>
+                          <span className={`mon-host-state${ok ? "" : " mon-host-bad"}`}>{word}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -915,7 +924,7 @@ function MonitorNetworks({
             这份清单是只读的。要开/关某个网络的采集、换绑监控机，去点对应的
             网络节点，在它的抽屉里操作；新加入网络的主机由后台巡检自动接线。
           </Text>
-        </Space>
+        </div>
       )}
     </Card>
   );

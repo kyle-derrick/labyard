@@ -491,6 +491,16 @@ pub struct ResolvedZone {
     pub uplink_ip: Option<String>,
     /// 网关的默认路由（父 zone 的网关地址）。与 `uplink_ip` 成对出现。
     pub uplink_gw: Option<String>,
+    /// 网关要为**下游 zone** 装的静态路由：`(目标网段, 下一跳)`。
+    ///
+    /// 没有这张表，拓扑就只是"子网能出去，外面进不来"：默认路由只朝上，
+    /// 父 zone 与兄弟 zone 都找不到子网段——攻击机在 lab、靶机在 l3 时，
+    /// 靶机 ping 得通攻击机，反过来一头雾水。
+    ///
+    /// 下一跳恒为**直接子** zone 网关的上联地址（在父网段里），出口是网关
+    /// 自己的内网口（eth0）：子网就是挂在父网段上的。
+    #[serde(default)]
+    pub downstream: Vec<(String, String)>,
     pub v4_cidr: String,
     /// 宿主在桥上的管理地址；Web 终端从宿主直连容器用
     pub bridge_mgmt_ip: String,
@@ -1060,6 +1070,7 @@ fn resolve_zone(
         uplink_bridge,
         uplink_ip: None,
         uplink_gw: None,
+        downstream: Vec::new(),
         v4_cidr: z.v4.clone(),
         bridge_mgmt_ip: mgmt,
         v6_prefix,
@@ -1358,6 +1369,63 @@ impl Spec {
             out[i].uplink_ip = Some(format!("{}/{}", parts.join("."), prefix));
             out[i].uplink_gw = parent_gw
                 .map(|ip| ip.split('/').next().unwrap_or(&ip).to_string());
+        }
+
+        // ── 下游路由：父 zone 的网关要能找到它的所有后代网段 ──
+        //
+        // 拓扑是一棵树（`uplink:` 指父）。默认路由只朝上，所以"子 → 父/外网"
+        // 天然通，"父 → 子 / 兄弟"全断。要打通就得让每个网关知道它的下游：
+        // 目标网段 → **直接子**网关的上联地址（下一跳落在父网段里，出厂口是
+        // 网关自己的内网口 eth0）。
+        //
+        // 只给直接子一跳就够：孙网段的包交给子网关，子网关自己有到孙的路由。
+        {
+            let names: Vec<String> = out.iter().map(|z| z.name.clone()).collect();
+            let up: Vec<Option<String>> = out.iter().map(|z| z.uplink.clone()).collect();
+            let vias: Vec<Option<String>> = out.iter().map(|z| z.uplink_ip.clone()).collect();
+            let mut routes: Vec<Vec<(String, String)>> = vec![Vec::new(); out.len()];
+            for i in 0..out.len() {
+                if out[i].external {
+                    continue;
+                }
+                for j in 0..out.len() {
+                    if i == j || out[j].external {
+                        continue;
+                    }
+                    // 沿 j 的 uplink 链向上爬，记下"离 i 最近的那一跳"
+                    let mut prev = j;
+                    let mut cur = up[j].clone();
+                    let mut hops = 0;
+                    while let Some(name) = cur {
+                        hops += 1;
+                        if hops > 64 {
+                            break;
+                        }
+                        if name == names[i] {
+                            // 没有网关的子 zone 分不到上联地址，跳过去：
+                            // 它本来也不该有子网路由
+                            if let Some(via) = vias[prev].clone() {
+                                let ip = via.split('/').next().unwrap_or(&via).to_string();
+                                routes[i].push((out[j].v4_cidr.clone(), ip));
+                            }
+                            break;
+                        }
+                        match names.iter().position(|n| *n == name) {
+                            Some(k) => {
+                                prev = k;
+                                cur = up[k].clone();
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                // 排序：步骤哈希要稳定，BTreeMap 的顺序不能靠遍历巧合
+                routes[i].sort();
+                routes[i].dedup();
+            }
+            for (i, r) in routes.into_iter().enumerate() {
+                out[i].downstream = r;
+            }
         }
 
         Ok(ResolvedSpec {
@@ -1726,10 +1794,89 @@ zones:
         }
     }
 
+    /// 每个网关要知道全部下游网段，下一跳是**直接子**网关，不是最终目的网关。
+    ///
+    /// lab 到 l3 是"孙"，下一跳必须是 l2（10.77.0.253），不是 l3 自己的
+    /// 上联地址（那个在 l2 网段里，lab 根本不可达）。
+    #[test]
+    fn downstream_routes_point_at_direct_child() {
+        let y = r#"
+defaults: { cores: 1, memory: 512, disk: 2, template: t, storage: s }
+zones:
+  lab:
+    uplink: wan
+    v4: 10.77.0.0/24
+    hosts:
+      gateway: { role: gateway }
+  l2:
+    uplink: lab
+    v4: 10.30.1.0/24
+    hosts:
+      gateway: { role: gateway }
+  l3:
+    uplink: l2
+    v4: 10.30.2.0/24
+    hosts:
+      gateway: { role: gateway }
+  l5:
+    uplink: lab
+    v4: 10.30.3.0/24
+    hosts:
+      gateway: { role: gateway }
+"#;
+        let zs = Spec::parse(y).unwrap().resolve("vmbr0").unwrap();
+        let routes = |n: &str| {
+            zs.iter()
+                .find(|z| z.name == n)
+                .map(|z| z.downstream.clone())
+                .unwrap()
+        };
+        let lab = routes("lab");
+        let l2_via = zs
+            .iter()
+            .find(|z| z.name == "l2")
+            .and_then(|z| z.uplink_ip.clone())
+            .unwrap();
+        let l2_via = l2_via.split('/').next().unwrap().to_string();
+        let l5_via = zs
+            .iter()
+            .find(|z| z.name == "l5")
+            .and_then(|z| z.uplink_ip.clone())
+            .unwrap();
+        let l5_via = l5_via.split('/').next().unwrap().to_string();
+
+        assert!(
+            lab.contains(&("10.30.1.0/24".to_string(), l2_via.clone())),
+            "lab 到 l2 的路由: {lab:?}"
+        );
+        assert!(
+            lab.contains(&("10.30.2.0/24".to_string(), l2_via.clone())),
+            "lab 到孙网段 l3 也要经直接子 l2: {lab:?}"
+        );
+        assert!(
+            lab.contains(&("10.30.3.0/24".to_string(), l5_via)),
+            "lab 到 l5: {lab:?}"
+        );
+        // 叶子没有下游
+        assert!(routes("l3").is_empty());
+        // l2 只需要知道 l3
+        assert_eq!(
+            routes("l2"),
+            vec![("10.30.2.0/24".to_string(), zs
+                .iter()
+                .find(|z| z.name == "l3")
+                .and_then(|z| z.uplink_ip.clone())
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap()
+                .to_string())]
+        );
+    }
+
     /// 数据盘：存储不给就跟随 rootfs 的 storage；挂载点重复要在解析期就拒绝。
     #[test]
-    fn host_disks_resolve_and_validate() {
-        let y = r#"
+    fn host_disks_resolve_and_validate() {        let y = r#"
 defaults: { cores: 1, memory: 512, disk: 2, template: t, storage: local-lvm }
 zones:
   main:

@@ -20,7 +20,7 @@
 
 use super::{spawn_plan, AppState};
 use crate::core::plan::{Plan, Phase, StepKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,8 +111,83 @@ async fn read_installed(state: &Arc<AppState>) -> Result<BTreeMap<String, String
     Ok(map)
 }
 
-async fn run_once(state: &Arc<AppState>) -> ReconcileInfo {
-    let mut info = ReconcileInfo::default();
+/// 单元 active 只说明"脚本上次跑通了"，不说明**规则还挂着**。
+///
+/// tc 规则绑在 veth 上：容器网卡一热插拔（改 net、重建容器、宿主重启），
+/// 旧 veth 消失，规则随之蒸发，而 oneshot 单元仍是 active。结果就是面板
+/// 写着"采集中"、抓包口一个包都没有——这种"绿灯下的漏抓"比红灯更难发现。
+///
+/// 这里逐个实例验证 ingress/egress 两条 mirred 是否指向正确的目标口，
+/// 返回需要重启的实例名。
+async fn stale_instances(
+    state: &Arc<AppState>,
+    skip: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let script = r#"for f in /etc/labyard/mirror/*.conf; do
+  [ -e "$f" ] || continue
+  inst=$(basename "$f" .conf)
+  . "$f"
+  src=$(ip -o link show master "$SRC_BRIDGE" 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E "^veth${SOURCE_VMID}i[0-9]+$" | head -1)
+  dst=$(ip -o link show master "$CAPTURE_BRIDGE" 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E "^veth${TARGET_VMID}i[0-9]+$" | head -1)
+  if [ -z "$src" ] || [ -z "$dst" ]; then echo "$inst iface"; continue; fi
+  a=$(tc filter show dev "$src" ingress 2>/dev/null | grep -c "Mirror to device $dst")
+  b=$(tc filter show dev "$src" egress 2>/dev/null | grep -c "Mirror to device $dst")
+  if [ "${a:-0}" -ge 1 ] && [ "${b:-0}" -ge 1 ]; then echo "$inst ok"; else echo "$inst rule"; fi
+done"#;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let out = state
+        .runner
+        .run(
+            "reconcile:check-rules",
+            &crate::core::runner::CommandSpec::new("sh", ["-c", script])
+                .with_timeout(Duration::from_secs(25)),
+            None,
+            &cancel,
+            true,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut bad = Vec::new();
+    for line in out.stdout.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(inst), Some(state_word)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if state_word != "ok" && !skip.contains(inst) {
+            bad.push(inst.to_string());
+        }
+    }
+    Ok(bad)
+}
+
+/// 重启这些实例：`labmirror` 自己会重新探测 veth 并重建规则。
+async fn restart_instances(state: &Arc<AppState>, instances: &[String]) -> Result<(), String> {
+    if instances.is_empty() {
+        return Ok(());
+    }
+    let units: String = instances
+        .iter()
+        .map(|i| format!("labmirror@{i}.service "))
+        .collect();
+    let cmd = format!("systemctl restart {units}");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    state
+        .runner
+        .run(
+            "reconcile:restart-mirror",
+            &crate::core::runner::CommandSpec::new("sh", ["-c", cmd.as_str()])
+                .with_timeout(Duration::from_secs(90)),
+            None,
+            &cancel,
+            true,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn run_once(state: &Arc<AppState>) -> ReconcileInfo {    let mut info = ReconcileInfo::default();
 
     // 有 run 在执行就不凑热闹：apply 本身就会把镜像装到位，巡检此刻读到的
     // "缺失"很可能只是执行到一半。
@@ -162,11 +237,39 @@ async fn run_once(state: &Arc<AppState>) -> ReconcileInfo {
 
     // ── 缺失：规格里有、宿主上没有（或刚被当作孤儿停掉） ──
     let missing = collect_missing(state, &desired, &actual, &orphans);
+    // ── 规则健康检查：单元 active ≠ 规则还在 ──
+    // 这一步必须独立于 missing：conf 文件一字不差、单元也是 active，
+    // 规则却可能因为 veth 重建而蒸发。这类"绿灯漏抓"只能靠实测规则发现。
+    let skip: BTreeSet<String> = missing
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StepKind::Mirror {
+                zone,
+                source_vmid,
+                target_vmid,
+                ..
+            } => Some(format!("{zone}-{source_vmid}-{target_vmid}")),
+            _ => None,
+        })
+        .collect();
+    match stale_instances(state, &skip).await {
+        Ok(bad) => {
+            if !bad.is_empty() {
+                tracing::warn!("巡检发现镜像规则丢失，重启单元: {bad:?}");
+                match restart_instances(state, &bad).await {
+                    Ok(()) => info.applied += bad.len(),
+                    Err(e) => info.error = Some(format!("重启镜像单元失败: {e}")),
+                }
+            }
+        }
+        Err(e) => info.error = Some(format!("检查镜像规则失败: {e}")),
+    }
+
     if missing.is_empty() {
         info.at = Some(now());
         return info;
     }
-    info.applied = missing.len();
+    info.applied += missing.len();
     tracing::info!(
         "巡检补装 {} 个镜像实例: {:?}",
         missing.len(),

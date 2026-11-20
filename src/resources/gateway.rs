@@ -31,6 +31,13 @@ pub struct Policy<'a> {
     pub v6_prefix: Option<&'a str>,
     pub pubs: &'a [ResolvedPub],
     pub vpn: &'a ResolvedVpn,
+    /// 规格里所有内网网段（含本 zone）。
+    ///
+    /// 用来把"内网互访"和"出公网"分开：`egress: false` 只该封公网，
+    /// 到父/兄弟网段的路由仍要放行；`masquerade` 也不该把去内网的目标
+    /// 一起转换（否则对端只看得见网关地址，抓包与审计全乱）。
+    /// 空 = 老行为（不区分），保持向后兼容。
+    pub lan_cidrs: &'a [String],
 }
 
 /// 生成整份 nft 规则表。
@@ -61,11 +68,29 @@ pub fn nft_script(p: &Policy) -> String {
 
     // 出网：关掉时先丢。**必须排在 established 之前**，否则已建立的连接
     // 还能继续出，用户看到的"已断网"是假的。
+    //
+    // 关掉不等于"关掉整个网络"：到规格内其它 zone 网段的转发仍然放行——
+    // 出网控制说的是"能不能上公网"，内网之间该通还得通。以前一刀切
+    // `iif lan oif uplink drop`，对嵌套 zone（uplink 是父 zone 而不是外网）
+    // 直接把访问父网段也封了，表现为"关了出网，连隔壁网段都 ping 不通"。
     let verdict = if p.egress { "accept" } else { "drop" };
-    s.push_str(&format!(
-        "    iifname \"{}\" oifname \"{}\" {}\n",
-        p.lan, p.uplink, verdict
-    ));
+    if p.egress || p.lan_cidrs.is_empty() {
+        s.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" {}\n",
+            p.lan, p.uplink, verdict
+        ));
+    } else {
+        s.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ip daddr {{ {} }} accept\n",
+            p.lan,
+            p.uplink,
+            p.lan_cidrs.join(", ")
+        ));
+        s.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" drop\n",
+            p.lan, p.uplink
+        ));
+    }
 
     s.push_str("    ct state established,related accept\n");
     if !p.pubs.is_empty() {
@@ -79,7 +104,20 @@ pub fn nft_script(p: &Policy) -> String {
         s.push_str(&format!("    iifname \"{iface}\" accept\n"));
         s.push_str(&format!("    oifname \"{iface}\" accept\n"));
     }
-    // 上联进来的新连接一律丢（映射的已在上面按 dnat 放行）
+    // 上联进来的新连接一律丢（映射的已在上面按 dnat 放行）。
+    //
+    // 例外：**源地址属于规格内网网段**的转发要放行。zone 树里"父 zone 的包
+    // 进子网"走的就是这条路（iif uplink → oif lan），它和"外网扫进来"在接口
+    // 上完全一样，只能靠源地址区分。以前无差别 drop，表现为父 zone 到子网段
+    // 100% 丢包、子网段却能一路出去——单向可达最难查。
+    if !p.lan_cidrs.is_empty() {
+        s.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ip saddr {{ {} }} accept\n",
+            p.uplink,
+            p.lan,
+            p.lan_cidrs.join(", ")
+        ));
+    }
     s.push_str(&format!(
         "    iifname \"{}\" oifname \"{}\" drop\n",
         p.uplink, p.lan
@@ -114,10 +152,21 @@ pub fn nft_script(p: &Policy) -> String {
             // DNAT 抓包能看到包到了目标主机，但对面一个字节都不回。
             s.push_str(&format!("    oifname \"{}\" ct status dnat masquerade\n", p.lan));
         }
-        s.push_str(&format!(
-            "    ip saddr {} oifname \"{}\" masquerade\n",
-            p.zone_cidr, p.uplink
-        ));
+        if p.lan_cidrs.is_empty() {
+            s.push_str(&format!(
+                "    ip saddr {} oifname \"{}\" masquerade\n",
+                p.zone_cidr, p.uplink
+            ));
+        } else {
+            // 只对"真正的出网"做源地址转换：去兄弟/父网段的包保持源地址，
+            // 否则对端看到的永远是网关 IP，抓包分析与封禁规则全部失真。
+            s.push_str(&format!(
+                "    ip saddr {} oifname \"{}\" ip daddr != {{ {} }} masquerade\n",
+                p.zone_cidr,
+                p.uplink,
+                p.lan_cidrs.join(", ")
+            ));
+        }
         if let Some(v6) = p.v6_prefix {
             s.push_str(&format!(
                 "    ip6 saddr {v6} oifname \"{}\" masquerade\n",
@@ -352,6 +401,7 @@ mod tests {
             v6_prefix: None,
             pubs,
             vpn,
+            lan_cidrs: &[],
         }
     }
 
@@ -396,6 +446,25 @@ mod tests {
     }
 
     #[test]
+    fn inbound_from_inner_networks_is_allowed() {
+        // 父 zone 的包进子网，和"外网扫进来"在接口上长一样。
+        // 全 drop 的话子网段就被关在单向通道里：出得去、进不来。
+        let pubs: Vec<ResolvedPub> = vec![];
+        let vpn = ResolvedVpn::default();
+        let cidrs = vec!["10.10.1.0/24".to_string(), "10.20.1.0/24".to_string()];
+        let mut p = policy(&pubs, &vpn);
+        p.lan_cidrs = &cidrs;
+        let s = nft_script(&p);
+        let allow = s
+            .find("iifname \"eth1\" oifname \"eth0\" ip saddr { 10.10.1.0/24, 10.20.1.0/24 } accept")
+            .expect("内网来源要放行");
+        let drop = s
+            .find("iifname \"eth1\" oifname \"eth0\" drop")
+            .expect("其余仍丢");
+        assert!(allow < drop, "放行必须排在丢弃之前:\n{s}");
+    }
+
+    #[test]
     fn egress_off_drops_lan_to_wan_before_established() {
         let pubs: Vec<ResolvedPub> = vec![];
         let vpn = ResolvedVpn::default();
@@ -409,8 +478,44 @@ mod tests {
     }
 
     #[test]
-    fn nat_off_means_no_masquerade_at_all() {
+    fn egress_off_still_allows_inner_networks() {
+        // 出网开关说的是"能不能上公网"。嵌套 zone 的 uplink 是父 zone 网段，
+        // 一刀切 drop 会把"访问父网段"一起封掉——实测现象：关掉出网之后，
+        // 连隔壁网段都 ping 不通了。
         let pubs: Vec<ResolvedPub> = vec![];
+        let vpn = ResolvedVpn::default();
+        let cidrs = vec!["10.10.1.0/24".to_string(), "10.20.1.0/24".to_string()];
+        let mut p = policy(&pubs, &vpn);
+        p.egress = false;
+        p.lan_cidrs = &cidrs;
+        let s = nft_script(&p);
+        let allow = s
+            .find("ip daddr { 10.10.1.0/24, 10.20.1.0/24 } accept")
+            .expect("内网网段要先放行");
+        let drop = s
+            .find("iifname \"eth0\" oifname \"eth1\" drop")
+            .expect("其余的才丢");
+        assert!(allow < drop, "放行必须在丢弃之前:\n{s}");
+    }
+
+    #[test]
+    fn masquerade_skips_inner_networks() {
+        // 去兄弟/父网段的包保持源地址，否则对端只看得见网关 IP，
+        // 抓包分析与按源地址的封禁全部失真。
+        let pubs: Vec<ResolvedPub> = vec![];
+        let vpn = ResolvedVpn::default();
+        let cidrs = vec!["10.10.1.0/24".to_string(), "10.20.1.0/24".to_string()];
+        let mut p = policy(&pubs, &vpn);
+        p.lan_cidrs = &cidrs;
+        let s = nft_script(&p);
+        assert!(
+            s.contains("ip saddr 10.10.1.0/24 oifname \"eth1\" ip daddr != { 10.10.1.0/24, 10.20.1.0/24 } masquerade"),
+            "出网才转换:\n{s}"
+        );
+    }
+
+    #[test]
+    fn nat_off_means_no_masquerade_at_all() {        let pubs: Vec<ResolvedPub> = vec![];
         let vpn = ResolvedVpn::default();
         let mut p = policy(&pubs, &vpn);
         p.nat = false;

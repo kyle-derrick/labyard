@@ -552,6 +552,7 @@ async fn apply_step(
             is_gateway,
             uplink_ip,
             uplink_gw,
+            routes,
             default_route,
             nat,
             dns,
@@ -560,12 +561,13 @@ async fn apply_step(
             // 地址/路由落成开机单元而不是"执行一次"：容器重启后这些运行时
             // 状态全没了，而本步骤是哈希门控的——apply 不会再跑一遍。
             let addressing = if *is_gateway {
-                net::gateway_addressing(
+                net::gateway_addressing_routed(
                     ipv4,
                     ipv6_prefix.as_deref(),
                     "eth1",
                     uplink_ip.as_deref(),
                     uplink_gw.as_deref(),
+                    routes,
                     dns,
                 )
             } else {
@@ -606,6 +608,9 @@ async fn apply_step(
                     v6_prefix: ipv6_prefix.as_deref(),
                     pubs: &[],
                     vpn: &no_vpn,
+                    // 基础策略只是"入向默认拒绝"的兜底，随后 Gateway 步骤会用
+                    // 完整策略覆盖同一个单元；这里不需要内网网段表。
+                    lan_cidrs: &[],
                 };
                 pve.ct_boot_script(
                     &format!("net-nft:{host}"),
@@ -723,6 +728,7 @@ async fn apply_step(
             pubs,
             vpn,
             uplink,
+            lan_cidrs,
             ..
         } => {
             let policy = gateway::Policy {
@@ -734,6 +740,7 @@ async fn apply_step(
                 v6_prefix: v6_prefix.as_deref(),
                 pubs,
                 vpn,
+                lan_cidrs,
             };
             // 规则整份重建：改一条映射也走同一路径，不存在增量漂移。
             // 同时覆盖 net 阶段装的那份基础策略单元——同一个单元名，
@@ -814,16 +821,28 @@ async fn apply_step(
             );
             let b64_script = crate::pve::base64_encode(script_body.as_bytes());
             let b64_unit = crate::pve::base64_encode(unit_body.as_bytes());
+            // 一条命令里有三段，各自的并发理由不同：
+            //   1. 落脚本/单元/conf + daemon-reload —— **必须串行**。多条连线
+            //      是并发执行的（批内并发 3），同时往 /usr/local/bin/labmirror
+            //      写同一份内容时，后启动的实例可能读到写了一半的脚本，或
+            //      daemon-reload 撞在一起；表现是"单独跑好好的，一 apply 就红"。
+            //   2. reset-failed —— 上一次失败会让单元进入 StartLimit 冷却
+            //      （300s 内 6 次就拒绝启动），不重置的话再点多少次都起不来。
+            //   3. restart —— 放在锁外：它会等脚本真正挂规则，不该占着安装锁。
             let cmd = format!(
                 "set -e\n\
                  mkdir -p {conf_dir}\n\
-                 echo {b64_script} | base64 -d > /usr/local/bin/labmirror\n\
-                 chmod +x /usr/local/bin/labmirror\n\
-                 echo {b64_unit} | base64 -d > /etc/systemd/system/labmirror@.service\n\
-                 rm -f {conf_dir}/labmirror@*.conf\n\
-                 printf '%s' '{conf}' > {conf_dir}/{instance}.conf\n\
-                 systemctl daemon-reload\n\
+                 (\n\
+                   flock 9\n\
+                   echo {b64_script} | base64 -d > /usr/local/bin/labmirror\n\
+                   chmod +x /usr/local/bin/labmirror\n\
+                   echo {b64_unit} | base64 -d > /etc/systemd/system/labmirror@.service\n\
+                   rm -f {conf_dir}/labmirror@*.conf\n\
+                   printf '%s' '{conf}' > {conf_dir}/{instance}.conf\n\
+                   systemctl daemon-reload\n\
+                 ) 9>/var/lock/labyard-mirror.install.lock\n\
                  systemctl enable {unit}.service 2>/dev/null || true\n\
+                 systemctl reset-failed {unit}.service 2>/dev/null || true\n\
                  systemctl restart {unit}.service 2>&1 || {{ journalctl -u {unit}.service -n 20 --no-pager; exit 1; }}"
             );
             let out = runner

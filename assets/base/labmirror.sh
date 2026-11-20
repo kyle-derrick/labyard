@@ -58,16 +58,63 @@ done
 [ -n "$DST_IF" ] || { log "监控机 $TARGET_VMID 在 $CAPTURE_BRIDGE 上没有网口"; exit 1; }
 log "mirroring $SRC_IF ($SRC_BRIDGE) -> $DST_IF ($CAPTURE_BRIDGE, ${TARGET_IFACE:-?})"
 
-# ── 双向都要抓 ──
+# ── 双向都要抓，且按**源口**聚合 ──
 # 源主机 veth 的 ingress = 容器发出去的包，egress = 发给容器的包。
 # 只抓 ingress 会漏掉一半（服务端的响应包全在 egress 上），这在"只看到一个
 # 方向的会话"时最难排查：抓包工具里握手只有 SYN。
-tc qdisc del dev "$SRC_IF" clsact 2>/dev/null || true
-tc qdisc add dev "$SRC_IF" clsact
+#
+# 一台主机可能被**多处**采集：整网监控（网络 → 监控机）+ 一条精确连线
+# （t1 → cache）。这里不能"每个实例挂一条规则"：matchall 是终止式匹配，
+# 同一条链上两条 matchall 只有优先级高的那条会跑，后加的那条计数永远是 0
+# ——真机上就是"面板两处都写着采集中，只有一处真在收包"。
+#
+# 正确做法：把同一源口的**全部**目标合成一条 filter，串多个 mirred action。
+# 任何实例重启都会读全量 conf 重建这条规则，因此天然幂等；并发重启也不会
+# 打架（最后写的都是同一份内容）。
+MY_BRIDGE="$SRC_BRIDGE"
+MY_VMID="$SOURCE_VMID"
+DSTS=""
+for c in /etc/labyard/mirror/*.conf; do
+  d=$(
+    # shellcheck disable=SC1090
+    . "$c"
+    [ "$SRC_BRIDGE" = "$MY_BRIDGE" ] && [ "$SOURCE_VMID" = "$MY_VMID" ] || exit 0
+    iface_of "$CAPTURE_BRIDGE" "$TARGET_VMID"
+  )
+  [ -n "$d" ] && DSTS="$DSTS $d"
+done
+DSTS=$(printf '%s\n' $DSTS | sort -u | tr '\n' ' ')
+[ -n "$DSTS" ] || { log "源口 $SRC_IF 找不到任何可用的抓包口"; exit 1; }
 
-tc filter add dev "$SRC_IF" ingress matchall \
-  action mirred egress mirror dev "$DST_IF"
-tc filter add dev "$SRC_IF" egress matchall \
-  action mirred egress mirror dev "$DST_IF"
+PREF=$(printf '%s' "$SRC_BRIDGE/$SOURCE_VMID" | cksum | cut -d' ' -f1)
+PREF=$((PREF % 59000 + 100))
 
-log "已挂 ingress+egress 镜像规则（排障：tc -s filter show dev $SRC_IF ingress）"
+if ! tc qdisc show dev "$SRC_IF" | grep -q clsact; then
+  tc qdisc add dev "$SRC_IF" clsact
+fi
+
+# 这个口上的镜像规则由本脚本独占：先全清再按当前目标集合重建。
+# 清的范围只有这一块 veth，别的源口的规则不受影响。
+tc filter del dev "$SRC_IF" ingress 2>/dev/null || true
+tc filter del dev "$SRC_IF" egress 2>/dev/null || true
+
+ACTIONS=""
+for d in $DSTS; do
+  ACTIONS="$ACTIONS action mirred egress mirror dev $d"
+done
+# shellcheck disable=SC2086
+tc filter add dev "$SRC_IF" ingress pref "$PREF" matchall $ACTIONS
+# shellcheck disable=SC2086
+tc filter add dev "$SRC_IF" egress pref "$PREF" matchall $ACTIONS
+
+# 装完当场验一次：`tc filter add` 成功但方向挂错时，单元照样 active，
+# 面板上写着"采集中"却一个包都收不到。这里失败就让单元红着，让巡检去补。
+# 文本取自 `tc filter show`：`action order 1: mirred (Egress Mirror to device veth112i1)`
+for d in $DSTS; do
+  tc filter show dev "$SRC_IF" ingress | grep -q "Mirror to device $d" \
+    || { log "ingress 规则没挂上（$SRC_IF → $d）"; exit 1; }
+  tc filter show dev "$SRC_IF" egress | grep -q "Mirror to device $d" \
+    || { log "egress 规则没挂上（$SRC_IF → $d）"; exit 1; }
+done
+
+log "已挂 ingress+egress 镜像规则（pref $PREF；目标:$DSTS；排障：tc -s filter show dev $SRC_IF ingress）"
