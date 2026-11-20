@@ -1005,6 +1005,48 @@ impl Executor {
             .collect())
     }
 
+    /// 停掉并删除某个 zone 的全部镜像实例（单元 + `/etc/labyard/mirror/*.conf`）。
+    ///
+    /// 销毁 zone 时必须调用：容器删了、桥删了，但 `labmirror@zt-103-103`
+    /// 这类单元和 conf 会留在宿主上——实测回归跑完就剩了两份 `zt-*.conf`。
+    /// 下次同名 zone 重建时会带着**旧的口配置**启动（源 veth 编号早变了），
+    /// 巡检看到单元"active"也不会管，表现为"采集中但抓不到包"。
+    pub async fn remove_zone_mirrors(
+        &self,
+        zone: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, String> {
+        let glob = format!("/etc/labyard/mirror/{zone}-*-*.conf");
+        let out = self
+            .runner
+            .run(
+                &format!("mirror-list:{zone}"),
+                &CommandSpec::new(
+                    "sh",
+                    ["-c", &format!(
+                        "for f in {glob}; do [ -e \"$f\" ] || continue; basename \"$f\" .conf; done"
+                    )],
+                )
+                .with_timeout(Duration::from_secs(30)),
+                None,
+                cancel,
+                true,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut seen = std::collections::BTreeSet::new();
+        let instances: Vec<String> = out
+            .stdout
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && seen.insert(l.clone()))
+            .collect();
+        if !instances.is_empty() {
+            self.stop_units(&instances, cancel).await?;
+        }
+        Ok(instances)
+    }
+
     /// 停单元 + 删配置。实例名拼法与执行镜像步骤时严格一致。
     async fn stop_units(&self, instances: &[String], cancel: &CancellationToken) -> Result<(), String> {
         let mut cmd = String::from("set -e\n");
@@ -1040,6 +1082,8 @@ pub struct DestroyReport {
     pub absent_cts: Vec<String>,
     pub bridge_deleted: bool,
     pub kept_bridge: Option<String>,
+    /// 一并停掉并删掉配置的镜像实例（`{zone}-{源}-{目标}`）
+    pub mirror_units_stopped: Vec<String>,
 }
 
 impl Executor {
@@ -1178,6 +1222,14 @@ impl Executor {
                 }
             }
         }
+
+        // ── 镜像实例：这个 zone 作为源或目标的单元与配置都要清掉 ──
+        // 顺序在删桥之前：脚本还要按桥名找源 veth，桥没了单元会报错退出，
+        // 配置却留在磁盘上。
+        report.mirror_units_stopped = self
+            .remove_zone_mirrors(&zone.name, cancel)
+            .await
+            .unwrap_or_default();
 
         // ── 抓包桥：监控机在这块网络上的网卡随容器消失，桥空了就一并删 ──
         //

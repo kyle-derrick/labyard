@@ -1166,18 +1166,20 @@ async fn bridge_states(state: &AppState) -> Vec<BridgeState> {
         // 只看平台自己建的：PVE 的 vmbr*、外网桥 wan 都不该出现在这里
         .filter(|(n, _, _)| n.starts_with("lab") || n.starts_with("mir"))
         .map(|(name, ips, members)| {
-            // `mirr` 是全局镜像桥，不属于任何 zone，永远不算残留
-            let zone = if name == "mirr" {
-                None
-            } else {
-                name.strip_prefix("lab")
-                    .or_else(|| name.strip_prefix("mir"))
-                    .map(|s| s.to_string())
-            };
-            let orphan = zone
-                .as_ref()
-                .map(|z| !live.zones.contains(z))
-                .unwrap_or(false);
+            // 桥名推 zone：`lab<zone>` / `mir<zone>`。**推出来的名字必须真在
+            // 规格里**才算这个 zone 的桥。推不出或对不上（例如历史遗留的空桥
+            // `mirr` 会被推成 `r`）就是无主桥——按残留处理，让面板能清理。
+            // 以前这里把 `mirr` 写死成"全局镜像桥、永远不算残留"，结果一块
+            // 无成员、DOWN、MAC 全 0 的废弃空桥在界面上永远显示成正常桥，
+            // 谁也删不掉（prune 只处理 orphan）。
+            let raw = name
+                .strip_prefix("lab")
+                .or_else(|| name.strip_prefix("mir"))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let known = raw.as_ref().map(|z| live.zones.contains(z)).unwrap_or(false);
+            let zone = if known { raw } else { None };
+            let orphan = !known;
             BridgeState {
                 safe: bridge_prunable(orphan, members),
                 orphan,

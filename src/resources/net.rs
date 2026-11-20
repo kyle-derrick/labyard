@@ -11,6 +11,7 @@
 ///
 /// `gw_v4` 是网关自己的地址（10.77.0.1/24），`uplink` 是上联网卡名（eth1）。
 /// 真机实测教训：早期把网段地址写上了接口，网关拿不到 .1 这个身份。
+#[allow(dead_code)] // 生产走 `gateway_addressing_routed`（带下游路由）；这个是无路由的便捷封装，仅测试用
 pub fn gateway_addressing(
     gw_v4: &str,
     v6_prefix: Option<&str>,

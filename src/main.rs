@@ -195,22 +195,72 @@ async fn serve_with(cfg: Config, concurrency: usize) -> Result<(), Box<dyn std::
     // 宿主上多出来的孤儿单元就停掉。
     api::reconcile::spawn(state.clone());
 
-    let app = api::router(state);
+    let app = api::router(state.clone());
 
     if tls {
         use axum_server::tls_rustls::RustlsConfig;
         let tls_cfg =
             RustlsConfig::from_pem_file(cert.unwrap(), key.unwrap()).await?;
         tracing::info!("HTTPS 监听 https://{addr}");
+        // 优雅停机：先取消在途 run（落成 cancelled），再让 axum-server 收连接。
+        let handle = axum_server::Handle::new();
+        let h = handle.clone();
+        let st = state.clone();
+        tokio::spawn(async move {
+            shutdown_signal(st).await;
+            h.graceful_shutdown(Some(std::time::Duration::from_secs(8)));
+        });
         axum_server::bind_rustls(addr.parse()?, tls_cfg)
+            .handle(handle)
             .serve(app.into_make_service())
             .await?;
     } else {
         tracing::info!("HTTP 监听 http://{addr}（未配 TLS，建议用 Caddy 反代）");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
+        let st = state.clone();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal(st))
+            .await?;
     }
     Ok(())
+}
+
+/// 停机：**先把在途 run 全部取消**，让执行器把它们落成 `cancelled`，
+/// 再交给 axum 收连接。
+///
+/// 为什么必须这样：`systemctl stop/restart`（部署、升级都会做）只给进程
+/// 发 SIGTERM，正在跑的 `pct exec` 会以非零退出码结束——执行器把这当成
+/// "命令失败"，run 就被记成 failed。实测部署 4 次，运行历史里攒了 4 条
+/// `gateway:lab 失败`，用户看到只会以为面板出了问题。
+async fn shutdown_signal(state: Arc<api::AppState>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    let runs = state.runs.lock().await;
+    let live = runs.len();
+    for h in runs.values() {
+        h.cancel.cancel();
+    }
+    drop(runs);
+    if live > 0 {
+        tracing::info!("停机：已取消 {live} 个在途 run，等它们落状态");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
 async fn doctor(config_path: PathBuf, json: bool) -> Result<(), Box<dyn std::error::Error>> {
