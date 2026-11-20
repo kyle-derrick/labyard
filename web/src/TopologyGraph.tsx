@@ -334,7 +334,38 @@ function LabEdge({
   markerEnd,
   data,
 }: EdgeProps) {
-  const d0 = (data ?? {}) as { corridorY?: number; exitX?: number };
+  const d0 = (data ?? {}) as {
+    corridorY?: number;
+    exitX?: number;
+    bus?: boolean;
+    taps?: { sx: number; sy: number; x: number }[];
+  };
+
+  // ── 采集总线：同一台监控机的 N 个被采网段合并成一条主干 ──
+  // 每个 tap 从网段卡右缘水平出框、沿列间走廊下到底部通道，再共用一条
+  // 水平总线汇入监控机。以前是"每网段一条主干"，底部并排 4 条虚线。
+  if (d0.bus && Array.isArray(d0.taps) && typeof d0.corridorY === "number") {
+    const cy = d0.corridorY;
+    const taps = d0.taps;
+    const xs = [...taps.map((t) => t.x), targetX];
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const tapD = taps.map((t) => `M ${t.sx},${t.sy} L ${t.x},${t.sy} L ${t.x},${cy}`).join(" ");
+    const mainD = `M ${minX},${cy} L ${maxX},${cy}`;
+    const spineD = `M ${targetX},${cy} L ${targetX},${targetY}`;
+    const op = typeof style?.opacity === "number" ? style.opacity : 1;
+    return (
+      <>
+        {taps.map((t, i) => (
+          <circle key={i} cx={t.sx} cy={t.sy} r={2.2} fill="#f59e0b" opacity={op} />
+        ))}
+        <path d={tapD} style={style} fill="none" />
+        <path d={mainD} style={style} fill="none" />
+        <path d={spineD} style={style} fill="none" markerEnd={markerEnd} />
+      </>
+    );
+  }
+
   const corridorY = typeof d0.corridorY === "number" ? d0.corridorY : undefined;
   const stem = 18;
   const pts: [number, number][] = [[sourceX, sourceY]];
@@ -738,38 +769,59 @@ function assemble(
   }
 
   let seq = 0;
+  // 按监控机聚合：一台监控机抓几个网段 -> 一条采集总线
+  const byMonitor = new Map<string, { k: string; zone: string; list: TopoEdge[] }[]>();
   for (const [k, list] of groups) {
     if (list.length < 2) {
       singles.push(...list);
       continue;
     }
-    const zone = k.split("->")[0];
-    const head = list[0];
+    const [zone, mon] = k.split("->");
+    const arr = byMonitor.get(mon) ?? [];
+    arr.push({ k, zone, list });
+    byMonitor.set(mon, arr);
+  }
+
+  const monitors = [...byMonitor.keys()].sort();
+  monitors.forEach((mon, lane) => {
+    const items = byMonitor.get(mon)!;
+    // 每条总线一条独立通道：底部走廊按监控机顺序 +18px，互不重叠
+    const laneY = layout.corridorY + lane * 28;
+    const taps = items.map((it) => {
+      const netPos = layout.pos.get(`net:${it.zone}`);
+      const box = boxOfZone.get(it.zone);
+      return {
+        // 起点：网段卡右缘中线
+        sx: (netPos?.x ?? 0) + DIM.network.w,
+        sy: (netPos?.y ?? 0) + DIM.network.h / 2,
+        // 下沉位置：本框右缘外的列间走廊（同一列的两个网段共用，正常）
+        x: (box?.x ?? 0) + (box?.w ?? 0) + 20,
+      };
+    });
+    const head = items[0].list[0];
     const iface = head.target_iface ?? "eth1";
-    const open = expand.has(k);
-    const id = `mirror-agg:${k}`;
-    // 主干：网段卡右缘 → 画布底部走廊 → 监控机底部抓包口。
-    // 走廊在所有区域框下方（layout.corridorY），无论如何都不穿节点。
+    const open = [...expand].some((k) => k.endsWith(`->${mon}`));
+    const totalHosts = items.reduce((n, it) => n + it.list.length, 0);
+
     rfEdges.push({
-      id,
-      source: `net:${zone}`,
+      id: `mirror-bus:${mon}`,
+      // source 只是载体（路径由 taps 决定），挂在第一个被采网段上
+      source: `net:${items[0].zone}`,
       sourceHandle: handleId("s", "r", "net"),
-      target: head.to,
-      targetHandle: handleId("t", sideOfOn(head.to, iface), iface),
+      target: mon,
+      targetHandle: handleId("t", sideOfOn(mon, iface), iface),
       type: "lab",
       data: {
-        corridorY: layout.corridorY,
-        // 先水平出到本框右缘外再下沉：直接从网段卡右缘往下会竖穿
-        // 本框内的主机行（实测穿 l2:w1 12 个采样点）
-        exitX: (boxOfZone.get(zone)?.x ?? 0) + (boxOfZone.get(zone)?.w ?? 0) + 20,
-        sameBox: false,
-        label: open ? `整网采集 · ${list.length} 台` : "",
+        bus: true,
+        corridorY: laneY,
+        taps,
+        label: open ? `采集 ${items.length} 个网段 · ${totalHosts} 台` : "",
       },
       style: {
         stroke: "#f59e0b",
         strokeWidth: open ? 2.2 : 1.3,
         strokeDasharray: "6 4",
-        opacity: open ? 1 : 0.5,
+        opacity: open ? 1 : 0.55,
       },
       markerEnd: {
         type: MarkerType.ArrowClosed,
@@ -779,10 +831,11 @@ function assemble(
       },
       zIndex: open ? 6 : 3,
     } as Edge);
+
     if (open) {
-      list.forEach((e, i) => rfEdges.push(perHostMirror(e, i, true)));
+      items.forEach((it) => it.list.forEach((e, i) => rfEdges.push(perHostMirror(e, i, true))));
     }
-  }
+  });
 
   singles.forEach((e, i) => rfEdges.push(perHostMirror(e, i)));
 
@@ -930,6 +983,14 @@ function GraphInner({
     const s = new Set<string>();
     if (hoverEdge?.startsWith("mirror-agg:")) {
       s.add(hoverEdge.slice("mirror-agg:".length));
+    }
+    if (hoverEdge?.startsWith("mirror-bus:")) {
+      const mon = hoverEdge.slice("mirror-bus:".length);
+      edges.forEach((e) => {
+        if (e.kind !== "mirror" || e.to !== mon) return;
+        if (!e.from.startsWith("host:")) return;
+        s.add(`${e.from.split(":")[1]}->${e.to}`);
+      });
     }
     if (hoverNode && monitorIds.has(hoverNode)) {
       edges.forEach((e) => {
