@@ -69,6 +69,8 @@ export const ROLE_LABEL: Record<string, string> = {
 type Data = {
   kind: TopoNode["kind"];
   label: string;
+  /** 主机所属网段：标题下第一行显示，三个 zone 的 gateway 才不会混 */
+  zone: string | null;
   role: string | null;
   ipv4: string | null;
   status: string | null;
@@ -120,7 +122,14 @@ const SIDE_POS: Record<string, Position> = {
   b: Position.Bottom,
 };
 
-/** 网口 chip：按 side 吸在节点边缘（略突出 8px），handle 就在突出点上。 */
+/** 网口 chip：按 side 吸在节点边缘（略突出 8px），handle 就在突出点上。
+ *
+ * **一个网口两个连接点**（用户要求）：
+ *   - main：正侧（左边口的正左、右边口的正右）——网络连线（uplink/inner）用它
+ *   - mirror：口的外上方角——镜像线用它
+ * 原因：主机/网关的内网口既跑网络流量、又可能被镜像；两条线锚在同一点
+ * 会完全重合，分不清谁是谁。分开之后 hover 也能单独点亮。
+ */
 function IfaceChip({ f, role }: { f: TopoIface; role: string | null }) {
   const side = sideOf(f, role);
   const tip = f.capture
@@ -209,7 +218,11 @@ function LabNode({ data }: NodeProps<GNode>) {
           <div className="tn-sub mono">{m("cidr") ?? "—"}</div>
           <div className="tn-sub tn-faint mono">
             {m("bridge")}
-            {m("gateway_host") ? ` · 网关 ${m("gateway_host")}` : ""}
+            {m("gateway_host")
+              ? ` · 网关 ${m("gateway_host")}`
+              : m("uplink_gw")
+                ? ` · 网关 ${m("uplink_gw")}`
+                : ""}
           </div>
         </div>
         <Handle
@@ -235,6 +248,7 @@ function LabNode({ data }: NodeProps<GNode>) {
           <span className="tn-chip">{ROLE_LABEL[data.role ?? ""] ?? data.role}</span>
         </div>
         <div className="tn-sub mono">
+          {data.zone && <span className="tn-zone">{data.zone} · </span>}
           {(data.ipv4 ?? "").replace(/\/\d+$/, "")}
           {typeof meta.memory === "number" && (
             <span className="tn-faint">
@@ -297,6 +311,18 @@ function LabNode({ data }: NodeProps<GNode>) {
             <IfaceChip key={f.name} f={f} role={data.role} />
           ))}
         </div>
+        {/* 镜像出点：被采集的流量从这里向下汇入采集总线。
+            为什么不挂在网口的角上：框内主机是横排的，左侧只有 16px 间隙，
+            角上出线会直接压进左邻主机（实测穿模 4 点）。底部留白 26px 足够。 */}
+        <Handle
+          type="source"
+          position={Position.Bottom}
+          id="s:b:mir"
+          style={{ left: "76%", bottom: -6, transform: "translate(-50%, 0)", opacity: 1 }}
+          title="镜像出点"
+        >
+          <span className="mir-dot" />
+        </Handle>
       </div>
     </>
   );
@@ -339,6 +365,7 @@ function LabEdge({
     exitX?: number;
     bus?: boolean;
     taps?: { sx: number; sy: number; x: number }[];
+    lane?: number;
   };
 
   // ── 采集总线：同一台监控机的 N 个被采网段合并成一条主干 ──
@@ -394,8 +421,11 @@ function LabEdge({
     push(targetX, targetY + stem);
     push(targetX, targetY);
   } else if (sourcePosition === Position.Right && targetPosition === Position.Left) {
-    // 跨列上联：走列间走廊（目标左缘再往左 28px 处必是空隙）
-    const mid = targetX > sourceX + 40 ? targetX - 28 : sourceX + stem;
+    // 跨列上联：走列间走廊（目标左缘再往左 28px 处必是空隙）。
+    // lane：同一个网段出去的多条上联线各占一条竖线，否则它们在走廊里
+    // **完全重合**——hover 只能选中压在上面那条，看起来像"线分叉"。
+    const lane = typeof d0.lane === "number" ? d0.lane : 0;
+    const mid = targetX > sourceX + 40 ? targetX - 28 - lane * 12 : sourceX + stem;
     push(mid, sourceY);
     push(mid, targetY);
     push(targetX, targetY);
@@ -649,6 +679,8 @@ function assemble(
   dimmed: Set<string>,
   /** 展开逐主机镜像线的网络（`zone->监控机`）；空 = 只画聚合主干 */
   expand: Set<string>,
+  /** 当前悬停的边：只点亮它、淡化其余线与无关节点 */
+  hoverEdge: string | null,
 ): { nodes: (GNode | GBox)[]; edges: Edge[] } {
   const uniq = uniqNodes(nodes);
   const zoneOf = (id: string) => (id.startsWith("net:") ? id.slice(4) : (id.split(":")[1] ?? ""));
@@ -668,31 +700,6 @@ function assemble(
     zIndex: -1,
     data: { label: b.label, cidr: b.cidr, hosts: b.hosts, external: b.external },
   }));
-
-  for (const n of uniq.values()) {
-    const d = DIM[n.kind] ?? DIM.host;
-    const p = layout.pos.get(n.id) ?? { x: 0, y: 0 };
-    rfNodes.push({
-      id: n.id,
-      type: "lab",
-      position: p,
-      data: {
-        kind: n.kind,
-        label: n.label,
-        role: n.role,
-        ipv4: n.ipv4,
-        status: n.status,
-        retired: n.retired,
-        vmidLabel: n.vmid ? `CT ${n.vmid}` : "",
-        meta: n.meta as Record<string, unknown>,
-        ifaces: n.ifaces ?? [],
-        selected: selected.has(n.id),
-        dimmed: dimmed.has(n.id),
-      },
-      width: d.w,
-      height: d.h,
-    });
-  }
 
   /** 某个节点上某块网口的 handle side（不在清单里就兜底左侧） */
   const sideOfOn = (nodeId: string, iface: string): string => {
@@ -721,19 +728,35 @@ function assemble(
   };
   const boxOfZone = new Map(layout.boxes.map((b) => [b.zone, b]));
 
+  // 同一网段出去的多条跨列上联线：按目标 y 排序分车道（走廊里平行分开）
+  const laneOf = new Map<string, number>();
+  {
+    const byFrom = new Map<string, TopoEdge[]>();
+    for (const e of edges) {
+      if (e.kind !== "attach" || e.port !== "uplink" || !e.from.startsWith("net:")) continue;
+      const arr = byFrom.get(e.from) ?? [];
+      arr.push(e);
+      byFrom.set(e.from, arr);
+    }
+    for (const arr of byFrom.values()) {
+      arr.sort((a, b) => (layout.pos.get(a.to)?.y ?? 0) - (layout.pos.get(b.to)?.y ?? 0));
+      arr.forEach((e, i) => laneOf.set(`${e.from}->${e.to}`, i));
+    }
+  }
+
   const rfEdges: Edge[] = [];
 
   /** 单条逐主机镜像线（源口 → 监控机抓包口）。聚合主干展开时才画。
    * forceHot：从展开的主干来的线直接高亮。 */
   const perHostMirror = (e: TopoEdge, i: number, forceHot = false): Edge => {
     const id = `${e.kind}:${e.from}->${e.to}:${i}`;
-    const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "l";
     const ts = e.target_iface ? sideOfOn(e.to, e.target_iface) : "b";
     return {
       id,
       source: e.from,
       target: e.to,
-      sourceHandle: handleId("s", ss, e.source_iface ?? "eth0"),
+      // 镜像线走**底部镜像点**：网络连线占网口正侧，两者完全分开
+      sourceHandle: "s:b:mir",
       targetHandle: handleId("t", ts, e.target_iface ?? "eth1"),
       type: "lab",
       data: {
@@ -744,6 +767,9 @@ function assemble(
           20,
         sameBox: inSameBox(e),
         label: "",
+        from: e.from,
+        to: e.to,
+        tip: `镜像 ${e.from.split(":").slice(1).join(":")}:${e.source_iface ?? "?"} → ${e.to.split(":").slice(1).join(":")}:${e.target_iface ?? "?"}`,
       },
       ...mirrorSpec(forceHot || hotMirror.has(id)),
     } as Edge;
@@ -816,6 +842,9 @@ function assemble(
         corridorY: laneY,
         taps,
         label: open ? `采集 ${items.length} 个网段 · ${totalHosts} 台` : "",
+        from: `net:${items[0].zone}`,
+        to: mon,
+        tip: `采集总线 → ${mon.split(":").slice(1).join(":")}（${items.length} 网段 · ${totalHosts} 台）`,
       },
       style: {
         stroke: "#f59e0b",
@@ -852,7 +881,16 @@ function assemble(
       sourceHandle: srcHandle(e),
       targetHandle: tgtHandle(e),
       type: "lab",
-      data: { sameBox: inSameBox(e), label: "" },
+      data: {
+        sameBox: inSameBox(e),
+        lane: laneOf.get(`${e.from}->${e.to}`) ?? 0,
+        label: "",
+        from: e.from,
+        to: e.to,
+        tip: `${e.from.split(":").slice(1).join(":")}${e.source_iface ? ":" + e.source_iface : ""} → ${
+          e.to.split(":").slice(1).join(":")
+        }${e.target_iface ? ":" + e.target_iface : ""}${e.port === "uplink" ? "（上联）" : ""}`,
+      },
       style: { stroke: spec.stroke, strokeWidth: spec.strokeWidth },
       markerEnd: spec.marker
         ? { type: MarkerType.ArrowClosed, color: spec.stroke, width: 14, height: 14 }
@@ -861,7 +899,58 @@ function assemble(
     } as Edge);
   }
 
-  return { nodes: rfNodes, edges: rfEdges };
+  // ── 悬停聚焦：点亮这一条、压暗其余，并显示它的接口标签 ──
+  const focused = hoverEdge ? rfEdges.map((e) => {
+    const foc = e.id === hoverEdge;
+    const d = (e.data ?? {}) as { tip?: string };
+    return {
+      ...e,
+      style: {
+        ...(e.style ?? {}),
+        opacity: foc ? 1 : 0.06,
+        strokeWidth: foc ? 2.6 : (e.style as { strokeWidth?: number })?.strokeWidth,
+      },
+      zIndex: foc ? 999 : e.zIndex,
+      data: foc && !(e.data as { label?: string })?.label ? { ...e.data, label: d.tip ?? "" } : e.data,
+    } as Edge;
+  }) : rfEdges;
+
+  // 节点：悬停某条线时只保留它的两端（其余淡化），否则沿用 hover 监控机的淡化
+  const keep = new Set<string>();
+  if (hoverEdge) {
+    const e = focused.find((x) => x.id === hoverEdge);
+    const d = (e?.data ?? {}) as { from?: string; to?: string };
+    if (d.from) keep.add(d.from);
+    if (d.to) keep.add(d.to);
+  }
+  const rfAll: (GNode | GBox)[] = [...rfNodes];
+  for (const n of uniq.values()) {
+    const d = DIM[n.kind] ?? DIM.host;
+    const p = layout.pos.get(n.id) ?? { x: 0, y: 0 };
+    rfAll.push({
+      id: n.id,
+      type: "lab",
+      position: p,
+      data: {
+        kind: n.kind,
+        label: n.label,
+        zone: n.zone ?? null,
+        role: n.role,
+        ipv4: n.ipv4,
+        status: n.status,
+        retired: n.retired,
+        vmidLabel: n.vmid ? `CT ${n.vmid}` : "",
+        meta: n.meta as Record<string, unknown>,
+        ifaces: n.ifaces ?? [],
+        selected: selected.has(n.id),
+        dimmed: hoverEdge ? !keep.has(n.id) : dimmed.has(n.id),
+      },
+      width: d.w,
+      height: d.h,
+    });
+  }
+
+  return { nodes: rfAll, edges: focused };
 }
 
 function GraphInner({
@@ -1003,8 +1092,8 @@ function GraphInner({
   }, [hoverEdge, hoverNode, monitorIds, edges]);
 
   const built = useMemo(
-    () => assemble(nodes, edges, layout, sel, hotMirror, dimmed, expand),
-    [nodes, edges, layout, sel, hotMirror, dimmed, expand],
+    () => assemble(nodes, edges, layout, sel, hotMirror, dimmed, expand, hoverEdge),
+    [nodes, edges, layout, sel, hotMirror, dimmed, expand, hoverEdge],
   );
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode | GBox>([]);

@@ -147,6 +147,8 @@ export default function SpecVisual({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [zoneOpen, setZoneOpen] = useState(false);
+  /** 添加网络时预填的网段：打开对话框时按现有网段算出下一个空的 */
+  const [zoneDefaultV4, setZoneDefaultV4] = useState("10.10.1.0/24");
   const [hostFor, setHostFor] = useState<string | null>(null);
   /** 数据盘编辑器：正在给哪台主机配盘 */
   const [diskFor, setDiskFor] = useState<{ zn: string; host: string } | null>(null);
@@ -224,6 +226,15 @@ export default function SpecVisual({
       .specModel(name)
       .then((r) => setModel((r.model ?? {}) as Model))
       .finally(() => setBusy(false));
+  };
+
+  /** 下一个可用网段：取现有 10.<x>.* 里最大的 x + 1，默认 10.x.1.0/24。
+   * 添加网络时预填，省得每次手写还撞段。 */
+  const nextV4 = () => {
+    const xs = Object.values(zones)
+      .map((z) => Number((z.v4 ?? "").split(".")[1] ?? 0))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    return `10.${xs.length ? Math.max(...xs) + 1 : 10}.1.0/24`;
   };
 
   const patchZone = (zn: string, p: Partial<ZoneM>) =>
@@ -552,7 +563,7 @@ export default function SpecVisual({
                   />
                 </Field>
               </Col>
-              <Col span={9}>
+              <Col span={6}>
                 <Field label="网段（CIDR）">
                   <Input
                     size="small"
@@ -563,7 +574,26 @@ export default function SpecVisual({
                   />
                 </Field>
               </Col>
-              <Col span={7}>
+              <Col span={6}>
+                <Field label="IPv6">
+                  <Tooltip title="auto = 从网段名派生 ULA 前缀（同一份规格每次一样）；off = 不开；也可以直接写 fd00:1234::/64 这样的固定前缀。网关脚本会同时下发 IPv6 地址与转发。">
+                    <Input
+                      size="small"
+                      className="mono"
+                      placeholder="auto / off / fd00:1::/64"
+                      value={
+                        z.v6 === true
+                          ? "auto"
+                          : z.v6 === false
+                            ? "off"
+                            : (z.v6 ?? "auto")
+                      }
+                      onChange={(e) => patchZone(zn, { v6: e.target.value })}
+                    />
+                  </Tooltip>
+                </Field>
+              </Col>
+              <Col span={4}>
                 <Field label="出网">
                   <Tooltip title="本网段的主机能否访问上游/外网。开 = 网关转发 + NAT 一起生效；关 = 立即断外网。高级场景（上游已手动路由整段、只想去掉 NAT）请改 YAML 里的 nat 字段。">
                     <Switch
@@ -890,7 +920,14 @@ export default function SpecVisual({
       })}
 
       <Space>
-        <Button size="small" icon={<PlusOutlined />} onClick={() => setZoneOpen(true)}>
+        <Button
+          size="small"
+          icon={<PlusOutlined />}
+          onClick={() => {
+            setZoneDefaultV4(nextV4());
+            setZoneOpen(true);
+          }}
+        >
           添加网络
         </Button>
         <Button
@@ -1055,7 +1092,7 @@ export default function SpecVisual({
           form={zoneForm}
           layout="vertical"
           preserve={false}
-          onFinish={(v: { name: string; uplink: string; v4: string }) => {
+          onFinish={(v: { name: string; uplink: string; v4: string; v6?: string }) => {
             if (zones[v.name]) {
               message.error(`网络 ${v.name} 已存在`);
               return;
@@ -1067,6 +1104,7 @@ export default function SpecVisual({
                 [v.name]: {
                   uplink: v.uplink,
                   v4: v.v4,
+                  v6: v.v6 || "auto",
                   hosts: { gateway: { role: "gateway" } },
                 },
               },
@@ -1099,9 +1137,13 @@ export default function SpecVisual({
           <Form.Item
             name="v4"
             label="网段"
+            initialValue={zoneDefaultV4}
             rules={[{ required: true, message: "写一个 CIDR，例如 10.30.1.0/24" }]}
           >
             <Input placeholder="10.30.1.0/24" className="mono" />
+          </Form.Item>
+          <Form.Item name="v6" label="IPv6" initialValue="auto">
+            <Input placeholder="auto / off / fd00:1::/64" className="mono" />
           </Form.Item>
           <Text type="secondary" style={{ fontSize: 12 }}>
             会自动加一台 <code>gateway</code> 主机；其余主机在里面加。

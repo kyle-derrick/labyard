@@ -40,6 +40,7 @@ import {
   ThunderboltOutlined,
 } from "@ant-design/icons";
 import TopologyGraph, { ROLE_LABEL } from "./TopologyGraph";
+import { HostConfigEditor, type ConfigTarget } from "./HostConfig";
 import { api, terminalUrl, vpnClientUrl, type GatewayStatus, type MirrorRow, type ReconcileInfo, type TopoEdge, type TopoNode } from "./api";
 
 const { Text } = Typography;
@@ -59,6 +60,8 @@ export default function TopologyPage() {
   const qc = useQueryClient();
   const [spec, setSpec] = useState<string | undefined>(undefined);
   const [picked, setPicked] = useState<TopoNode | null>(null);
+  /** 正在编辑配置的主机（null = 弹窗关闭） */
+  const [cfg, setCfg] = useState<ConfigTarget | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [busy, setBusy] = useState(false);
@@ -600,6 +603,22 @@ export default function TopologyPage() {
               >
                 打开终端
               </Button>
+              <Button
+                size="small"
+                onClick={() =>
+                  setCfg({
+                    spec: String((detail.meta as Record<string, unknown>).spec ?? ""),
+                    zone: detail.zone!,
+                    host: detail.label,
+                    cores: Number((detail.meta as Record<string, unknown>).cores ?? 0) || undefined,
+                    memory: Number((detail.meta as Record<string, unknown>).memory ?? 0) || undefined,
+                    disk: Number((detail.meta as Record<string, unknown>).disk ?? 0) || undefined,
+                  })
+                }
+                disabled={!detail.vmid}
+              >
+                改配置
+              </Button>
             </Space>
 
             <Space wrap>
@@ -633,6 +652,8 @@ export default function TopologyPage() {
           </Space>
         )}
       </Drawer>
+
+      <HostConfigEditor target={cfg} onClose={() => setCfg(null)} />
 
       <Modal
         open={pubOpen}

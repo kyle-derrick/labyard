@@ -298,6 +298,188 @@ pub async fn put_model(
 }
 
 #[derive(Deserialize)]
+pub struct HostPatchBody {
+    #[serde(default)]
+    pub cores: Option<u32>,
+    #[serde(default)]
+    pub memory: Option<u32>,
+    #[serde(default)]
+    pub disk: Option<u32>,
+}
+
+/// **行级**改主机的 CPU/内存/磁盘，不动 YAML 其余部分。
+///
+/// 为什么不用 `put_model`：那条路会把整份 YAML 重新序列化——用户手写的
+/// 注释、字段顺序、`v6: auto   # 说明` 这种行尾注释全部丢失（实测一次
+/// 保存后注释数从若干变成 0）。这个接口只替换/插入目标 host 块里的
+/// 三个标量键，其余文本逐字节保留。
+///
+/// 找不到目标块（inline 写法 `gw: { role: gateway }` 等）时返回 409，
+/// 前端据此提示用户去编排页改。
+pub async fn patch_host_config(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((name, zone, host)): Path<(String, String, String)>,
+    Json(body): Json<HostPatchBody>,
+) -> Response {
+    render((|| {
+        authed(&state, &headers)?;
+        let dir = spec_dir(&state);
+        let Some(text) = specs::read(&dir, &name).map_err(bad)? else {
+            return Err(err(StatusCode::NOT_FOUND, "规格不存在"));
+        };
+        let Some(patched) = patch_yaml_host(&text, &zone, &host, &body) else {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "这个主机在 YAML 里是单行写法，没法安全地改字段——去编排页改",
+            ));
+        };
+        // 与 put_model 同样的安全网：先解析、再展开，任何一步失败都不落盘
+        let sp = Spec::parse(&patched).map_err(bad)?;
+        sp.resolve_all(&state.cfg.pve.wan_bridge).map_err(bad)?;
+        specs::write(&dir, &name, &patched).map_err(bad)?;
+        Ok(Json(serde_json::json!({ "ok": true, "yaml": patched })))
+    })())
+}
+
+/// 在 YAML 文本里定位 `zones: > <zone>: > hosts: > <host>:` 块，替换/插入
+/// cores / memory / disk。块内没有的键按 host 子键缩进插入到块首。
+/// 找不到返回 None（调用方据此回退成"去编排页改"）。
+pub fn patch_yaml_host(yaml: &str, zone: &str, host: &str, body: &HostPatchBody) -> Option<String> {
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let is_blank = |l: &str| {
+        let t = l.trim();
+        t.is_empty() || t.starts_with('#')
+    };
+    let lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+
+    // 逐级找块：zones(0) → zone(2) → hosts(4) → host(6)。
+    // 缩进不写死：先找到 `zones:` 的缩进 z0，之后各级 = 上次 + 2。
+    let mut zones_i = None;
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim() == "zones:" {
+            zones_i = Some(i);
+            break;
+        }
+    }
+    let zi = zones_i?;
+    let z0 = indent_of(&lines[zi]);
+
+    let mut zone_i = None;
+    let zone_indent = z0 + 2;
+    for i in (zi + 1)..lines.len() {
+        let l = &lines[i];
+        if is_blank(l) {
+            continue;
+        }
+        if indent_of(l) <= z0 {
+            break; // 出了 zones 块
+        }
+        if indent_of(l) == zone_indent && l.trim() == format!("{zone}:") {
+            zone_i = Some(i);
+            break;
+        }
+    }
+    let zzi = zone_i?;
+
+    let mut hosts_i = None;
+    let hosts_indent = zone_indent + 2;
+    for i in (zzi + 1)..lines.len() {
+        let l = &lines[i];
+        if is_blank(l) {
+            continue;
+        }
+        if indent_of(l) <= zone_indent {
+            break;
+        }
+        if indent_of(l) == hosts_indent && l.trim() == "hosts:" {
+            hosts_i = Some(i);
+            break;
+        }
+    }
+    let hi = hosts_i?;
+
+    let mut host_i = None;
+    let host_indent = hosts_indent + 2;
+    for i in (hi + 1)..lines.len() {
+        let l = &lines[i];
+        if is_blank(l) {
+            continue;
+        }
+        if indent_of(l) <= hosts_indent {
+            break;
+        }
+        if indent_of(l) == host_indent && l.trim() == format!("{host}:") {
+            host_i = Some(i);
+            break;
+        }
+        // 单行映射写法：`gw: { role: gateway }` —— 不碰，交给上层报 409
+        if indent_of(l) == host_indent && l.trim_start().starts_with(&format!("{host}:")) {
+            return None;
+        }
+    }
+    let hhi = host_i?;
+
+    // host 块：到下一个缩进 <= host_indent 的非空行为止
+    let mut end = lines.len();
+    for i in (hhi + 1)..lines.len() {
+        let l = &lines[i];
+        if is_blank(l) {
+            continue;
+        }
+        if indent_of(l) <= host_indent {
+            end = i;
+            break;
+        }
+    }
+    let field_indent = host_indent + 2;
+    let pad = " ".repeat(field_indent);
+
+    let mut out: Vec<String> = lines[..=hhi].to_vec();
+    let mut filled: Vec<&str> = Vec::new();
+    for l in &lines[(hhi + 1)..end] {
+        let t = l.trim_start();
+        let mut replaced = None;
+        for (k, v) in [
+            ("cores", body.cores),
+            ("memory", body.memory),
+            ("disk", body.disk),
+        ] {
+            if let Some(v) = v {
+                if t.starts_with(&format!("{k}:")) && indent_of(l) == field_indent {
+                    filled.push(k);
+                    replaced = Some(format!("{pad}{k}: {v}"));
+                }
+            }
+        }
+        out.push(replaced.unwrap_or_else(|| l.clone()));
+    }
+    // 新键插到块首（紧跟 host: 行），顺序固定 cores/memory/disk
+    let mut insert: Vec<String> = Vec::new();
+    if let Some(v) = body.cores {
+        if !filled.contains(&"cores") {
+            insert.push(format!("{pad}cores: {v}"));
+        }
+    }
+    if let Some(v) = body.memory {
+        if !filled.contains(&"memory") {
+            insert.push(format!("{pad}memory: {v}"));
+        }
+    }
+    if let Some(v) = body.disk {
+        if !filled.contains(&"disk") {
+            insert.push(format!("{pad}disk: {v}"));
+        }
+    }
+    let mut final_out: Vec<String> = out[..=hhi].to_vec();
+    final_out.extend(insert);
+    final_out.extend(out[(hhi + 1)..].iter().cloned());
+    final_out.extend(lines[end..].iter().cloned());
+
+    Some(final_out.join("\n") + "\n")
+}
+
+#[derive(Deserialize)]
 pub struct SpecBody {
     pub yaml: String,
 }
@@ -961,8 +1143,16 @@ pub async fn topology_view(
                 .and_then(|r| r.status.clone())
         };
         let retired_fn = |z: &str, h: &str| state.db.is_retired(z, h);
+        // wan 是宿主外网桥：网段与网关直接读宿主，界面上不再是 "--"
+        let (wan_cidr, wan_gw) = state
+            .pve
+            .wan_addressing(&state.cfg.pve.wan_bridge, &CancellationToken::new())
+            .await
+            .unwrap_or((None, None));
         let st = crate::api::topology::State {
             wan_bridge: &state.cfg.pve.wan_bridge,
+            wan_cidr: wan_cidr.as_deref(),
+            wan_gw: wan_gw.as_deref(),
             status: &status_fn,
             retired: &retired_fn,
         };
@@ -1533,6 +1723,41 @@ pub async fn catalog(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const YAML: &str = "defaults:\n  cores: 1\n  template: debian-12-standard\n  storage: local-lvm\nzones:\n  lab:\n    uplink: wan\n    v4: 10.77.0.0/24\n    hosts:\n      gw:\n        role: gateway\n      t1:\n        role: server\n        # 手写注释\n        ip: 20\n        memory: 256\n      w1:\n        role: server\n        ip: 21\n";
+
+    fn body(cores: Option<u32>, memory: Option<u32>, disk: Option<u32>) -> HostPatchBody {
+        HostPatchBody { cores, memory, disk }
+    }
+
+    #[test]
+    fn patch_host_replaces_existing_keys_only() {
+        let out = patch_yaml_host(YAML, "lab", "t1", &body(Some(2), Some(512), None)).unwrap();
+        assert!(out.contains("cores: 2"), "新键应插入到 t1 块");
+        assert!(out.contains("memory: 512"), "已有键应被替换");
+        assert!(out.contains("# 手写注释"), "注释必须保留");
+        assert!(out.contains("ip: 20"), "其他字段不动");
+        // 邻居不受影响
+        assert!(out.contains("      w1:\n        role: server\n        ip: 21"));
+        // 仍能被解析
+        let parsed = crate::core::spec::Spec::parse(&out);
+        assert!(parsed.is_ok(), "输出:\n{out}\n错误: {:?}", parsed.err());
+    }
+
+    #[test]
+    fn patch_host_refuses_inline_mapping() {
+        let y = "zones:\n  lab:\n    hosts:\n      gw: { role: gateway }\n";
+        assert!(patch_yaml_host(y, "lab", "gw", &body(Some(2), None, None)).is_none());
+    }
+
+    #[test]
+    fn patch_host_missing_zone_or_host_is_none() {
+        assert!(patch_yaml_host(YAML, "nope", "t1", &body(Some(2), None, None)).is_none());
+        assert!(patch_yaml_host(YAML, "lab", "nope", &body(Some(2), None, None)).is_none());
+    }
+
+
     use super::*;
 
     #[test]

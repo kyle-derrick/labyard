@@ -100,6 +100,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(ops::get_model).put(ops::put_model),
         )
         .route("/api/specs/{name}/zones", post(ops::add_zone))
+        // 主机资源改配：行级编辑，保住 YAML 里的注释与顺序
+        .route(
+            "/api/specs/{name}/hosts/{zone}/{host}",
+            axum::routing::patch(ops::patch_host_config),
+        )
         .route(
             "/api/specs/{name}/zones/{z}",
             get(ops::get_zone)
@@ -2038,6 +2043,13 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
         ("put", "按结构化视图保存，生成 YAML 并校验"),
     ]),
     ("/api/specs/{name}/zones", &[("post", "新增一个 zone")]),
+    (
+        "/api/specs/{name}/hosts/{zone}/{host}",
+        &[(
+            "patch",
+            "改主机 CPU/内存/系统盘：按行编辑 YAML，注释与字段顺序原样保留",
+        )],
+    ),
     ("/api/specs/{name}/zones/{z}", &[
         ("get", "取 zone 片段（编辑框的种子）"),
         ("put", "用片段替换整个 zone"),

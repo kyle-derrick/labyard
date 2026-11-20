@@ -43,10 +43,12 @@ import {
   ReloadOutlined,
   SafetyOutlined,
   SearchOutlined,
+  SettingOutlined,
   SyncOutlined,
   UndoOutlined,
 } from "@ant-design/icons";
 import { api, terminalUrl, type HostRow } from "./api";
+import { HostConfigEditor, type ConfigTarget } from "./HostConfig";
 import GatewayPanel from "./Gateway";
 
 const { Text } = Typography;
@@ -250,6 +252,7 @@ export default function Hosts() {
   const [term, setTerm] = useState<{ zone: string; host: string } | null>(null);
   const [snap, setSnap] = useState<{ zone: string; host: string } | null>(null);
   const [gw, setGw] = useState<string | null>(null);
+  const [cfg, setCfg] = useState<ConfigTarget | null>(null);
   const [destroyZone, setDestroyZone] = useState<string | null>(null);
   const [confirmName, setConfirmName] = useState("");
   const [selected, setSelected] = useState<Key[]>([]);
@@ -639,6 +642,16 @@ export default function Hosts() {
               onClick={() => setTerm({ zone: r.zone, host: r.host })}
             >
               终端
+            </Button>
+          </Tooltip>
+          <Tooltip title="改 CPU / 内存 / 系统盘（写回规格，执行后生效）">
+            <Button
+              size="small"
+              icon={<SettingOutlined />}
+              disabled={!r.exists || r.retired || !r.spec}
+              onClick={() => setCfg({ spec: r.spec!, zone: r.zone, host: r.host })}
+            >
+              配置
             </Button>
           </Tooltip>
           <Tooltip title="快照：创建 / 回滚 / 删除">
@@ -1308,6 +1321,8 @@ export default function Hosts() {
           {snapBatch?.map((r) => `${r.zone}/${r.host}`).join("、")}
         </Text>
       </Modal>
+
+      <HostConfigEditor target={cfg} onClose={() => setCfg(null)} />
     </>
   );
 }

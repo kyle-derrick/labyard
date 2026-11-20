@@ -614,3 +614,20 @@ body {
   white-space: nowrap;
   pointer-events: none;
 }
+
+/* 主机卡：网段前缀（三个 zone 都叫 gateway 时靠它区分） */
+.tn-zone {
+  color: #64748b;
+  font-weight: 600;
+}
+
+/* 主机底部镜像出点：被采流量从这个橙点向下汇入总线 */
+.mir-dot {
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1px solid #f59e0b;
+  background: #fffbeb;
+  box-sizing: border-box;
+}

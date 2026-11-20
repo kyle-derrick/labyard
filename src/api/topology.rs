@@ -77,6 +77,9 @@ pub struct Edge {
 
 pub struct State<'a> {
     pub wan_bridge: &'a str,
+    /// wan 桥（宿主 vmbr0）的网段与默认网关——"只读"不等于"只能看 --"
+    pub wan_cidr: Option<&'a str>,
+    pub wan_gw: Option<&'a str>,
     /// vmid → PVE 状态（running/stopped）；查不到就是 None
     pub status: &'a dyn Fn(u32) -> Option<String>,
     pub retired: &'a dyn Fn(&str, &str) -> bool,
@@ -99,7 +102,8 @@ pub fn build(specs: &[(String, ResolvedSpec)], st: &State) -> (Vec<Node>, Vec<Ed
         meta: serde_json::json!({
             "bridge": st.wan_bridge,
             "external": true,
-            "cidr": null,
+            "cidr": st.wan_cidr,
+            "uplink_gw": st.wan_gw,
         }),
         ifaces: Vec::new(),
     });
@@ -334,6 +338,8 @@ zones:
         let s = spec();
         let st = State {
             wan_bridge: "vmbr0",
+            wan_cidr: Some("192.168.33.0/24"),
+            wan_gw: Some("192.168.33.1"),
             status: &|v| if v == 100 { Some("running".into()) } else { None },
             retired: &|_z, h| h == "web",
         };
@@ -425,6 +431,8 @@ zones:
         let s = Spec::parse(y).unwrap().resolve_all("vmbr0").unwrap();
         let st = State {
             wan_bridge: "vmbr0",
+            wan_cidr: Some("192.168.33.0/24"),
+            wan_gw: Some("192.168.33.1"),
             status: &|_| None,
             retired: &|_, _| false,
         };

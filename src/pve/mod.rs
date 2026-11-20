@@ -664,6 +664,64 @@ done"#;
             .collect())
     }
 
+    /// 外网桥的基本信息：宿主在这张桥上的地址（转成网段）+ 默认路由网关。
+    ///
+    /// wan 在面板上"只读"，但不该是一排 `--`：它的网段和网关就是宿主
+    /// `vmbr0` 的地址，直接读出来展示即可（不走 PVE API，一条 ip 命令）。
+    pub async fn wan_addressing(
+        &self,
+        bridge: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(Option<String>, Option<String>), PveError> {
+        let script = format!(
+            r#"b={bridge}
+ip=$(ip -4 -o addr show dev "$b" 2>/dev/null | awk '{{print $4}}' | head -1)
+gw=$(ip -4 route show default dev "$b" 2>/dev/null | awk '/via/{{print $3; exit}}')
+[ -z "$gw" ] && gw=$(ip -4 route show default 2>/dev/null | awk '/via/{{print $3; exit}}')
+printf '%s|%s
+' "$ip" "$gw""#
+        );
+        let out = self
+            .runner
+            .run(
+                "probe:wan-addressing",
+                &CommandSpec::new("sh", vec!["-c", script.as_str()]),
+                None,
+                cancel,
+                true,
+            )
+            .await?;
+        let line = out.stdout.lines().next().unwrap_or("");
+        let mut it = line.trim().split('|');
+        let ip = it.next().unwrap_or("").trim().to_string();
+        let gw = it.next().unwrap_or("").trim().to_string();
+        // `192.168.33.222/24` → 网段 `192.168.33.0/24`
+        let cidr = ip.split_once('/').and_then(|(addr, plen)| {
+            let octets: Vec<&str> = addr.split('.').collect();
+            let plen: u32 = plen.parse().ok()?;
+            if octets.len() != 4 {
+                return None;
+            }
+            let n: u32 = octets
+                .iter()
+                .try_fold(0u32, |acc, o| o.parse::<u32>().ok().map(|v| (acc << 8) | v))?;
+            let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+            let net = n & mask;
+            Some(format!(
+                "{}.{}.{}.{}/{}",
+                (net >> 24) & 255,
+                (net >> 16) & 255,
+                (net >> 8) & 255,
+                net & 255,
+                plen
+            ))
+        });
+        Ok((
+            cidr,
+            if gw.is_empty() { None } else { Some(gw) },
+        ))
+    }
+
     /// 内核实际生效面：`ip -o link show type bridge`。桥的本质是内核接口，
     /// /etc/network/interfaces 只是持久化——"存在不存在"看这里才不会说谎。
     pub async fn kernel_bridges(&self, cancel: &CancellationToken) -> Result<Vec<String>, PveError> {
@@ -1145,6 +1203,14 @@ fi
                 )
                 .await?;
 
+                // 磁盘：规格改大就扩容（PVE 不支持缩盘，改小静默不生效）。
+                // 不做这一步，界面上改完磁盘"保存成功"，实际容量一点没变。
+                if let Some(cur) = self.ct_rootfs_gb(vmid, cancel).await {
+                    if disk > cur {
+                        self.ct_resize_rootfs(vmid, disk - cur, cancel).await?;
+                    }
+                }
+
                 // 停着的容器必须拉起来。`--start` 只对新建生效，
                 // 手工 `pct stop` 过的容器如果这里不管，后面 `pct exec` 会全部失败。
                 if row.status.as_deref() != Some("running") {
@@ -1168,6 +1234,57 @@ fi
                 }
             }
         }
+        Ok(())
+    }
+
+    /// rootfs 当前大小（GB）。读不到就 None（不猜）。
+    pub async fn ct_rootfs_gb(&self, vmid: u32, cancel: &CancellationToken) -> Option<u32> {
+        let out = self
+            .cmd(
+                "ct-config",
+                CommandSpec::new("pct", vec!["config".into(), vmid.to_string()]),
+                cancel,
+            )
+            .await
+            .ok()?;
+        let line = out.stdout.lines().find(|l| l.trim_start().starts_with("rootfs:"))?;
+        let size = line.split("size=").nth(1)?;
+        let s = size.split(',').next()?.trim();
+        let up = s.to_ascii_uppercase();
+        let num: u32 = s
+            .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+            .parse()
+            .ok()?;
+        if up.ends_with('M') {
+            Some((num / 1024).max(1))
+        } else {
+            Some(num)
+        }
+    }
+
+    /// 扩 rootfs。**PVE 只支持加，不支持缩**——缩盘要让用户自己整盘搬迁，
+    /// 界面上写清楚"只增不减"，改小就当没改（返回 false）。
+    pub async fn ct_resize_rootfs(
+        &self,
+        vmid: u32,
+        delta_gb: u32,
+        cancel: &CancellationToken,
+    ) -> Result<(), PveError> {
+        self.cmd(
+            "ct-resize",
+            CommandSpec::new(
+                "pct",
+                vec![
+                    "resize".into(),
+                    vmid.to_string(),
+                    "rootfs".into(),
+                    format!("+{delta_gb}G"),
+                ],
+            )
+            .with_timeout(Duration::from_secs(180)),
+            cancel,
+        )
+        .await?;
         Ok(())
     }
 

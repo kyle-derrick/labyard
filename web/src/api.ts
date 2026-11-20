@@ -226,6 +226,18 @@ export const api = {
       { method: "DELETE" },
     ),
 
+  /** 主机资源改配：后端按行编辑 YAML，注释与排版原样保留。 */
+  patchHostConfig: (
+    spec: string,
+    zone: string,
+    host: string,
+    body: { cores?: number; memory?: number; disk?: number },
+  ) =>
+    req<{ ok: boolean; yaml: string }>(
+      `/api/specs/${encodeURIComponent(spec)}/hosts/${encodeURIComponent(zone)}/${encodeURIComponent(host)}`,
+      { method: "PATCH", body: JSON.stringify(body) },
+    ),
+
   /** 结构化视图：可视化编排读它，保存也走它（后端负责 JSON ↔ YAML）。 */
   specModel: (name: string) =>
     req<{ exists: boolean; model: unknown; yaml: string | null; name: string }>(
