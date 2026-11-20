@@ -451,8 +451,12 @@ export default function TopologyPage() {
             外网
           </span>
           <span className="lg">
-            <b style={{ background: "#faf5ff", borderColor: "#a78bfa", borderStyle: "dashed" }} />
+            <b style={{ background: "#faf5ff", borderColor: "#a78bfa" }} />
             内网（zone）
+          </span>
+          <span className="lg">
+            <b style={{ background: "#fafbfd", borderColor: "#d7dee9", borderStyle: "dashed" }} />
+            网段框（一层=一个网段）
           </span>
           <span className="lg">
             <b style={{ background: "#f0fdf4", borderColor: "#16a34a" }} />

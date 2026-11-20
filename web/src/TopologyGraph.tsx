@@ -1,22 +1,25 @@
 /** 全局拓扑图：react-flow 只负责画，语义全在后端。
  *
- * 后端给的是两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
- * 方向都是数据流方向。这里做四件事：
- *   1. **一列一个 zone** 的手工分层布局（见 `layoutPositions`）：左列上游、
- *      右列下游，列内从上到下是"网段 → 网关 → 监控机 → 主机"。
- *      不靠自动布局：层级算法把网段节点当普通节点排，一条链路能撑开三四列。
- *   2. **网口分侧**：外网口贴左缘、内网口贴右缘、抓包口贴下缘，均略突出
- *      节点框——线从哪个口进出一眼可见。路径交给 React Flow 按 handle 现算
- *      （smoothstep），拖节点时线跟着走。
- *   3. 拖动不闪：数据轮询重建节点时**保留 RF 内部当前位置**，只换数据；
- *      拖动位置由 React Flow 自己管理，不经过重建路径。
- *   4. 接住点击、多选、右键，交给页面去开抽屉 / 弹菜单。
+ * 后端给两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
+ * 方向都是数据流方向。前端做四件事：
+ *   1. **一列一网段 + 区域框**（见 `layoutPositions`）：深度=列，每个 zone
+ *      一块带标题的框，框内"网段卡在上、主机横排在下"——同一网段的全部
+ *      节点永远在同一层、同一框里。
+ *   2. **网口分侧**：外网口贴左缘、内网口贴右缘、抓包口贴下缘，略突出
+ *      节点框。路径由自定义边 `LabEdge` 按 handle 朝向现算：跨列走列间
+ *      走廊、长镜像线走画布底部走廊，全图零穿节点（内置 smoothstep 不
+ *      避障，实测会穿 13 处）。
+ *   3. 拖动不闪：数据轮询重建节点时保留 RF 内部当前位置，只换数据；
+ *      拖动时边端点跟着 handle 走。
+ *   4. 接住点击、多选、右键，交给页面开抽屉 / 弹菜单。
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   BackgroundVariant,
+  BaseEdge,
   Controls,
+  EdgeLabelRenderer,
   Handle,
   MarkerType,
   MiniMap,
@@ -27,17 +30,31 @@ import {
   useNodesState,
   useReactFlow,
   type Edge,
+  type EdgeProps,
   type Node,
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import type { TopoEdge, TopoIface, TopoNode } from "./api";
 
-/** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。
- * host 高度含底部的抓包口 chip 行；左右缘的网口 chip 是突出的，不算宽。 */
+/** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。 */
 const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
-  network: { w: 190, h: 70 },
-  host: { w: 200, h: 118 },
+  network: { w: 176, h: 60 },
+  host: { w: 172, h: 92 },
+};
+
+/** 区域框（一个网段一个）与列间距。框把"同网段的全部节点"圈在一起，
+ * 一眼就能看出"这个网对应的层"。 */
+const ZONE = {
+  pad: 12, // 框内左右边距
+  // 框底留白要容下**抓包口 chip**：chip 在卡片下缘再突出 9px、自身高 14px，
+  // 一共占卡片下方约 23px。留 26 才不至于让 chip 压住区域框的虚线边。
+  padBottom: 26,
+  head: 24, // 框标题条高
+  gap: 10, // 框标题 / 网段卡 / 主机行之间的纵向间距
+  colGap: 44, // 相邻两列（框）之间的走廊宽度——所有跨列线都走这里
+  rowGap: 18, // 同列上下两个框的间距
+  hostGap: 16, // 框内主机横排间距（网口 chip 比卡边还突出 ~17px，不能小于 16）
 };
 
 export const ROLE_LABEL: Record<string, string> = {
@@ -65,6 +82,14 @@ type Data = {
 };
 
 type GNode = Node<Data, "lab">;
+
+type BoxData = {
+  label: string;
+  cidr: string;
+  hosts: number;
+  external: boolean;
+};
+type GBox = Node<BoxData, "zonebox">;
 
 /** 网口在哪一侧。约定：**左为入、右为出、下为镜像**。
  *
@@ -146,12 +171,25 @@ function LabNode({ data }: NodeProps<GNode>) {
     .join(" ");
 
   if (data.kind !== "host") {
-    // 网络节点（以及兜底）：左收右发；底部留一个镜像聚合主干的出向
-    // handle（"整网采集"的线从网段底部出，贴画布下缘走，不与主流向交叉）
+    // 网络节点（以及兜底）：左收右发；**底部**是"下挂主机"的出点
+    // （网段卡在上、主机横排在下，线垂直向下接入每台主机，不掉头）
     return (
       <>
         <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
-        <Handle type="source" position={Position.Bottom} id={handleId("s", "b", "agg")} style={{ opacity: 0 }} />
+        {/* 底部两个出/入点：左侧给"下挂主机"（源），右侧给本 zone 网关的
+            内网口（目标）。分开摆，扇形线各走各的，不挤在一个点上。 */}
+        <Handle
+          type="source"
+          position={Position.Bottom}
+          id={handleId("s", "b", "inner")}
+          style={{ left: "34%", transform: "translate(-50%, 0)", opacity: 0 }}
+        />
+        <Handle
+          type="target"
+          position={Position.Bottom}
+          id={handleId("t", "b", "net")}
+          style={{ left: "66%", transform: "translate(-50%, 0)", opacity: 0 }}
+        />
         <div className={cls} style={{ width: dim.w, height: dim.h }}>
           <div className="tn-row">
             <span className="tn-neticon" data-external={flag("external") ? "1" : "0"} />
@@ -174,7 +212,12 @@ function LabNode({ data }: NodeProps<GNode>) {
             {m("gateway_host") ? ` · 网关 ${m("gateway_host")}` : ""}
           </div>
         </div>
-        <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
+        <Handle
+          type="source"
+          position={Position.Right}
+          id={handleId("s", "r", "net")}
+          style={{ opacity: 0 }}
+        />
       </>
     );
   }
@@ -259,7 +302,127 @@ function LabNode({ data }: NodeProps<GNode>) {
   );
 }
 
-const nodeTypes = { lab: LabNode };
+/** 区域框：纯背景层，把同一网段的网段卡 + 主机圈在一起。
+ * 不可选、不可连、不接收鼠标——只是"这个网段占这一层"的视觉边界。 */
+function ZoneBox({ data }: NodeProps<GBox>) {
+  return (
+    <div className={`zonebox${data.external ? " zonebox-wan" : ""}`}>
+      <div className="zonebox-head">
+        <span className="zonebox-name">{data.label}</span>
+        {data.cidr && <span className="zonebox-cidr mono">{data.cidr}</span>}
+        <span className="zonebox-count">{data.hosts} 台</span>
+      </div>
+    </div>
+  );
+}
+
+/** 正交走廊边：按 handle 朝向拼折线，长距离线（镜像主干）走底部走廊。
+ *
+ * 为什么不用内置 smoothstep：它**不避障**，实测全图 13 条边穿过节点
+ * （`gw→net` 掉头穿自己、`net:l2→l3:gw` 穿 l2:w1、镜像主干横穿主机）。
+ * 这里的三段式路由在所有场景下都只经过"列间空隙"或"画布下缘"：
+ *   出向 18px → 走廊 → 进向 18px。
+ */
+function LabEdge({
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  style,
+  markerEnd,
+  data,
+}: EdgeProps) {
+  const d0 = (data ?? {}) as { corridorY?: number; exitX?: number };
+  const corridorY = typeof d0.corridorY === "number" ? d0.corridorY : undefined;
+  const stem = 18;
+  const pts: [number, number][] = [[sourceX, sourceY]];
+  const push = (x: number, y: number) => {
+    const last = pts[pts.length - 1];
+    if (Math.abs(last[0] - x) > 0.5 || Math.abs(last[1] - y) > 0.5) pts.push([x, y]);
+  };
+
+  if (targetPosition === Position.Bottom && corridorY !== undefined) {
+    // 长线（镜像主干 / 展开的逐主机线）：出向 → 画布底部走廊 → 从下方进抓包口
+    if (sourcePosition === Position.Right) push(sourceX + 8, sourceY);
+    else if (sourcePosition === Position.Left) {
+      // 主机横排时间隙只有 16px：左侧 18px 会落进左邻主机，纵向也必须
+      // 越过本机卡片（eth0 chip 中心约在卡顶 +22）到"网段卡下方空隙"，
+      // 再横向出框。
+      push(sourceX, sourceY - 28);
+    } else if (sourcePosition === Position.Top) push(sourceX, sourceY - stem);
+    else push(sourceX, sourceY + stem);
+    // 先出本框右缘（列间走廊）再下沉，避免竖直段穿过本框内的主机行
+    const sideX = pts[pts.length - 1][0];
+    const sideY = pts[pts.length - 1][1];
+    const exitX = typeof d0.exitX === "number" ? d0.exitX : sideX;
+    if (Math.abs(exitX - sideX) > 1) push(exitX, sideY);
+    push(pts[pts.length - 1][0], corridorY);
+    push(targetX, corridorY);
+    push(targetX, targetY + stem);
+    push(targetX, targetY);
+  } else if (sourcePosition === Position.Right && targetPosition === Position.Left) {
+    // 跨列上联：走列间走廊（目标左缘再往左 28px 处必是空隙）
+    const mid = targetX > sourceX + 40 ? targetX - 28 : sourceX + stem;
+    push(mid, sourceY);
+    push(mid, targetY);
+    push(targetX, targetY);
+  } else if (sourcePosition === Position.Bottom && targetPosition === Position.Top) {
+    // 本网段下挂主机：垂直下行，端点错开时中段水平
+    const midY = sourceY + Math.max(14, (targetY - sourceY) * 0.45);
+    push(sourceX, midY);
+    push(targetX, midY);
+    push(targetX, targetY);
+  } else if (targetPosition === Position.Bottom) {
+    // 右/左 → 底（网关内网口 → 本网段卡）：**先竖直**沿主机间隙上到
+    // 网段卡下方的空隙（targetY + 6），再横向进底。若先横移 18px 会
+    // 擦进右边相邻主机的左上角（实测 22 个采样点穿 cache）。
+    const gapY = targetY + 6;
+    push(sourceX, gapY);
+    push(targetX, gapY);
+    push(targetX, targetY);
+  } else if (sourcePosition === Position.Bottom && targetPosition === Position.Left) {
+    // 网段卡下挂主机：水平段贴着主机行**上方**的空隙走（sourceY + 6），
+    // 否则 +18 会横穿中间那台主机的顶部。
+    const midY = sourceY + 6;
+    push(sourceX, midY);
+    // targetX 是**网口 chip 上**的 handle 位置，比主机卡左缘还靠左 19px；
+    // 从 handle 往左让 8px 会进入左邻主机。所以竖线走在 chip 的**右边**
+    // （主机卡左缘与 chip 之间的间隙），最后再向左拐 8px 进 handle。
+    push(targetX + 8, midY);
+    push(targetX + 8, targetY);
+    push(targetX, targetY);
+  } else {
+    const midX = (sourceX + targetX) / 2;
+    push(midX, sourceY);
+    push(midX, targetY);
+    push(targetX, targetY);
+  }
+
+  const d = pts.map((q, i) => `${i ? "L" : "M"} ${q[0]},${q[1]}`).join(" ");
+  const lbl = typeof (data ?? {}).label === "string" ? (data as { label: string }).label : "";
+  // 标签放在路径中点（长线就放在走廊上）——只在 hover 展开时由 assemble 传入
+  const mid = pts[Math.floor(pts.length / 2)] ?? [sourceX, sourceY];
+  return (
+    <>
+      <BaseEdge path={d} style={style} markerEnd={markerEnd} />
+      {lbl && (
+        <EdgeLabelRenderer>
+          <div
+            className="edge-lbl"
+            style={{ transform: `translate(-50%, -50%) translate(${mid[0]}px, ${mid[1]}px)` }}
+          >
+            {lbl}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  );
+}
+
+const edgeTypes = { lab: LabEdge };
+const nodeTypes = { lab: LabNode, zonebox: ZoneBox };
 
 /** 边的画法参数：uplink 用蓝色描边 + 箭头，其余弱化成灰线。 */
 function attachSpec(e: TopoEdge): { stroke: string; strokeWidth: number; marker?: boolean } {
@@ -281,10 +444,6 @@ function mirrorSpec(hot: boolean): Partial<Edge> {
     },
     // 不带 label：谁抓谁看两端就够，多条线的标签挤在画布中部
     // 互相重叠（"镜像通道 x - eth0"铺一片），信息还重复。
-    labelStyle: { fontSize: 10.5, fill: "#b45309" },
-    labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.92 },
-    labelBgPadding: [4, 2] as [number, number],
-    labelBgBorderRadius: 4,
     markerEnd: {
       type: MarkerType.ArrowClosed,
       color: "#f59e0b",
@@ -302,22 +461,38 @@ function uniqNodes(nodes: TopoNode[]): Map<string, TopoNode> {
   return uniq;
 }
 
-type Layout = {
-  pos: Map<string, { x: number; y: number }>;
+type Box = {
+  id: string;
+  zone: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+  cidr: string;
+  hosts: number;
+  external: boolean;
 };
 
-/** 手工分组布局：**一个 zone 一个组，组内两小列**——net 节点在左小列
- * （垂直居中），主机竖排在右小列（网关 → 监控机 → 其他主机）。
+type Layout = {
+  pos: Map<string, { x: number; y: number }>;
+  /** 每个 zone 一块区域框：框住同网段的网段卡 + 全部主机 */
+  boxes: Box[];
+  /** 画布底部走廊：所有长距离镜像主干沿这条水平线走，永远在节点下方 */
+  corridorY: number;
+};
+
+/** 布局：**一列一网段**，深度 = 列号。
  *
- * 为什么这样分：同 zone 的"网段 ⇄ 主机"是左右邻居后，**所有连线都是顺向的**
- * ——上游在左、下游在右，线永远从左 handle 出、右 handle 进：
- *   - gw.eth1(左) ← 父网段；gw.eth0(右) → 本网段；
- *   - 网段(右) → 本 zone 主机 eth0(左)；网段(右) → 下游 zone 网关 eth1(左)。
- * 以前 net 和主机同列竖排，"网段 → 主机"的线两端都锚在左右侧，
- * smoothstep 被迫画 U 形掉头线——那就是"蓝色线绕大圈"的根源。
+ * 每列一个带标题的区域框，框内：网段卡在上（居中）、主机横排在下。
+ * 同一网段的全部节点永远落在同一个框、同一层，一眼可见归属；
+ * 跨列只有 attach 的 uplink 一条，走列间走廊（`ZONE.colGap`）。
  *
- * 组的深度从 attach 边的 `port: uplink` 推：`net:<父> → host:<子>:gateway`。
- * 同深度的兄弟 zone（如 l2/l5）在同一 X 处上下堆叠。
+ * 之前是"网段卡一列 + 主机一列"的两小列：`gw.eth0(右) → net(左)` 成了反向
+ * 掉头线、穿过自己；`net:l2 → l3:gw` 穿过 l2:w1。现在网段卡和主机竖的垂直
+ * 关系改成"上→下"，网段出来的线全部向下，不再掉头。
+ *
+ * 深度从 attach 边的 `port: uplink` 推：`net:<父> → host:<子>:gateway`。
  */
 function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
   const uniq = uniqNodes(nodes);
@@ -340,7 +515,6 @@ function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
     return d;
   };
 
-  // zone → 组内容（net 节点 + 主机列表）
   const groups = new Map<string, { net: TopoNode | null; hosts: TopoNode[] }>();
   for (const n of uniq.values()) {
     const z = zoneOf(n);
@@ -350,16 +524,27 @@ function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
     groups.set(z, g);
   }
 
-  const rank = (n: TopoNode) => {
-    if (n.role === "gateway") return 0;
-    if (n.role === "monitor") return 1;
-    return 2;
-  };
+  // 框内主机顺序：网关 → 监控机 → 其他主机（固定，不随轮询跳动）
+  const rank = (n: TopoNode) => (n.role === "gateway" ? 0 : n.role === "monitor" ? 1 : 2);
   for (const g of groups.values()) {
     g.hosts.sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
   }
 
-  // 深度 → zone 列表（同列多个兄弟 zone 按名字排，顺序稳定）
+  const boxSize = (z: string) => {
+    const g = groups.get(z)!;
+    const n = g.hosts.length;
+    const rowW = n > 0 ? n * DIM.host.w + (n - 1) * ZONE.hostGap : 0;
+    const w = Math.max(DIM.network.w, rowW) + ZONE.pad * 2;
+    const h =
+      ZONE.head +
+      ZONE.gap +
+      DIM.network.h +
+      (n > 0 ? ZONE.gap + DIM.host.h : 0) +
+      ZONE.padBottom;
+    return { w, h };
+  };
+
+  // 深度 → 该列的 zone（同列的兄弟网段按名字排，顺序稳定）
   const cols = new Map<number, string[]>();
   for (const z of groups.keys()) {
     const d = depthOf(z);
@@ -369,45 +554,59 @@ function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
   }
   for (const arr of cols.values()) arr.sort();
 
-  // 组宽：net(190) + 组内 gap + host(200)；组间距是 GROUP_W 里带的
-  const NET_W = DIM.network.w;
-  const HOST_W = DIM.host.w;
-  const INNER_GAP = 34;
-  const GROUP_W = NET_W + INNER_GAP + HOST_W + 64;
-  const V_GAP = 18;
-  const ZONE_GAP = 42;
+  const maxD = Math.max(0, ...cols.keys());
+  const colW = new Map<number, number>();
+  for (const [d, zs] of cols) colW.set(d, Math.max(...zs.map((z) => boxSize(z).w)));
 
-  const groupH = (z: string) => {
-    const g = groups.get(z)!;
-    return Math.max(g.hosts.length * (DIM.host.h + V_GAP), DIM.network.h + V_GAP);
-  };
-
-  // 每列高度（用于垂直居中，避免矮列全挤在顶上）
-  const colHeights = new Map<number, number>();
-  for (const [d, zs] of cols) {
-    colHeights.set(d, zs.reduce((s, z) => s + groupH(z) + ZONE_GAP, -ZONE_GAP));
+  const colX = new Map<number, number>();
+  let cx = 36;
+  for (let d = 0; d <= maxD; d++) {
+    colX.set(d, cx);
+    cx += (colW.get(d) ?? 0) + ZONE.colGap;
   }
-  const maxH = Math.max(0, ...colHeights.values());
 
   const pos = new Map<string, { x: number; y: number }>();
+  const boxes: Box[] = [];
+  let bottom = 0;
+
   for (const [d, zs] of cols) {
-    const xNet = 40 + d * GROUP_W;
-    const xHost = xNet + NET_W + INNER_GAP;
-    let y = 40 + Math.max(0, (maxH - (colHeights.get(d) ?? 0)) / 2);
+    let y = 36;
     for (const z of zs) {
       const g = groups.get(z)!;
-      const h = groupH(z);
-      // net 垂直居中在组高上：它同时连着组内所有主机，居中最不偏
-      if (g.net) pos.set(g.net.id, { x: xNet, y: y + (h - DIM.network.h) / 2 });
-      let hy = y;
-      for (const n of g.hosts) {
-        pos.set(n.id, { x: xHost, y: hy });
-        hy += DIM.host.h + V_GAP;
+      const { w, h } = boxSize(z);
+      const bx = colX.get(d)!;
+      const meta = (g.net?.meta ?? {}) as Record<string, unknown>;
+
+      // 网段卡：框内水平居中、贴标题条下方
+      if (g.net) {
+        pos.set(g.net.id, { x: bx + (w - DIM.network.w) / 2, y: y + ZONE.head + ZONE.gap });
       }
-      y += h + ZONE_GAP;
+      // 主机：网段卡下方横排（超过框宽的极端情况由 fitView 兜住）
+      const rowW = g.hosts.length * DIM.host.w + Math.max(0, g.hosts.length - 1) * ZONE.hostGap;
+      const rowX = bx + (w - rowW) / 2;
+      const rowY = y + ZONE.head + ZONE.gap + DIM.network.h + ZONE.gap;
+      g.hosts.forEach((hn, i) =>
+        pos.set(hn.id, { x: rowX + i * (DIM.host.w + ZONE.hostGap), y: rowY }),
+      );
+
+      boxes.push({
+        id: `zone:${z}`,
+        zone: z,
+        x: bx,
+        y,
+        w,
+        h,
+        label: g.net?.label ?? z,
+        cidr: typeof meta.cidr === "string" ? meta.cidr : "",
+        hosts: g.hosts.length,
+        external: meta.external === true,
+      });
+      bottom = Math.max(bottom, y + h);
+      y += h + ZONE.rowGap;
     }
   }
-  return { pos };
+
+  return { pos, boxes, corridorY: bottom + 44 };
 }
 
 function assemble(
@@ -419,10 +618,26 @@ function assemble(
   dimmed: Set<string>,
   /** 展开逐主机镜像线的网络（`zone->监控机`）；空 = 只画聚合主干 */
   expand: Set<string>,
-): { nodes: GNode[]; edges: Edge[] } {
+): { nodes: (GNode | GBox)[]; edges: Edge[] } {
   const uniq = uniqNodes(nodes);
+  const zoneOf = (id: string) => (id.startsWith("net:") ? id.slice(4) : (id.split(":")[1] ?? ""));
 
-  const rfNodes: GNode[] = [];
+  // 区域框垫在最底层：不可拖、不可选、不参与连线，只是"这一层是这个网段"
+  const rfNodes: (GNode | GBox)[] = layout.boxes.map((b) => ({
+    id: b.id,
+    type: "zonebox" as const,
+    position: { x: b.x, y: b.y },
+    width: b.w,
+    height: b.h,
+    draggable: false,
+    selectable: false,
+    connectable: false,
+    deletable: false,
+    focusable: false,
+    zIndex: -1,
+    data: { label: b.label, cidr: b.cidr, hosts: b.hosts, external: b.external },
+  }));
+
   for (const n of uniq.values()) {
     const d = DIM[n.kind] ?? DIM.host;
     const p = layout.pos.get(n.id) ?? { x: 0, y: 0 };
@@ -455,11 +670,30 @@ function assemble(
     return f ? sideOf(f, n?.role ?? null) : "l";
   };
 
+  const inSameBox = (e: TopoEdge) => zoneOf(e.from) === zoneOf(e.to);
+
+  // ── handle 解析：网段卡没有物理网口，按语义选固定的接入点 ──
+  //   net 作为源、目标在本框内（下挂主机 / 管理口）：走底部，线垂直向下
+  //   net 作为源、目标在别的框（跨列 uplink）：走右缘，线走列间走廊
+  //   net 作为目标：走底部右侧（本 zone 网关的内网口接进来）
+  const srcHandle = (e: TopoEdge): string | undefined => {
+    if (e.source_iface) return handleId("s", sideOfOn(e.from, e.source_iface), e.source_iface);
+    if (e.from.startsWith("net:")) {
+      return inSameBox(e) ? handleId("s", "b", "inner") : handleId("s", "r", "net");
+    }
+    return undefined;
+  };
+  const tgtHandle = (e: TopoEdge): string | undefined => {
+    if (e.target_iface) return handleId("t", sideOfOn(e.to, e.target_iface), e.target_iface);
+    if (e.to.startsWith("net:")) return handleId("t", "b", "net");
+    return undefined;
+  };
+  const boxOfZone = new Map(layout.boxes.map((b) => [b.zone, b]));
+
   const rfEdges: Edge[] = [];
 
   /** 单条逐主机镜像线（源口 → 监控机抓包口）。聚合主干展开时才画。
-   * forceHot：从展开的主干来的线直接高亮——hover 主干时这些细线
-   * 才是主角，不能还是半透明。 */
+   * forceHot：从展开的主干来的线直接高亮。 */
   const perHostMirror = (e: TopoEdge, i: number, forceHot = false): Edge => {
     const id = `${e.kind}:${e.from}->${e.to}:${i}`;
     const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "l";
@@ -470,15 +704,22 @@ function assemble(
       target: e.to,
       sourceHandle: handleId("s", ss, e.source_iface ?? "eth0"),
       targetHandle: handleId("t", ts, e.target_iface ?? "eth1"),
-      type: "smoothstep",
+      type: "lab",
+      data: {
+        corridorY: layout.corridorY,
+        exitX:
+          (boxOfZone.get(zoneOf(e.from))?.x ?? 0) +
+          (boxOfZone.get(zoneOf(e.from))?.w ?? 0) +
+          20,
+        sameBox: inSameBox(e),
+        label: "",
+      },
       ...mirrorSpec(forceHot || hotMirror.has(id)),
     } as Edge;
   };
 
   // ── 整网采集：同网络的多条逐主机线合成一条主干 ──
-  // 一个网络开监控时，图上会出现"每台主机 → 同一块抓包口"的 N 条虚线，
-  // 全部横穿画布、互相压标签，一眼看不出这个网段到底归谁抓。语义上它本来
-  // 就是网络级开关（开在网络节点上），所以主干画 网络 → 监控机抓包口，
+  // 语义上它是网络级开关（开在网络节点上），所以主干画 网络 → 监控机抓包口，
   // 悬停监控机或主干时再把逐主机细线展开。
   const groups = new Map<string, TopoEdge[]>();
   const singles: TopoEdge[] = [];
@@ -499,7 +740,6 @@ function assemble(
   let seq = 0;
   for (const [k, list] of groups) {
     if (list.length < 2) {
-      // 只有一台被采（精确连线）：保持逐主机的画法，语义更强
       singles.push(...list);
       continue;
     }
@@ -508,31 +748,29 @@ function assemble(
     const iface = head.target_iface ?? "eth1";
     const open = expand.has(k);
     const id = `mirror-agg:${k}`;
-    // 主干从网段**底部**出、进监控机底部抓包口：两个 bottom handle 之间
-    // smoothstep 会先往下再横走，水平段贴在整张图下缘，**不穿任何节点、
-    // 不与左右流向的 attach 线交叉**。以前两端无 handle，React Flow 按
-    // 节点中心取方位，线横穿整个画布中部。
-    // 标签只在 hover 展开时显示：默认显示时中点恰好压在别的节点上，
-    // "线上的字压着图"就是这么来的；台数信息 hover 时看，细节在抽屉里。
+    // 主干：网段卡右缘 → 画布底部走廊 → 监控机底部抓包口。
+    // 走廊在所有区域框下方（layout.corridorY），无论如何都不穿节点。
     rfEdges.push({
       id,
       source: `net:${zone}`,
-      sourceHandle: handleId("s", "b", "agg"),
+      sourceHandle: handleId("s", "r", "net"),
       target: head.to,
       targetHandle: handleId("t", sideOfOn(head.to, iface), iface),
-      type: "smoothstep",
-      pathOptions: { borderRadius: 12, offset: 26 },
+      type: "lab",
+      data: {
+        corridorY: layout.corridorY,
+        // 先水平出到本框右缘外再下沉：直接从网段卡右缘往下会竖穿
+        // 本框内的主机行（实测穿 l2:w1 12 个采样点）
+        exitX: (boxOfZone.get(zone)?.x ?? 0) + (boxOfZone.get(zone)?.w ?? 0) + 20,
+        sameBox: false,
+        label: open ? `整网采集 · ${list.length} 台` : "",
+      },
       style: {
         stroke: "#f59e0b",
-        strokeWidth: open ? 2.4 : 1.6,
+        strokeWidth: open ? 2.2 : 1.3,
         strokeDasharray: "6 4",
-        opacity: open ? 1 : 0.8,
+        opacity: open ? 1 : 0.5,
       },
-      label: open ? `整网采集 · ${list.length} 台` : undefined,
-      labelStyle: { fontSize: 10.5, fill: "#b45309" },
-      labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.94 },
-      labelBgPadding: [5, 2] as [number, number],
-      labelBgBorderRadius: 4,
       markerEnd: {
         type: MarkerType.ArrowClosed,
         color: "#f59e0b",
@@ -548,28 +786,20 @@ function assemble(
 
   singles.forEach((e, i) => rfEdges.push(perHostMirror(e, i)));
 
-  // attach 边：端点锚在具体网口的 handle 上，让 React Flow 算路径。
-  // 以前用 ELK 的绝对折点画 polyline，节点一拖线就留在原地，
-  // 节点内容一变高端点还会悬空——看着像"线摆在那，没接上"。
+  // attach 边：端点锚在具体网口的 handle 上。
   for (const e of edges) {
     if (e.kind !== "attach") continue;
     if (!uniq.has(e.from) || !uniq.has(e.to) || e.from === e.to) continue;
     const id = `attach:${e.from}->${e.to}:${seq++}`;
     const spec = attachSpec(e);
-    const ss = e.source_iface
-      ? handleId("s", sideOfOn(e.from, e.source_iface), e.source_iface)
-      : undefined;
-    const ts = e.target_iface
-      ? handleId("t", sideOfOn(e.to, e.target_iface), e.target_iface)
-      : undefined;
     rfEdges.push({
       id,
       source: e.from,
       target: e.to,
-      sourceHandle: ss,
-      targetHandle: ts,
-      type: "smoothstep",
-      pathOptions: { borderRadius: 10, offset: 16 },
+      sourceHandle: srcHandle(e),
+      targetHandle: tgtHandle(e),
+      type: "lab",
+      data: { sameBox: inSameBox(e), label: "" },
       style: { stroke: spec.stroke, strokeWidth: spec.strokeWidth },
       markerEnd: spec.marker
         ? { type: MarkerType.ArrowClosed, color: spec.stroke, width: 14, height: 14 }
@@ -679,7 +909,7 @@ function GraphInner({
     return `${nk}#${ek}`;
   }, [nodes, edges]);
 
-  const [layout, setLayout] = useState<Layout>({ pos: new Map() });
+  const [layout, setLayout] = useState<Layout>({ pos: new Map(), boxes: [], corridorY: 0 });
   const fitted = useRef(false);
 
   useEffect(() => {
@@ -716,7 +946,7 @@ function GraphInner({
     [nodes, edges, layout, sel, hotMirror, dimmed, expand],
   );
 
-  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode>([]);
+  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode | GBox>([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   // 布局引用记一笔：ELK 异步算完返回**新 Layout 对象** → 全量采用它的
@@ -775,9 +1005,12 @@ function GraphInner({
         nodes={rfNodes}
         edges={rfEdges}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
-        onSelectionChange={({ nodes: ns }) => onSelect?.(ns.map((n) => n.id))}
+        onSelectionChange={({ nodes: ns }) =>
+          onSelect?.(ns.filter((n) => n.type !== "zonebox").map((n) => n.id))
+        }
         // 普通拖动 = 平移画布，Shift + 拖动 = 框选。反过来的话（拖拽即框选）
         // 会让人以为图卡住了：想挪一下视野，结果拉出一个选框。
         selectionOnDrag={false}
@@ -788,10 +1021,14 @@ function GraphInner({
         maxZoom={1.6}
         nodesConnectable={false}
         edgesFocusable={false}
-        onNodeClick={(_, n) => pick(n.id)}
+        onNodeClick={(_, n) => {
+          if (n.type === "zonebox") return;
+          pick(n.id);
+        }}
         onPaneClick={() => pick(undefined)}
         // hover 高亮：监控机节点与镜像线都接住鼠标
         onNodeMouseEnter={(_, n) => {
+          if (n.type === "zonebox") return;
           cancelLeave();
           setHoverNode(n.id);
           setHoverEdge(null);

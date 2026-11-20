@@ -551,3 +551,66 @@ body {
 .mon-dot-missing {
   background: #f59e0b;
 }
+
+/* ── 拓扑区域框：一个网段一层 ──
+ * 框把"同网段的网段卡 + 全部主机"圈在一起，列=深度从左到右；
+ * 框本身不吃鼠标事件（纯背景），节点在框内自由点击/拖动。 */
+.react-flow__node-zonebox {
+  pointer-events: none !important;
+}
+
+.zonebox {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  border: 1px dashed #d7dee9;
+  border-radius: 12px;
+  background: #fafbfd;
+}
+
+.zonebox-wan {
+  border-color: #c3caf3;
+  background: #f7f8ff;
+}
+
+.zonebox-head {
+  box-sizing: border-box;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px dashed #e4e9f1;
+}
+
+.zonebox-name {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #475569;
+  white-space: nowrap;
+}
+
+.zonebox-cidr {
+  font-size: 10px;
+  color: #94a3b8;
+}
+
+.zonebox-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
+/* 边上标签（只在 hover 展开时出现） */
+.edge-lbl {
+  position: absolute;
+  font-size: 10.5px;
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+  pointer-events: none;
+}
