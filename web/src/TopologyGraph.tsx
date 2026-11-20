@@ -146,10 +146,12 @@ function LabNode({ data }: NodeProps<GNode>) {
     .join(" ");
 
   if (data.kind !== "host") {
-    // 网络节点（以及兜底）：左侧收、右侧发
+    // 网络节点（以及兜底）：左收右发；底部留一个镜像聚合主干的出向
+    // handle（"整网采集"的线从网段底部出，贴画布下缘走，不与主流向交叉）
     return (
       <>
         <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
+        <Handle type="source" position={Position.Bottom} id={handleId("s", "b", "agg")} style={{ opacity: 0 }} />
         <div className={cls} style={{ width: dim.w, height: dim.h }}>
           <div className="tn-row">
             <span className="tn-neticon" data-external={flag("external") ? "1" : "0"} />
@@ -269,7 +271,7 @@ function attachSpec(e: TopoEdge): { stroke: string; strokeWidth: number; marker?
   };
 }
 
-function mirrorSpec(e: TopoEdge, hot: boolean): Partial<Edge> {
+function mirrorSpec(hot: boolean): Partial<Edge> {
   return {
     style: {
       stroke: "#f59e0b",
@@ -277,8 +279,9 @@ function mirrorSpec(e: TopoEdge, hot: boolean): Partial<Edge> {
       strokeDasharray: "5 4",
       opacity: hot ? 1 : 0.45,
     },
-    label: e.label ?? undefined,
-    labelStyle: { fontSize: 10.5, fill: "#b45309", opacity: hot ? 1 : 0.7 },
+    // 不带 label：谁抓谁看两端就够，多条线的标签挤在画布中部
+    // 互相重叠（"镜像通道 x - eth0"铺一片），信息还重复。
+    labelStyle: { fontSize: 10.5, fill: "#b45309" },
     labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.92 },
     labelBgPadding: [4, 2] as [number, number],
     labelBgBorderRadius: 4,
@@ -303,14 +306,18 @@ type Layout = {
   pos: Map<string, { x: number; y: number }>;
 };
 
-/** 手工分层布局：**一列一个 zone**，列内从上到下是"网段 → 网关 → 监控机 → 主机"。
+/** 手工分组布局：**一个 zone 一个组，组内两小列**——net 节点在左小列
+ * （垂直居中），主机竖排在右小列（网关 → 监控机 → 其他主机）。
  *
- * 为什么不用 ELK：层级布局把网段节点当成普通节点参与排序，结果 gw 在网段
- * 左边、主机在右边，一条链路被拉成三四列，5 个 zone 就撑到近 2000px 宽——
- * fitView 只能缩到 0.4，"看清楚整张图"和"看清一台机器"两头都做不到。
- * 可读性靠**列语义**而不是自动优化：左列是上游，右列是下游，同列同网段。
+ * 为什么这样分：同 zone 的"网段 ⇄ 主机"是左右邻居后，**所有连线都是顺向的**
+ * ——上游在左、下游在右，线永远从左 handle 出、右 handle 进：
+ *   - gw.eth1(左) ← 父网段；gw.eth0(右) → 本网段；
+ *   - 网段(右) → 本 zone 主机 eth0(左)；网段(右) → 下游 zone 网关 eth1(左)。
+ * 以前 net 和主机同列竖排，"网段 → 主机"的线两端都锚在左右侧，
+ * smoothstep 被迫画 U 形掉头线——那就是"蓝色线绕大圈"的根源。
  *
- * 深度从 attach 边的 `port: uplink` 推：`net:<父> → host:<子>:gateway`。
+ * 组的深度从 attach 边的 `port: uplink` 推：`net:<父> → host:<子>:gateway`。
+ * 同深度的兄弟 zone（如 l2/l5）在同一 X 处上下堆叠。
  */
 function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
   const uniq = uniqNodes(nodes);
@@ -333,25 +340,28 @@ function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
     return d;
   };
 
-  // zone → 该 zone 的节点（网段节点 + 主机）
-  const zones = new Map<string, TopoNode[]>();
+  // zone → 组内容（net 节点 + 主机列表）
+  const groups = new Map<string, { net: TopoNode | null; hosts: TopoNode[] }>();
   for (const n of uniq.values()) {
     const z = zoneOf(n);
-    const arr = zones.get(z) ?? [];
-    arr.push(n);
-    zones.set(z, arr);
+    const g = groups.get(z) ?? { net: null, hosts: [] };
+    if (n.kind === "network") g.net = n;
+    else g.hosts.push(n);
+    groups.set(z, g);
   }
 
   const rank = (n: TopoNode) => {
-    if (n.kind === "network") return 0;
-    if (n.role === "gateway") return 1;
-    if (n.role === "monitor") return 2;
-    return 3;
+    if (n.role === "gateway") return 0;
+    if (n.role === "monitor") return 1;
+    return 2;
   };
+  for (const g of groups.values()) {
+    g.hosts.sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
+  }
 
-  // 列 → 该列的 zone 组。同列多个 zone（兄弟）按名字排，顺序稳定。
+  // 深度 → zone 列表（同列多个兄弟 zone 按名字排，顺序稳定）
   const cols = new Map<number, string[]>();
-  for (const z of zones.keys()) {
+  for (const z of groups.keys()) {
     const d = depthOf(z);
     const arr = cols.get(d) ?? [];
     arr.push(z);
@@ -359,35 +369,42 @@ function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
   }
   for (const arr of cols.values()) arr.sort();
 
-  const COL_W = DIM.host.w + 96;
-  const GAP = 16;
-  const GROUP_GAP = 34;
+  // 组宽：net(190) + 组内 gap + host(200)；组间距是 GROUP_W 里带的
+  const NET_W = DIM.network.w;
+  const HOST_W = DIM.host.w;
+  const INNER_GAP = 34;
+  const GROUP_W = NET_W + INNER_GAP + HOST_W + 64;
+  const V_GAP = 18;
+  const ZONE_GAP = 42;
 
-  // 先算每列高度，再整体垂直居中——否则矮列全挤在顶上，图看着"歪"
+  const groupH = (z: string) => {
+    const g = groups.get(z)!;
+    return Math.max(g.hosts.length * (DIM.host.h + V_GAP), DIM.network.h + V_GAP);
+  };
+
+  // 每列高度（用于垂直居中，避免矮列全挤在顶上）
   const colHeights = new Map<number, number>();
   for (const [d, zs] of cols) {
-    let h = 0;
-    for (const z of zs) {
-      const list = (zones.get(z) ?? []).slice().sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
-      if (list.length === 0) continue;
-      for (const n of list) h += DIM[n.kind].h + GAP;
-      h += GROUP_GAP;
-    }
-    colHeights.set(d, h);
+    colHeights.set(d, zs.reduce((s, z) => s + groupH(z) + ZONE_GAP, -ZONE_GAP));
   }
   const maxH = Math.max(0, ...colHeights.values());
 
   const pos = new Map<string, { x: number; y: number }>();
   for (const [d, zs] of cols) {
-    const x = 40 + d * COL_W;
+    const xNet = 40 + d * GROUP_W;
+    const xHost = xNet + NET_W + INNER_GAP;
     let y = 40 + Math.max(0, (maxH - (colHeights.get(d) ?? 0)) / 2);
     for (const z of zs) {
-      const list = (zones.get(z) ?? []).slice().sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
-      for (const n of list) {
-        pos.set(n.id, { x, y });
-        y += DIM[n.kind].h + GAP;
+      const g = groups.get(z)!;
+      const h = groupH(z);
+      // net 垂直居中在组高上：它同时连着组内所有主机，居中最不偏
+      if (g.net) pos.set(g.net.id, { x: xNet, y: y + (h - DIM.network.h) / 2 });
+      let hy = y;
+      for (const n of g.hosts) {
+        pos.set(n.id, { x: xHost, y: hy });
+        hy += DIM.host.h + V_GAP;
       }
-      y += GROUP_GAP;
+      y += h + ZONE_GAP;
     }
   }
   return { pos };
@@ -440,8 +457,10 @@ function assemble(
 
   const rfEdges: Edge[] = [];
 
-  /** 单条逐主机镜像线（源口 → 监控机抓包口）。聚合主干展开时才画。 */
-  const perHostMirror = (e: TopoEdge, i: number): Edge => {
+  /** 单条逐主机镜像线（源口 → 监控机抓包口）。聚合主干展开时才画。
+   * forceHot：从展开的主干来的线直接高亮——hover 主干时这些细线
+   * 才是主角，不能还是半透明。 */
+  const perHostMirror = (e: TopoEdge, i: number, forceHot = false): Edge => {
     const id = `${e.kind}:${e.from}->${e.to}:${i}`;
     const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "l";
     const ts = e.target_iface ? sideOfOn(e.to, e.target_iface) : "b";
@@ -452,7 +471,7 @@ function assemble(
       sourceHandle: handleId("s", ss, e.source_iface ?? "eth0"),
       targetHandle: handleId("t", ts, e.target_iface ?? "eth1"),
       type: "smoothstep",
-      ...mirrorSpec(e, hotMirror.has(id)),
+      ...mirrorSpec(forceHot || hotMirror.has(id)),
     } as Edge;
   };
 
@@ -489,20 +508,27 @@ function assemble(
     const iface = head.target_iface ?? "eth1";
     const open = expand.has(k);
     const id = `mirror-agg:${k}`;
+    // 主干从网段**底部**出、进监控机底部抓包口：两个 bottom handle 之间
+    // smoothstep 会先往下再横走，水平段贴在整张图下缘，**不穿任何节点、
+    // 不与左右流向的 attach 线交叉**。以前两端无 handle，React Flow 按
+    // 节点中心取方位，线横穿整个画布中部。
+    // 标签只在 hover 展开时显示：默认显示时中点恰好压在别的节点上，
+    // "线上的字压着图"就是这么来的；台数信息 hover 时看，细节在抽屉里。
     rfEdges.push({
       id,
       source: `net:${zone}`,
+      sourceHandle: handleId("s", "b", "agg"),
       target: head.to,
       targetHandle: handleId("t", sideOfOn(head.to, iface), iface),
       type: "smoothstep",
-      pathOptions: { borderRadius: 12, offset: 22 },
+      pathOptions: { borderRadius: 12, offset: 26 },
       style: {
         stroke: "#f59e0b",
         strokeWidth: open ? 2.4 : 1.6,
         strokeDasharray: "6 4",
-        opacity: open ? 1 : 0.75,
+        opacity: open ? 1 : 0.8,
       },
-      label: `整网采集 · ${list.length} 台`,
+      label: open ? `整网采集 · ${list.length} 台` : undefined,
       labelStyle: { fontSize: 10.5, fill: "#b45309" },
       labelBgStyle: { fill: "#fffbeb", fillOpacity: 0.94 },
       labelBgPadding: [5, 2] as [number, number],
@@ -516,7 +542,7 @@ function assemble(
       zIndex: open ? 6 : 3,
     } as Edge);
     if (open) {
-      list.forEach((e, i) => rfEdges.push(perHostMirror(e, i)));
+      list.forEach((e, i) => rfEdges.push(perHostMirror(e, i, true)));
     }
   }
 
