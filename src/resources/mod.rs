@@ -1064,8 +1064,20 @@ impl Executor {
         // ── 容器：存在才删（stop → destroy --purge），不存在记 absent ──
         let vms = self.pve.cluster_vms(cancel).await.map_err(|e| e.to_string())?;
         for h in &zone.hosts {
-            // spec 固定 vmid 或 DB 分配过，二者都没有 = 从没建过
-            let vmid = h.vmid.or_else(|| self.db.vmid_of(&zone.name, &h.name));
+            // spec 固定 vmid 或 DB 分配过，二者都没有 = 从没建过。
+            // 还有第三种情况：分配记录被清掉了（比如临时 zone 的镜像连线
+            // 被删时顺手清了 DB），但容器还在宿主上跑——这时按 labyard
+            // 建容器时固定用的 hostname `{zone}-{host}` 找回来，否则
+            // destroy 会报"容器不存在"，把人引向完全错误的方向。
+            let vmid = h
+                .vmid
+                .or_else(|| self.db.vmid_of(&zone.name, &h.name))
+                .or_else(|| {
+                    let want = format!("{}-{}", zone.name, h.name);
+                    vms.iter()
+                        .find(|r| r.is_lxc() && r.name.as_deref() == Some(want.as_str()))
+                        .and_then(|r| r.vmid_parsed())
+                });
             let Some(vmid) = vmid else {
                 report.absent_cts.push(h.name.clone());
                 continue;
@@ -1180,6 +1192,16 @@ impl Executor {
                 members.join(", ")
             ));
         }
+
+        // ── 镜像步骤：key 是 `mirror:{from}->{to}`，任一端属于这个 zone 都算 ──
+        //
+        // 不删的话，销毁 zone 之后概览页会留一条"镜像已完成"的孤儿记录：
+        // 它既不对应任何现存连线，清理接口也只会把它当普通孤儿计数，
+        // 看起来像是"删了 zone 还有残留"。
+        self.db
+            .forget_steps_matching(&format!("mirror:{}:%", zone.name));
+        self.db
+            .forget_steps_matching(&format!("mirror:%->{}:%", zone.name));
 
         Ok(report)
     }

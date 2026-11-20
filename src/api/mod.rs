@@ -950,9 +950,9 @@ async fn hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         }
     }
 
-    let rows: Vec<serde_json::Value> = state
-        .db
-        .all_vmids()
+    let vmids = state.db.all_vmids();
+    let known: std::collections::HashSet<u32> = vmids.iter().map(|(_, _, v)| *v).collect();
+    let rows: Vec<serde_json::Value> = vmids
         .into_iter()
         .map(|(zone, host, vmid)| {
             let row = vms.iter().find(|r| r.vmid_parsed() == Some(vmid));
@@ -974,7 +974,25 @@ async fn hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
             })
         })
         .collect();
-    Json(serde_json::json!({ "hosts": rows })).into_response()
+
+    // 宿主上还有 labyard 不认识的虚拟机：在 PVE 面板里手工建的、或别的工具
+    // 建的。它们不占 vmid 分配表，以前在界面上完全看不见——用户会问"我加的
+    // VM 在哪"。这里只报告，不纳管：规格才是这台平台的唯一真相。
+    let unmanaged: Vec<serde_json::Value> = vms
+        .iter()
+        .filter(|r| r.vmid_parsed().map(|v| !known.contains(&v)).unwrap_or(false))
+        .map(|r| {
+            serde_json::json!({
+                "vmid": r.vmid_parsed(),
+                "kind": if r.is_lxc() { "lxc" } else { "qemu" },
+                "name": r.name.clone().unwrap_or_default(),
+                "status": r.status.clone().unwrap_or_else(|| "unknown".to_string()),
+                "node": r.node.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "hosts": rows, "unmanaged": unmanaged })).into_response()
 }
 
 /// 清掉"规格已删除、容器也不存在"的 vmid 分配记录。
@@ -1107,8 +1125,30 @@ struct PurgeReq {
 /// 为什么必须看内核而不是看规格：删 zone 只改了文件（`destroy` 才动桥），
 /// 而 `destroy` 需要 zone 还在规格里。规格先删了，桥就永远留下来了——
 /// 界面上完全看不见，却占着名字和地址（`labzt` 上还挂着 10.99.3.254）。
-async fn list_bridges(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    require_auth!(state, headers);
+/// 孤儿桥能不能一键删。
+///
+/// 唯一的否决条件是「还有成员口」：那说明容器仍挂在这张桥上，删接口会把它断掉。
+/// 桥上有地址不否决——孤儿桥的地址是我们建桥时配的 zone 网关地址，zone 都没了，
+/// 那个地址只是悬在接口上。早先要求"地址也为空"才删，结果 `labzt` 这种
+/// 带网关地址的残留永远停在"需要人工确认"，面板上点不动。
+fn bridge_prunable(orphan: bool, members: usize) -> bool {
+    orphan && members == 0
+}
+
+/// 宿主上一张 labyard 网桥的现状。
+struct BridgeState {
+    name: String,
+    zone: Option<String>,
+    ips: String,
+    members: usize,
+    orphan: bool,
+    safe: bool,
+    kernel: bool,
+}
+
+/// 收集宿主上的网桥现状。列表与清理共用这一份，避免两处各写一套条件——
+/// 之前列表判"可自动删除"、清理判"地址为空才删"，结果界面上点了没反应。
+async fn bridge_states(state: &AppState) -> Vec<BridgeState> {
     let live = live_entities(&state.cfg);
     let cancel = CancellationToken::new();
     let mut usage = state.pve.bridge_usage(&cancel).await.unwrap_or_default();
@@ -1121,7 +1161,7 @@ async fn list_bridges(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
             usage.push((name, String::new(), 0));
         }
     }
-    let rows: Vec<serde_json::Value> = usage
+    usage
         .into_iter()
         // 只看平台自己建的：PVE 的 vmbr*、外网桥 wan 都不该出现在这里
         .filter(|(n, _, _)| n.starts_with("lab") || n.starts_with("mir"))
@@ -1138,58 +1178,58 @@ async fn list_bridges(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
                 .as_ref()
                 .map(|z| !live.zones.contains(z))
                 .unwrap_or(false);
-            // 有地址或有成员口就不能自动删：前者可能正被当管理口用，
-            // 后者说明还有容器挂在上面（跑着的抓包口）。
-            let safe = orphan && ips.is_empty() && members == 0;
+            BridgeState {
+                safe: bridge_prunable(orphan, members),
+                orphan,
+                kernel: in_kernel.contains(&name),
+                name,
+                zone,
+                ips,
+                members,
+            }
+        })
+        .collect()
+}
+
+async fn list_bridges(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    require_auth!(state, headers);
+    let rows: Vec<serde_json::Value> = bridge_states(&state)
+        .await
+        .into_iter()
+        .map(|b| {
             serde_json::json!({
-                "name": name,
-                "zone": zone,
-                "ips": ips,
-                "members": members,
-                "orphan": orphan,
-                "safe": safe,
+                "name": b.name,
+                "zone": b.zone,
+                "ips": b.ips,
+                "members": b.members,
+                "orphan": b.orphan,
+                "safe": b.safe,
                 // false = 内核里已经没了，只剩配置里的持久化段
-                "kernel": in_kernel.contains(&name),
+                "kernel": b.kernel,
             })
         })
         .collect();
     Json(serde_json::json!({ "bridges": rows })).into_response()
 }
 
-/// 清掉"无地址、无成员"的残留网桥。有 IP 或有成员的只报告不动手。
+/// 清掉孤儿网桥。还有成员口的只报告不动手。
 async fn prune_bridges(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     require_auth!(state, headers);
-    let live = live_entities(&state.cfg);
     let cancel = CancellationToken::new();
-    let mut usage = state.pve.bridge_usage(&cancel).await.unwrap_or_default();
-    let in_kernel: std::collections::HashSet<String> =
-        usage.iter().map(|(n, _, _)| n.clone()).collect();
-    for name in state.pve.persisted_bridges(&cancel).await.unwrap_or_default() {
-        if !in_kernel.contains(&name) {
-            usage.push((name, String::new(), 0));
-        }
-    }
     let mut removed: Vec<String> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
-    for (name, ips, members) in usage {
-        let Some(z) = name
-            .strip_prefix("lab")
-            .or_else(|| name.strip_prefix("mir"))
-            .map(|s| s.to_string())
-        else {
-            continue;
-        };
-        if name == "mirr" || live.zones.contains(&z) {
+    for b in bridge_states(&state).await {
+        if !b.orphan {
             continue;
         }
-        if !ips.is_empty() || members > 0 {
-            kept.push(name);
+        if !b.safe {
+            kept.push(b.name);
             continue;
         }
-        if state.pve.destroy_bridge(&name, &cancel).await.is_ok() {
-            removed.push(name);
+        if state.pve.destroy_bridge(&b.name, &cancel).await.is_ok() {
+            removed.push(b.name);
         } else {
-            kept.push(name);
+            kept.push(b.name);
         }
     }
     Json(serde_json::json!({ "removed": removed, "kept": kept })).into_response()
@@ -1322,6 +1362,11 @@ struct DestroyReq {
     zone: String,
     /// 必须与 zone 同名——Web 版的"第二次确认"
     confirm: String,
+    /// 限定在哪份规格里找这个 zone。多份规格可能有同名 zone，
+    /// 不指定时按名字顺序取第一份（旧行为）；指定了就只认那一份，
+    /// 免得"想删临时规格里的测试 zone，结果删了正式环境的同名 zone"。
+    #[serde(default)]
+    spec: Option<String>,
 }
 
 async fn destroy(
@@ -1337,12 +1382,48 @@ async fn destroy(
         )
             .into_response();
     }
-    // zone 可能在任何一份规格里：先按名字定位，找不到才报错
-    let (_, yaml) = match ops::locate_zone(&state, &req.zone) {
-        Ok(v) => v,
-        Err((code, msg)) => {
-            return (code, Json(serde_json::json!({ "error": msg }))).into_response()
+    // zone 可能在任何一份规格里：先按名字定位，找不到才报错。
+    // 调用方指定了 spec 就只在那份里找——同名 zone 分属两份规格时，
+    // 否则会命中名字靠前的那份，删错环境。
+    let (_, yaml) = match &req.spec {
+        Some(name) => {
+            let text = match specs::read(&state.cfg.paths.specs, name) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "error": format!("规格 `{name}` 不存在") })),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response()
+                }
+            };
+            let has = Spec::parse(&text)
+                .map(|sp| sp.zones.contains_key(&req.zone))
+                .unwrap_or(false);
+            if !has {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("规格 `{name}` 里没有 zone `{}`", req.zone)
+                    })),
+                )
+                    .into_response();
+            }
+            (name.clone(), text)
         }
+        None => match ops::locate_zone(&state, &req.zone) {
+            Ok(v) => v,
+            Err((code, msg)) => {
+                return (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        },
     };
     let text_specs = match Spec::parse(&yaml) {
         Ok(sp) => sp,
@@ -2063,6 +2144,17 @@ async fn static_handler(axum::extract::OriginalUri(uri): axum::extract::Original
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_is_prunable_only_when_unused() {
+        // 孤儿桥 + 没有成员口：可删。地址不参与判定——`labzt` 就是带着
+        // 10.99.3.254 的网关地址留在那，以前因此判成"需要人工确认"。
+        assert!(bridge_prunable(true, 0));
+        // 还有容器挂着：不能删
+        assert!(!bridge_prunable(true, 1));
+        // zone 还在规格里：这不是残留，不归清理管
+        assert!(!bridge_prunable(false, 0));
+    }
 
     #[test]
     fn phase_matches_key_prefix() {

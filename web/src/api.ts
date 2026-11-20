@@ -331,7 +331,7 @@ export const api = {
   retry: (id: string) =>
     req<{ run_id: string }>(`/api/runs/${id}/retry`, { method: "POST" }),
 
-  hosts: () => req<{ hosts: HostRow[] }>("/api/hosts"),
+  hosts: () => req<{ hosts: HostRow[]; unmanaged: UnmanagedVm[] }>("/api/hosts"),
 
   pruneHosts: () =>
     req<{ removed: number; kept: number }>("/api/hosts/prune", {
@@ -425,6 +425,15 @@ export type HostRow = {
   /** 规格里已经没有这台主机了：vmid 记录是历史残留 */
   orphan?: boolean;
   retired: boolean;
+};
+
+/** 宿主上有、但不在 labyard 的 vmid 分配表里的虚拟机（PVE 面板手工建的等）。 */
+export type UnmanagedVm = {
+  vmid: number | null;
+  kind: "lxc" | "qemu";
+  name: string;
+  status: string;
+  node: string;
 };
 
 /** 宿主上的 labyard 网桥。orphan = 规格里已经没有这个网络了。 */

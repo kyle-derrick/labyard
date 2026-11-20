@@ -130,6 +130,19 @@ pub(crate) fn locate_zone(state: &AppState, zone: &str) -> ApiResult<(String, St
             return Ok((meta.name, text));
         }
     }
+    // `wan` 不是规格里的 zone，是所有顶层 zone 共用的外部网络（宿主上的
+    // wan_bridge）。界面上它和真正的网络并排出现，点"网关策略"就会打到
+    // 这里——直接说清楚它没有网关，别让人以为规格坏了。
+    if zone == "wan" || zone == state.cfg.pve.wan_bridge {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "`{zone}` 是外部网络（宿主上的 {}），不属于任何规格，没有网关容器。\
+                 出网开关、端口映射与 VPN 都在承载它的 zone 的网关上配置。",
+                state.cfg.pve.wan_bridge
+            ),
+        ));
+    }
     Err(err(
         StatusCode::NOT_FOUND,
         format!("所有规格里都找不到 zone `{zone}`"),

@@ -297,6 +297,23 @@ if PW:
         if isinstance(lst, dict) else []
     record(link not in left, "删后列表里不再有", "GET /api/mirrors", 200, str(left)[:110])
     check("再删一次失败", "DELETE", f"/api/mirrors/{q(link)}", want=400)
+    # 加镜像连线是**异步**执行（接口拿到 run_id 就返回）：不等它跑完就
+    # destroy，会删到一个当时还不存在的容器，随后后台 plan 又把容器建回来，
+    # 留下"DB 没记录、容器还在、step 还是 done"的半孤儿。
+    for _ in range(60):
+        st = call("GET", "/api/runs")[1]
+        busy = [r for r in (st.get("runs", []) if isinstance(st, dict) else [])
+                if r.get("status") in ("running", "pending")]
+        if not busy:
+            break
+        time.sleep(2)
+    # 加镜像连线不是纯配置操作：它会让该 zone 立刻生效——真的建 lab/mir 桥、
+    # 建容器、写 vmid。只删 zone 的话，规格改了，容器和桥留在宿主上，
+    # 下次 apply 还会把这套再建一遍（zt 就是这样反复"复活"的）。
+    # 所以这里按 zone 真正销毁一次，再删规格片段。必须带 spec：多份规格
+    # 可能有同名 zone，只按名字会删错环境。
+    check("销毁镜像测试用的 zone（真删容器与桥）", "POST", "/api/destroy",
+          {"zone": "zt", "confirm": "zt", "spec": TMP}, keys=["ok"])
     check("删镜像用的 zone", "DELETE", f"/api/specs/{q(TMP)}/zones/zt", keys=["ok"])
 
     # ── monitor.use 引用其它 zone 的新建声明 ──

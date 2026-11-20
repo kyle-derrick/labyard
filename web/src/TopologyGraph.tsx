@@ -16,9 +16,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   BackgroundVariant,
-  BaseEdge,
   Controls,
-  EdgeProps,
   Handle,
   MarkerType,
   MiniMap,
@@ -69,12 +67,22 @@ type Data = {
 
 type GNode = Node<Data, "lab">;
 
-/** 网口在哪一侧：wan 口在左（外面从左边来），普通口在右（内网在右边），
- * 抓包口在下（镜像线从下面进监控机）。 */
-function sideOf(f: TopoIface): "l" | "r" | "b" {
+/** 网口在哪一侧。约定：**左为入、右为出、下为镜像**。
+ *
+ * - 网关：`eth1` 是上联口（外网 / 父网络，流量从这一侧进来）→ 左；
+ *   `eth0` 是本 zone 的内网口（由它派生出去）→ 右。
+ *   编号规则与后端 topology.rs 一致：eth0 恒为本网络，eth1 恒为上联。
+ * - 监控机：抓包口 → 下；管理口（eth0，接它被部署到的那个网络）→ 左。
+ * - 其他主机：只有一个入向口，全在左边。
+ *
+ * 之前只按 `net === "wan"` 判断，结果网关的 eth1（上联到父 zone 时
+ * net 是父 zone 名）被放到右边，普通主机的内网口也被放到右边，与
+ * 连线方向相反。
+ */
+function sideOf(f: TopoIface, role: string | null): "l" | "r" | "b" {
   if (f.capture) return "b";
-  if (f.net === "wan") return "l";
-  return "r";
+  if (role === "gateway") return f.name === "eth1" ? "l" : "r";
+  return "l";
 }
 
 /** handle id 约定：`{t|s}{l|r|b}:{iface}`。assemble 与节点渲染共用这条规则。 */
@@ -89,8 +97,8 @@ const SIDE_POS: Record<string, Position> = {
 };
 
 /** 网口 chip：按 side 吸在节点边缘（略突出 8px），handle 就在突出点上。 */
-function IfaceChip({ f }: { f: TopoIface }) {
-  const side = sideOf(f);
+function IfaceChip({ f, role }: { f: TopoIface; role: string | null }) {
+  const side = sideOf(f, role);
   const tip = f.capture
     ? `${f.name} · 抓包（${f.net} 的流量）`
     : `${f.name} · ${f.net}${f.ip ? ` ${f.ip.replace(/\/\d+$/, "")}` : ""}`;
@@ -170,10 +178,10 @@ function LabNode({ data }: NodeProps<GNode>) {
     );
   }
 
-  // 主机节点：网口分侧——wan 口贴左缘竖排、内网口贴右缘竖排、抓包口贴下缘横排
-  const left = data.ifaces.filter((f) => sideOf(f) === "l");
-  const right = data.ifaces.filter((f) => sideOf(f) === "r");
-  const bottom = data.ifaces.filter((f) => sideOf(f) === "b");
+  // 主机节点：网口分侧——按"左入右出下镜像"，具体规则见 sideOf
+  const left = data.ifaces.filter((f) => sideOf(f, data.role) === "l");
+  const right = data.ifaces.filter((f) => sideOf(f, data.role) === "r");
+  const bottom = data.ifaces.filter((f) => sideOf(f, data.role) === "b");
   return (
     <>
       <div className={cls} style={{ width: dim.w, height: dim.h }}>
@@ -213,7 +221,7 @@ function LabNode({ data }: NodeProps<GNode>) {
           }}
         >
           {left.map((f) => (
-            <IfaceChip key={f.name} f={f} />
+            <IfaceChip key={f.name} f={f} role={data.role} />
           ))}
         </div>
         <div
@@ -227,7 +235,7 @@ function LabNode({ data }: NodeProps<GNode>) {
           }}
         >
           {right.map((f) => (
-            <IfaceChip key={f.name} f={f} />
+            <IfaceChip key={f.name} f={f} role={data.role} />
           ))}
         </div>
         <div
@@ -242,7 +250,7 @@ function LabNode({ data }: NodeProps<GNode>) {
           }}
         >
           {bottom.map((f) => (
-            <IfaceChip key={f.name} f={f} />
+            <IfaceChip key={f.name} f={f} role={data.role} />
           ))}
         </div>
       </div>
@@ -252,31 +260,7 @@ function LabNode({ data }: NodeProps<GNode>) {
 
 const nodeTypes = { lab: LabNode };
 
-/** ELK 正交路由的 attach 边：直接按 ELK 给的折点画 polyline——它绕开了节点。 */
-function OrthEdge({
-  data,
-  markerEnd,
-}: EdgeProps) {
-  const pts: [number, number][] = (data?.pts as [number, number][] | undefined) ?? [];
-  const d =
-    pts.length >= 2
-      ? pts.map((p, i) => `${i ? "L" : "M"}${p[0]},${p[1]}`).join(" ")
-      : "";
-  return (
-    <BaseEdge
-      path={d}
-      markerEnd={markerEnd}
-      style={{
-        stroke: (data?.stroke as string) ?? "#b9c4d4",
-        strokeWidth: (data?.strokeWidth as number) ?? 1.2,
-      }}
-    />
-  );
-}
-
-const edgeTypes = { ortho: OrthEdge };
-
-/** 边的画法参数：attach 走 ELK 正交路由，mirror 半透明虚线（smoothstep）。 */
+/** 边的画法参数：uplink 用蓝色描边 + 箭头，其余弱化成灰线。 */
 function attachSpec(e: TopoEdge): { stroke: string; strokeWidth: number; marker?: boolean } {
   const uplink = e.port === "uplink";
   return {
@@ -318,11 +302,9 @@ function uniqNodes(nodes: TopoNode[]): Map<string, TopoNode> {
 
 type Layout = {
   pos: Map<string, { x: number; y: number }>;
-  /** attach 边的正交折点（ELK ORTHOGONAL 路由输出，root 全局坐标） */
-  paths: Map<string, [number, number][]>;
 };
 
-/** ELK 分层布局 + 正交路由，只吃 attach 边。 */
+/** ELK 分层布局（只决定节点位置，路径交给 React Flow 按 handle 算）。 */
 async function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Promise<Layout> {
   const uniq = uniqNodes(nodes);
   const elk = new ELK();
@@ -356,19 +338,9 @@ async function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Promise<La
       pos.set(c.id, { x: c.x, y: c.y });
     }
   }
-  // 收集每条 attach 边的折线：ELK 的 edge 输出顺序与输入一致，
-  // id 是我们传的 `{from}->{to}`，sections 是 root 全局坐标
-  const paths = new Map<string, [number, number][]>();
-  for (const ee of res.edges ?? []) {
-    const pts: [number, number][] = [];
-    for (const s of (ee as { sections?: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; bendPoints?: { x: number; y: number }[] }[] }).sections ?? []) {
-      pts.push([s.startPoint.x, s.startPoint.y]);
-      for (const b of s.bendPoints ?? []) pts.push([b.x, b.y]);
-      pts.push([s.endPoint.x, s.endPoint.y]);
-    }
-    if (pts.length >= 2) paths.set(ee.id, pts);
-  }
-  return { pos, paths };
+  // 折点不再需要：端点由 React Flow 按 handle 实时计算，
+  // 拖节点时线才会跟着走（ELK 的绝对坐标做不到这一点）。
+  return { pos };
 }
 
 function assemble(
@@ -407,10 +379,11 @@ function assemble(
     });
   }
 
-  /** 某个节点上某块网口的 handle side（不在清单里就兜底右侧） */
+  /** 某个节点上某块网口的 handle side（不在清单里就兜底左侧） */
   const sideOfOn = (nodeId: string, iface: string): string => {
-    const f = uniq.get(nodeId)?.ifaces?.find((x) => x.name === iface);
-    return f ? sideOf(f) : "r";
+    const n = uniq.get(nodeId);
+    const f = n?.ifaces?.find((x) => x.name === iface);
+    return f ? sideOf(f, n?.role ?? null) : "l";
   };
 
   const rfEdges: Edge[] = edges
@@ -425,18 +398,25 @@ function assemble(
     .map((e, i) => {
       const id = `${e.kind}:${e.from}->${e.to}:${i}`;
       if (e.kind === "attach") {
-        // attach：ELK 正交路由的折点直接画，handle 只作锚（正交边忽略它）
+        // attach：端点锚在具体网口的 handle 上，让 React Flow 算路径。
+        // 以前用 ELK 的绝对折点画 polyline，节点一拖线就留在原地，
+        // 节点内容一变高端点还会悬空——看着像"线摆在那，没接上"。
         const spec = attachSpec(e);
+        const ss = e.source_iface
+          ? handleId("s", sideOfOn(e.from, e.source_iface), e.source_iface)
+          : undefined;
+        const ts = e.target_iface
+          ? handleId("t", sideOfOn(e.to, e.target_iface), e.target_iface)
+          : undefined;
         return {
           id,
           source: e.from,
           target: e.to,
-          type: "ortho",
-          data: {
-            pts: layout.paths.get(`${e.from}->${e.to}`),
-            stroke: spec.stroke,
-            strokeWidth: spec.strokeWidth,
-          },
+          sourceHandle: ss,
+          targetHandle: ts,
+          type: "smoothstep",
+          pathOptions: { borderRadius: 10, offset: 16 },
+          style: { stroke: spec.stroke, strokeWidth: spec.strokeWidth },
           markerEnd: spec.marker
             ? { type: MarkerType.ArrowClosed, color: spec.stroke, width: 14, height: 14 }
             : undefined,
@@ -444,7 +424,7 @@ function assemble(
         } as Edge;
       }
       // mirror：从源口所在侧出、进目标口所在侧（抓包口在监控机下缘）
-      const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "r";
+      const ss = e.source_iface ? sideOfOn(e.from, e.source_iface) : "l";
       const ts = e.target_iface ? sideOfOn(e.to, e.target_iface) : "b";
       return {
         id,
@@ -558,7 +538,7 @@ function GraphInner({
     return `${nk}#${ek}`;
   }, [nodes, edges]);
 
-  const [layout, setLayout] = useState<Layout>({ pos: new Map(), paths: new Map() });
+  const [layout, setLayout] = useState<Layout>({ pos: new Map() });
   const fitted = useRef(false);
 
   useEffect(() => {
@@ -621,7 +601,6 @@ function GraphInner({
         nodes={rfNodes}
         edges={rfEdges}
         nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onSelectionChange={({ nodes: ns }) => onSelect?.(ns.map((n) => n.id))}

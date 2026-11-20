@@ -381,6 +381,9 @@ export default function Hosts() {
     [bridges.data],
   );
 
+  /** PVE 上有、但不在 vmid 分配表里的虚拟机（面板里手工建的等）。 */
+  const unmanaged = useMemo(() => hosts.data?.unmanaged ?? [], [hosts.data]);
+
   /** 销毁"规格里已经没有、容器还在"的孤儿。没有这个入口就只能上机器手工删。 */
   const purgeOrphans = useCallback(async () => {
     try {
@@ -924,16 +927,29 @@ export default function Hosts() {
             {
               title: "操作",
               width: 210,
-              render: (_: unknown, r) => (
-                <Space size={4}>
-                  <Button
-                    size="small"
-                    icon={<SafetyOutlined />}
-                    onClick={() => setGw(r.zone)}
-                  >
-                    网关策略
-                  </Button>
-                  <Dropdown
+              render: (_: unknown, r) => {
+                // `wan` 是外部网络（宿主上的外网桥），不是规格里的 zone：
+                // 它没有网关容器，出网/端口映射/VPN 都配不到它头上，
+                // 也不该出现"销毁网络"——点了只会得到一句找不到 zone。
+                if (r.zone === "wan") {
+                  return (
+                    <Tooltip title="wan 是宿主上的外部网络，不属于任何规格：没有网关容器，也没有可配的策略。出网开关、端口映射与 VPN 在承载它的 zone 的网关上配置。">
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        仅查看
+                      </Text>
+                    </Tooltip>
+                  );
+                }
+                return (
+                  <Space size={4}>
+                    <Button
+                      size="small"
+                      icon={<SafetyOutlined />}
+                      onClick={() => setGw(r.zone)}
+                    >
+                      网关策略
+                    </Button>
+                    <Dropdown
                     menu={{
                       items: [
                         {
@@ -992,7 +1008,8 @@ export default function Hosts() {
                     />
                   </Popconfirm>
                 </Space>
-              ),
+                );
+              },
             },
           ]}
         />
@@ -1012,7 +1029,7 @@ export default function Hosts() {
           extra={
             <Popconfirm
               title="清理残留网桥？"
-              description="只删「无地址、无成员口」的桥；有地址或有成员口的会保留并列出来。"
+              description="只删「无成员口」的孤儿桥；有成员口的会保留并列出来。桥上残留的地址会随接口一起删掉。"
               okText="清理"
               cancelText="取消"
               onConfirm={pruneBridges}
@@ -1074,9 +1091,11 @@ export default function Hosts() {
                 width: 130,
                 render: (_: unknown, r) =>
                   r.safe ? (
-                    <Tag color="orange">可自动删除</Tag>
+                    <Tooltip title="网络已从规格删掉，桥上也没有成员口：删除接口时连残留地址一起清掉">
+                      <Tag color="orange">可自动删除</Tag>
+                    </Tooltip>
                   ) : (
-                    <Tooltip title="还挂着地址或成员口，删掉可能断掉正在用的链路">
+                    <Tooltip title="还有容器挂在它上面（成员口 > 0），删掉会断开正在用的链路">
                       <Tag color="red">需要人工确认</Tag>
                     </Tooltip>
                   ),
@@ -1085,12 +1104,74 @@ export default function Hosts() {
           />
           {orphanBridges.some((b) => !b.safe) && (
             <Text type="secondary" style={{ fontSize: 12 }}>
-              标记「需要人工确认」的桥还挂着地址或成员口，删掉可能断掉正在用的链路。
-              确认不再使用后，可在宿主机执行 <code>ip link del 桥名</code>，并删掉
-              <code>/etc/network/interfaces</code> 里对应的{" "}
-              <code>auto 桥名</code> 段——只删接口不删配置，重启会被重建。
+              标记「需要人工确认」的桥上还有成员口（容器仍挂着），删掉会断链。
+              先在主机页把它们销毁或改挂到别的网络，再回来清理。确认不再使用后也可以
+              在宿主机执行 <code>ip link del 桥名</code>，并删掉{" "}
+              <code>/etc/network/interfaces</code> 里对应的 <code>auto 桥名</code> 段
+              ——只删接口不删配置，重启会被重建。
             </Text>
           )}
+        </Card>
+      )}
+
+      {/* PVE 面板里手工建的虚拟机不会进 vmid 分配表，以前界面上完全看不见 */}
+      {unmanaged.length > 0 && (
+        <Card
+          size="small"
+          title={
+            <Space size={8}>
+              <span>宿主上的其它虚拟机</span>
+              <Tag>{unmanaged.length}</Tag>
+            </Space>
+          }
+          style={{ marginBottom: 16 }}
+          extra={
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              不是本平台创建的，不受规格管理
+            </Text>
+          }
+        >
+          <Table
+            size="small"
+            rowKey={(r) => String(r.vmid)}
+            pagination={false}
+            dataSource={unmanaged}
+            columns={[
+              {
+                title: "CT / VM",
+                width: 110,
+                render: (_: unknown, r) => (
+                  <Text className="mono">{r.vmid ?? "—"}</Text>
+                ),
+              },
+              {
+                title: "类型",
+                width: 100,
+                render: (_: unknown, r) =>
+                  r.kind === "lxc" ? <Tag>容器</Tag> : <Tag color="blue">虚拟机</Tag>,
+              },
+              {
+                title: "名称",
+                dataIndex: "name",
+                render: (v: string) => v || <Text type="secondary">—</Text>,
+              },
+              {
+                title: "状态",
+                width: 100,
+                render: (_: unknown, r) =>
+                  r.status === "running" ? (
+                    <Tag color="green">运行</Tag>
+                  ) : (
+                    <Tag>停止</Tag>
+                  ),
+              },
+              { title: "节点", dataIndex: "node", width: 120 },
+            ]}
+          />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            这些是在 PVE 面板或用其它工具直接建的，没有经过规格，所以平台只展示、不接管：
+            要纳入管理请写进规格；不用了请到 PVE 里删除。
+          </Text>
         </Card>
       )}
 
