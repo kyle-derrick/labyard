@@ -1,23 +1,25 @@
 /** 全局拓扑图：react-flow 只负责画，语义全在后端。
  *
  * 后端给两类节点（`net:*` / `host:*`）和两类边（`attach` / `mirror`），
- * 方向都是数据流方向。前端做四件事：
- *   1. **一列一网段 + 区域框**（见 `layoutPositions`）：深度=列，每个 zone
- *      一块带标题的框，框内"网段卡在上、主机横排在下"——同一网段的全部
- *      节点永远在同一层、同一框里。
- *   2. **网口分侧**：外网口贴左缘、内网口贴右缘、抓包口贴下缘，略突出
- *      节点框。路径由自定义边 `LabEdge` 按 handle 朝向现算：跨列走列间
- *      走廊、长镜像线走画布底部走廊，全图零穿节点（内置 smoothstep 不
- *      避障，实测会穿 13 处）。
- *   3. 拖动不闪：数据轮询重建节点时保留 RF 内部当前位置，只换数据；
- *      拖动时边端点跟着 handle 走。
- *   4. 接住点击、多选、右键，交给页面开抽屉 / 弹菜单。
+ * 方向都是数据流方向。前端做三件事：
+ *
+ *   1. **一列一类，交替排开**（`layoutPositions`）：网段占一列、它的设备占
+ *      下一列，再下一个网段一列……即
+ *      `外网 | 网关·监控机·主机 | 内网 | 网关·监控机·主机 | …`。
+ *      网段只要看列就知道在第几层，不再画区域框（框里再套框，越看越乱）。
+ *   2. **连线全部横着走**：网段卡的出入口在**左右两侧**（左=上联进来 /
+ *      右=下挂设备），主机的网口 chip 朝着自己所在的网段。跨列线走列间
+ *      走廊（每条线一条车道，互不重合），所以线下不穿节点、上不掉头。
+ *   3. 拖动不闪、hover 只点亮相关的一小片，见文件后半。
+ *
+ * 镜像线的两端：**监控机**那端是它卡片下方的抓包口；**网关/主机**那端就
+ * 在它那块真实网口的 chip 上（和网络连线同一个锚点）——镜像本来就是从
+ * 这块网卡复制出去的，锚在别处就成了"凭空多出来一个口"。
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   BackgroundVariant,
-  BaseEdge,
   Controls,
   EdgeLabelRenderer,
   Handle,
@@ -37,24 +39,24 @@ import {
 import "@xyflow/react/dist/style.css";
 import type { TopoEdge, TopoIface, TopoNode } from "./api";
 
-/** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致，否则连线会悬空。 */
+/** 每种节点的画布尺寸。CSS 里的宽高必须和这里一致：网口 chip 是 absolute
+ * 吸在卡片边缘上的，尺寸对不上连线就会悬空。 */
 const DIM: Record<TopoNode["kind"], { w: number; h: number }> = {
   network: { w: 176, h: 60 },
-  host: { w: 172, h: 92 },
+  host: { w: 176, h: 92 },
 };
 
-/** 区域框（一个网段一个）与列间距。框把"同网段的全部节点"圈在一起，
- * 一眼就能看出"这个网对应的层"。 */
-const ZONE = {
-  pad: 12, // 框内左右边距
-  // 框底留白要容下**抓包口 chip**：chip 在卡片下缘再突出 9px、自身高 14px，
-  // 一共占卡片下方约 23px。留 26 才不至于让 chip 压住区域框的虚线边。
-  padBottom: 26,
-  head: 24, // 框标题条高
-  gap: 10, // 框标题 / 网段卡 / 主机行之间的纵向间距
-  colGap: 44, // 相邻两列（框）之间的走廊宽度——所有跨列线都走这里
-  rowGap: 18, // 同列上下两个框的间距
-  hostGap: 16, // 框内主机横排间距（网口 chip 比卡边还突出 ~17px，不能小于 16）
+/** 画布几何。所有间距只在这里改，别散落到各处。 */
+const GEO = {
+  pad: 40, // 画布左上留白
+  colGap: 100, // 列间走廊：跨列线全走这里（同时要容下镜像竖线与车道）
+  rowGap: 22, // 同列上下两个节点之间（要容下卡片下缘突出的抓包口 chip）
+  lane0: 46, // 第一条车道离目标口的距离
+  laneStep: 9, // 车道间距（同一个网段扇出多条线时用）
+  mir: 13, // 镜像线从网口 chip 外沿再往外走多少再下沉
+  mirStep: 10, // 同列同侧多台被镜像的主机，竖线依次错开（6 太小，看着像双线）
+  corridor: 44, // 画布底部走廊：在最低节点下方多少
+  busLane: 30, // 每台监控机一条横向采集通道
 };
 
 export const ROLE_LABEL: Record<string, string> = {
@@ -85,25 +87,12 @@ type Data = {
 
 type GNode = Node<Data, "lab">;
 
-type BoxData = {
-  label: string;
-  cidr: string;
-  hosts: number;
-  external: boolean;
-};
-type GBox = Node<BoxData, "zonebox">;
-
-/** 网口在哪一侧。约定：**左为入、右为出、下为镜像**。
+/** 网口在哪一侧。约定：**朝自己的网段**。
  *
- * - 网关：`eth1` 是上联口（外网 / 父网络，流量从这一侧进来）→ 左；
- *   `eth0` 是本 zone 的内网口（由它派生出去）→ 右。
- *   编号规则与后端 topology.rs 一致：eth0 恒为本网络，eth1 恒为上联。
- * - 监控机：抓包口 → 下；管理口（eth0，接它被部署到的那个网络）→ 左。
- * - 其他主机：只有一个入向口，全在左边。
- *
- * 之前只按 `net === "wan"` 判断，结果网关的 eth1（上联到父 zone 时
- * net 是父 zone 名）被放到右边，普通主机的内网口也被放到右边，与
- * 连线方向相反。
+ * - 网关：`eth1` 是上联口（接上一列那个网段）→ 左；`eth0` 是本 zone 内网口
+ *   （接下一列那个网段）→ 右。编号与后端 topology.rs 一致。
+ * - 监控机：抓包口（`capture`）→ 下；管理口 → 左。
+ * - 其他主机：只有一个入向口 → 左。
  */
 function sideOf(f: TopoIface, role: string | null): "l" | "r" | "b" {
   if (f.capture) return "b";
@@ -122,36 +111,43 @@ const SIDE_POS: Record<string, Position> = {
   b: Position.Bottom,
 };
 
-/** 网口 chip：按 side 吸在节点边缘（略突出 8px），handle 就在突出点上。
+/** handle 的位移要按侧单独给（见 IfaceChip 里的说明）：
+ *  左右口只居中 y、不横向平移；下口只居中 x、不纵向平移。 */
+const SIDE_TF: Record<string, string> = {
+  l: "translate(0, -50%)",
+  r: "translate(0, -50%)",
+  b: "translate(-50%, 0)",
+};
+
+/** 网口 chip。handle 用 react-flow 的默认定位（左口 left:0、右口 right:0、
+ *  下口 bottom:0 + 自身 -50% 偏移）——**正好落在 chip 的边缘上**。
  *
- * **一个网口两个连接点**（用户要求）：
- *   - main：正侧（左边口的正左、右边口的正右）——网络连线（uplink/inner）用它
- *   - mirror：口的外上方角——镜像线用它
- * 原因：主机/网关的内网口既跑网络流量、又可能被镜像；两条线锚在同一点
- * 会完全重合，分不清谁是谁。分开之后 hover 也能单独点亮。
- */
+ *  以前的写法给 handle 额外加了 ±9px，线头就停在 chip 外面一格，看着像
+ *  "接口位置和线头对不上"。要让线离 chip 远一点，应该挪 chip 容器
+ *  （下面 `left: -8`），不是挪 handle。 */
 function IfaceChip({ f, role }: { f: TopoIface; role: string | null }) {
   const side = sideOf(f, role);
   const tip = f.capture
     ? `${f.name} · 抓包（${f.net} 的流量）`
     : `${f.name} · ${f.net}${f.ip ? ` ${f.ip.replace(/\/\d+$/, "")}` : ""}`;
-  const isB = side === "b";
-  const style: React.CSSProperties = isB
-    ? { bottom: -9 }
-    : side === "l"
-      ? { left: -9 }
-      : { right: -9 };
+  // 两个方向各挂一个 handle：同一条 chip 既可能是边的起点（主机→网段、
+  // 主机→监控机），也可能是终点（网段→主机）。锚点同一个位置。
+  //
+  // `transform` 必须按侧覆盖：react-flow 默认 `translate(-50%,-50%)`，而它算
+  // 锚点时取 handle 的**外沿**（left 取 x、right 取 x+width、bottom 取
+  // y+height）。默认位移下 6px 的 handle 会让锚点偏出 chip 边缘 3px——缩放
+  // 70% 时就是"线头没贴住网口"。改成只居中对侧后，锚点正好落在 chip 边上。
   const handles = (["s", "t"] as const).map((t) => (
     <Handle
       key={t}
       type={t === "s" ? "source" : "target"}
       id={handleId(t, side, f.name)}
       position={SIDE_POS[side]}
-      style={{ width: 6, height: 6, opacity: 0, ...style }}
+      style={{ width: 6, height: 6, opacity: 0, border: "none", transform: SIDE_TF[side] }}
     />
   ));
   return (
-    <div className={`iface${f.capture ? " iface-cap" : ""}`} title={tip} style={{ position: "relative" }}>
+    <div className={`iface${f.capture ? " iface-cap" : ""}`} title={tip}>
       {handles}
       <span className="iface-name">{f.name}</span>
       {f.capture && <span className="iface-net">{f.net}</span>}
@@ -180,24 +176,21 @@ function LabNode({ data }: NodeProps<GNode>) {
     .join(" ");
 
   if (data.kind !== "host") {
-    // 网络节点（以及兜底）：左收右发；**底部**是"下挂主机"的出点
-    // （网段卡在上、主机横排在下，线垂直向下接入每台主机，不掉头）
+    // 网段卡：**左进右出**。左边收上联（本 zone 网关的内网口 / 父网段挂过来
+    // 的线），右边扇出到下挂设备。没有底部出点——网络连线不从下方走。
     return (
       <>
-        <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
-        {/* 底部两个出/入点：左侧给"下挂主机"（源），右侧给本 zone 网关的
-            内网口（目标）。分开摆，扇形线各走各的，不挤在一个点上。 */}
-        <Handle
-          type="source"
-          position={Position.Bottom}
-          id={handleId("s", "b", "inner")}
-          style={{ left: "34%", transform: "translate(-50%, 0)", opacity: 0 }}
-        />
         <Handle
           type="target"
-          position={Position.Bottom}
-          id={handleId("t", "b", "net")}
-          style={{ left: "66%", transform: "translate(-50%, 0)", opacity: 0 }}
+          position={Position.Left}
+          id={handleId("t", "l", "net")}
+          style={{ opacity: 0, border: "none", transform: "translate(0, -50%)" }}
+        />
+        <Handle
+          type="source"
+          position={Position.Right}
+          id={handleId("s", "r", "net")}
+          style={{ opacity: 0, border: "none", transform: "translate(0, -50%)" }}
         />
         <div className={cls} style={{ width: dim.w, height: dim.h }}>
           <div className="tn-row">
@@ -225,22 +218,18 @@ function LabNode({ data }: NodeProps<GNode>) {
                 : ""}
           </div>
         </div>
-        <Handle
-          type="source"
-          position={Position.Right}
-          id={handleId("s", "r", "net")}
-          style={{ opacity: 0 }}
-        />
       </>
     );
   }
 
-  // 主机节点：网口分侧——按"左入右出下镜像"，具体规则见 sideOf
+  // 主机：网口按"朝自己网段"分侧——左入右出（网关 eth0）、下抓包
   const left = data.ifaces.filter((f) => sideOf(f, data.role) === "l");
   const right = data.ifaces.filter((f) => sideOf(f, data.role) === "r");
   const bottom = data.ifaces.filter((f) => sideOf(f, data.role) === "b");
   return (
-    <>
+    // 外层只做定位容器：卡片自己有 overflow:hidden（截断长标题），网口 chip
+    // 又必须探出卡片边缘——放进卡片里就会被裁掉，所以兄弟节点摆放。
+    <div className="tn-wrap" style={{ width: dim.w, height: dim.h }}>
       <div className={cls} style={{ width: dim.w, height: dim.h }}>
         <div className="tn-row">
           <span className="tn-dot" data-st={data.retired ? "retired" : data.status} />
@@ -263,91 +252,38 @@ function LabNode({ data }: NodeProps<GNode>) {
           {data.retired ? "已废弃" : ""}
           {/* 监控机声明在别的网络里（如 lab:monitor、管理口在 wan）时，
               把声明名标出来，否则用户会以为凭空多了一台机器 */}
-          {typeof meta.declared === "string" && (
-            <span> · 声明 {String(meta.declared)}</span>
-          )}
+          {typeof meta.declared === "string" && <span> · 声明 {String(meta.declared)}</span>}
         </div>
-        {/* 分侧网口：绝对定位在框边缘，chip 突出 9px 方便连线 */}
-        <div
-          style={{
-            position: "absolute",
-            left: -8,
-            top: 14,
-            display: "flex",
-            flexDirection: "column",
-            gap: 6,
-          }}
-        >
-          {left.map((f) => (
-            <IfaceChip key={f.name} f={f} role={data.role} />
-          ))}
-        </div>
-        <div
-          style={{
-            position: "absolute",
-            right: -8,
-            top: 14,
-            display: "flex",
-            flexDirection: "column",
-            gap: 6,
-          }}
-        >
-          {right.map((f) => (
-            <IfaceChip key={f.name} f={f} role={data.role} />
-          ))}
-        </div>
-        <div
-          style={{
-            position: "absolute",
-            bottom: -9,
-            left: 0,
-            right: 0,
-            display: "flex",
-            justifyContent: "center",
-            gap: 6,
-          }}
-        >
-          {bottom.map((f) => (
-            <IfaceChip key={f.name} f={f} role={data.role} />
-          ))}
-        </div>
-        {/* 镜像出点：被采集的流量从这里向下汇入采集总线。
-            为什么不挂在网口的角上：框内主机是横排的，左侧只有 16px 间隙，
-            角上出线会直接压进左邻主机（实测穿模 4 点）。底部留白 26px 足够。 */}
-        <Handle
-          type="source"
-          position={Position.Bottom}
-          id="s:b:mir"
-          style={{ left: "76%", bottom: -6, transform: "translate(-50%, 0)", opacity: 1 }}
-          title="镜像出点"
-        >
-          <span className="mir-dot" />
-        </Handle>
       </div>
-    </>
-  );
-}
-
-/** 区域框：纯背景层，把同一网段的网段卡 + 主机圈在一起。
- * 不可选、不可连、不接收鼠标——只是"这个网段占这一层"的视觉边界。 */
-function ZoneBox({ data }: NodeProps<GBox>) {
-  return (
-    <div className={`zonebox${data.external ? " zonebox-wan" : ""}`}>
-      <div className="zonebox-head">
-        <span className="zonebox-name">{data.label}</span>
-        {data.cidr && <span className="zonebox-cidr mono">{data.cidr}</span>}
-        <span className="zonebox-count">{data.hosts} 台</span>
+      {/* 分侧网口：chip 吸在卡片边缘、向外突出 8px，handle 在 chip 边沿 */}
+      <div className="iface-col" style={{ left: -8, top: 14 }}>
+        {left.map((f) => (
+          <IfaceChip key={f.name} f={f} role={data.role} />
+        ))}
+      </div>
+      <div className="iface-col" style={{ right: -8, top: 14, alignItems: "flex-end" }}>
+        {right.map((f) => (
+          <IfaceChip key={f.name} f={f} role={data.role} />
+        ))}
+      </div>
+      <div className="iface-row" style={{ bottom: -9 }}>
+        {bottom.map((f) => (
+          <IfaceChip key={f.name} f={f} role={data.role} />
+        ))}
       </div>
     </div>
   );
 }
 
-/** 正交走廊边：按 handle 朝向拼折线，长距离线（镜像主干）走底部走廊。
+/** 正交边：全部横着走。
  *
- * 为什么不用内置 smoothstep：它**不避障**，实测全图 13 条边穿过节点
- * （`gw→net` 掉头穿自己、`net:l2→l3:gw` 穿 l2:w1、镜像主干横穿主机）。
- * 这里的三段式路由在所有场景下都只经过"列间空隙"或"画布下缘"：
- *   出向 18px → 走廊 → 进向 18px。
+ * 为什么要自己算路径：内置 smoothstep 不避障（实测穿节点十几次），而且
+ * 折点是"两端中点"，同一个网段扇出 5 条线时会在走廊里完全重合——hover
+ * 只能压在最上面那条上，看着像"线分叉"。
+ *
+ * 两种走法：
+ *   - 跨列（右→左）：出 10px → 走廊里的本车道竖线 → 横进目标口
+ *   - 镜像（口→底部抓包口）：出 13px → 下到画布底部走廊 → 横移 → 上顶进抓包口
  */
 function LabEdge({
   sourceX,
@@ -362,97 +298,50 @@ function LabEdge({
 }: EdgeProps) {
   const d0 = (data ?? {}) as {
     corridorY?: number;
-    exitX?: number;
-    bus?: boolean;
-    taps?: { sx: number; sy: number; x: number }[];
     lane?: number;
+    laneStep?: number;
+    mirSlot?: number;
+    dim?: boolean;
   };
+  const lbl = typeof (data ?? {}).label === "string" ? (data as { label: string }).label : "";
 
-  // ── 采集总线：同一台监控机的 N 个被采网段合并成一条主干 ──
-  // 每个 tap 从网段卡右缘水平出框、沿列间走廊下到底部通道，再共用一条
-  // 水平总线汇入监控机。以前是"每网段一条主干"，底部并排 4 条虚线。
-  if (d0.bus && Array.isArray(d0.taps) && typeof d0.corridorY === "number") {
-    const cy = d0.corridorY;
-    const taps = d0.taps;
-    const xs = [...taps.map((t) => t.x), targetX];
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const tapD = taps.map((t) => `M ${t.sx},${t.sy} L ${t.x},${t.sy} L ${t.x},${cy}`).join(" ");
-    const mainD = `M ${minX},${cy} L ${maxX},${cy}`;
-    const spineD = `M ${targetX},${cy} L ${targetX},${targetY}`;
-    const op = typeof style?.opacity === "number" ? style.opacity : 1;
-    return (
-      <>
-        {taps.map((t, i) => (
-          <circle key={i} cx={t.sx} cy={t.sy} r={2.2} fill="#f59e0b" opacity={op} />
-        ))}
-        <path d={tapD} style={style} fill="none" />
-        <path d={mainD} style={style} fill="none" />
-        <path d={spineD} style={style} fill="none" markerEnd={markerEnd} />
-      </>
-    );
-  }
-
-  const corridorY = typeof d0.corridorY === "number" ? d0.corridorY : undefined;
-  const stem = 18;
   const pts: [number, number][] = [[sourceX, sourceY]];
   const push = (x: number, y: number) => {
     const last = pts[pts.length - 1];
     if (Math.abs(last[0] - x) > 0.5 || Math.abs(last[1] - y) > 0.5) pts.push([x, y]);
   };
 
-  if (targetPosition === Position.Bottom && corridorY !== undefined) {
-    // 长线（镜像主干 / 展开的逐主机线）：出向 → 画布底部走廊 → 从下方进抓包口
-    if (sourcePosition === Position.Right) push(sourceX + 8, sourceY);
-    else if (sourcePosition === Position.Left) {
-      // 主机横排时间隙只有 16px：左侧 18px 会落进左邻主机，纵向也必须
-      // 越过本机卡片（eth0 chip 中心约在卡顶 +22）到"网段卡下方空隙"，
-      // 再横向出框。
-      push(sourceX, sourceY - 28);
-    } else if (sourcePosition === Position.Top) push(sourceX, sourceY - stem);
-    else push(sourceX, sourceY + stem);
-    // 先出本框右缘（列间走廊）再下沉，避免竖直段穿过本框内的主机行
-    const sideX = pts[pts.length - 1][0];
-    const sideY = pts[pts.length - 1][1];
-    const exitX = typeof d0.exitX === "number" ? d0.exitX : sideX;
-    if (Math.abs(exitX - sideX) > 1) push(exitX, sideY);
-    push(pts[pts.length - 1][0], corridorY);
-    push(targetX, corridorY);
-    push(targetX, targetY + stem);
+  if (targetPosition === Position.Bottom) {
+    // 镜像线：从网口外沿出来 → 沉到底部走廊 → 横移 → 从下方顶进抓包口。
+    // 同一列同侧的口 x 完全一样，靠 mirSlot 依次外错几像素，才看得出是几条线。
+    const slot = typeof d0.mirSlot === "number" ? d0.mirSlot : 0;
+    const dir = sourcePosition === Position.Left ? -1 : sourcePosition === Position.Right ? 1 : 0;
+    const off = dir * (GEO.mir + slot * GEO.mirStep);
+    const cy = typeof d0.corridorY === "number" ? d0.corridorY : targetY + GEO.corridor;
+    push(sourceX + off, sourceY);
+    push(sourceX + off, cy);
+    push(targetX, cy);
     push(targetX, targetY);
   } else if (sourcePosition === Position.Right && targetPosition === Position.Left) {
-    // 跨列上联：走列间走廊（目标左缘再往左 28px 处必是空隙）。
-    // lane：同一个网段出去的多条上联线各占一条竖线，否则它们在走廊里
-    // **完全重合**——hover 只能选中压在上面那条，看起来像"线分叉"。
+    // 跨列：走廊里按车道竖着走。车道号由 assemble 按目标 y 排序给出，
+    // 越靠上的目标越贴近目标列——扇出的线因此是"嵌套"的，互不交叉。
+    // laneStep 由 assemble 按该源口扇出的条数摊算：条数多时缩小间距，否则
+    // 会挤到卡片边上被 clamp，几条线重合、hover 只能选中最上面那条。
     const lane = typeof d0.lane === "number" ? d0.lane : 0;
-    const mid = targetX > sourceX + 40 ? targetX - 28 - lane * 12 : sourceX + stem;
-    push(mid, sourceY);
-    push(mid, targetY);
-    push(targetX, targetY);
-  } else if (sourcePosition === Position.Bottom && targetPosition === Position.Top) {
-    // 本网段下挂主机：垂直下行，端点错开时中段水平
-    const midY = sourceY + Math.max(14, (targetY - sourceY) * 0.45);
-    push(sourceX, midY);
-    push(targetX, midY);
-    push(targetX, targetY);
-  } else if (targetPosition === Position.Bottom) {
-    // 右/左 → 底（网关内网口 → 本网段卡）：**先竖直**沿主机间隙上到
-    // 网段卡下方的空隙（targetY + 6），再横向进底。若先横移 18px 会
-    // 擦进右边相邻主机的左上角（实测 22 个采样点穿 cache）。
-    const gapY = targetY + 6;
-    push(sourceX, gapY);
-    push(targetX, gapY);
-    push(targetX, targetY);
-  } else if (sourcePosition === Position.Bottom && targetPosition === Position.Left) {
-    // 网段卡下挂主机：水平段贴着主机行**上方**的空隙走（sourceY + 6），
-    // 否则 +18 会横穿中间那台主机的顶部。
-    const midY = sourceY + 6;
-    push(sourceX, midY);
-    // targetX 是**网口 chip 上**的 handle 位置，比主机卡左缘还靠左 19px；
-    // 从 handle 往左让 8px 会进入左邻主机。所以竖线走在 chip 的**右边**
-    // （主机卡左缘与 chip 之间的间隙），最后再向左拐 8px 进 handle。
-    push(targetX + 8, midY);
-    push(targetX + 8, targetY);
+    const step = typeof d0.laneStep === "number" ? d0.laneStep : GEO.laneStep;
+    if (Math.abs(targetY - sourceY) < 1) {
+      push(targetX, targetY);
+    } else {
+      const laneX = Math.max(targetX - GEO.lane0 - lane * step, sourceX + 10);
+      push(laneX, sourceY);
+      push(laneX, targetY);
+      push(targetX, targetY);
+    }
+  } else if (sourcePosition === Position.Left) {
+    // 兜底（布局异常时）：往左让一格再横走
+    const laneX = Math.min(sourceX - GEO.lane0, targetX + 10);
+    push(laneX, sourceY);
+    push(laneX, targetY);
     push(targetX, targetY);
   } else {
     const midX = (sourceX + targetX) / 2;
@@ -462,17 +351,33 @@ function LabEdge({
   }
 
   const d = pts.map((q, i) => `${i ? "L" : "M"} ${q[0]},${q[1]}`).join(" ");
-  const lbl = typeof (data ?? {}).label === "string" ? (data as { label: string }).label : "";
-  // 标签放在路径中点（长线就放在走廊上）——只在 hover 展开时由 assemble 传入
-  const mid = pts[Math.floor(pts.length / 2)] ?? [sourceX, sourceY];
+
+  // 标签挂在最长一段的中点上（折线中点常常落在拐角上，看起来像飘着）
+  let best: [[number, number], [number, number]] = [pts[0], pts[pts.length - 1]];
+  let bestLen = -1;
+  for (let i = 1; i < pts.length; i++) {
+    const len = Math.abs(pts[i][0] - pts[i - 1][0]) + Math.abs(pts[i][1] - pts[i - 1][1]);
+    if (len > bestLen) {
+      bestLen = len;
+      best = [pts[i - 1], pts[i]];
+    }
+  }
+  const lp: [number, number] = [(best[0][0] + best[1][0]) / 2, (best[0][1] + best[1][1]) / 2];
+
   return (
     <>
-      <BaseEdge path={d} style={style} markerEnd={markerEnd} />
+      <path d={d} className="lab-path" fill="none" style={style} markerEnd={markerEnd} />
+      {/* 加粗的透明命中区：细线也好点中。被淡化（正聚焦别的线）时不挂
+          命中区——否则鼠标一移开就被旁边那条几乎看不见的线接住，表现为
+          "凸显之后移出不会恢复"。 */}
+      {!d0.dim && (
+        <path d={d} fill="none" stroke="transparent" strokeWidth={11} style={{ pointerEvents: "stroke" }} />
+      )}
       {lbl && (
         <EdgeLabelRenderer>
           <div
             className="edge-lbl"
-            style={{ transform: `translate(-50%, -50%) translate(${mid[0]}px, ${mid[1]}px)` }}
+            style={{ transform: `translate(-50%, -50%) translate(${lp[0]}px, ${lp[1]}px)` }}
           >
             {lbl}
           </div>
@@ -483,7 +388,7 @@ function LabEdge({
 }
 
 const edgeTypes = { lab: LabEdge };
-const nodeTypes = { lab: LabNode, zonebox: ZoneBox };
+const nodeTypes = { lab: LabNode };
 
 /** 边的画法参数：uplink 用蓝色描边 + 箭头，其余弱化成灰线。 */
 function attachSpec(e: TopoEdge): { stroke: string; strokeWidth: number; marker?: boolean } {
@@ -499,12 +404,10 @@ function mirrorSpec(hot: boolean): Partial<Edge> {
   return {
     style: {
       stroke: "#f59e0b",
-      strokeWidth: hot ? 2.2 : 1.4,
+      strokeWidth: hot ? 2.2 : 1.3,
       strokeDasharray: "5 4",
-      opacity: hot ? 1 : 0.45,
+      opacity: hot ? 1 : 0.5,
     },
-    // 不带 label：谁抓谁看两端就够，多条线的标签挤在画布中部
-    // 互相重叠（"镜像通道 x - eth0"铺一片），信息还重复。
     markerEnd: {
       type: MarkerType.ArrowClosed,
       color: "#f59e0b",
@@ -522,38 +425,34 @@ function uniqNodes(nodes: TopoNode[]): Map<string, TopoNode> {
   return uniq;
 }
 
-type Box = {
-  id: string;
-  zone: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  label: string;
-  cidr: string;
-  hosts: number;
-  external: boolean;
-};
+/** 镜像边的 id。带抓包口名：同一台源主机可能被复制到同一台监控机的
+ *  多个抓包口上，只用 `from->to` 会撞 id，React Flow 会丢掉一条。 */
+function mirrorEdgeId(e: TopoEdge): string {
+  return `mirror:${e.from}->${e.to}:${e.target_iface ?? ""}`;
+}
 
 type Layout = {
   pos: Map<string, { x: number; y: number }>;
-  /** 每个 zone 一块区域框：框住同网段的网段卡 + 全部主机 */
-  boxes: Box[];
-  /** 画布底部走廊：所有长距离镜像主干沿这条水平线走，永远在节点下方 */
+  /** 节点在第几列（0 起）。跨列线的车道、镜像线的错位都按它算。 */
+  colOf: Map<string, number>;
+  /** 画布底部走廊：镜像竖线到这里汇成一条总干 */
   corridorY: number;
+  /** 每台监控机一条横向通道（多台监控机时上下错开） */
+  laneOf: Map<string, number>;
 };
 
-/** 布局：**一列一网段**，深度 = 列号。
+/** 布局：**一列一网段、一列设备，交替**。
  *
- * 每列一个带标题的区域框，框内：网段卡在上（居中）、主机横排在下。
- * 同一网段的全部节点永远落在同一个框、同一层，一眼可见归属；
- * 跨列只有 attach 的 uplink 一条，走列间走廊（`ZONE.colGap`）。
+ *   col0 外网 │ col1 [网关 监控机 主机] │ col2 内网 │ col3 [网关 监控机 主机] │ …
  *
- * 之前是"网段卡一列 + 主机一列"的两小列：`gw.eth0(右) → net(左)` 成了反向
- * 掉头线、穿过自己；`net:l2 → l3:gw` 穿过 l2:w1。现在网段卡和主机竖的垂直
- * 关系改成"上→下"，网段出来的线全部向下，不再掉头。
+ * 列号：网段 = 父网段 + 2（中间那列留给它的设备）；网关在本网段左边一列
+ * （它的 eth1 朝左接上层网段、eth0 朝右接自己的网段），其他主机在右边一列。
+ * 因此所有 attach 边都是"右→左"的横向线，网络连线既不会从卡下方出来，
+ * 也不会掉头。
  *
- * 深度从 attach 边的 `port: uplink` 推：`net:<父> → host:<子>:gateway`。
+ * 纵向：每列按"左邻列连接对象的高度"排——同一网段的设备挨在一起、
+ * 网关对着它的网段。监控机排在本列最底：它的抓包口在卡片下方，采集线要
+ * 从下面顶上来，底下不能压着别的卡。
  */
 function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
   const uniq = uniqNodes(nodes);
@@ -563,111 +462,94 @@ function layoutPositions(nodes: TopoNode[], edges: TopoEdge[]): Layout {
   for (const e of edges) {
     if (e.kind !== "attach" || e.port !== "uplink") continue;
     if (!e.from.startsWith("net:") || !e.to.startsWith("host:")) continue;
-    const child = e.to.split(":")[1];
-    parent.set(child, e.from.slice(4));
+    parent.set(e.to.split(":")[1], e.from.slice(4));
   }
-  const depthOf = (zone: string) => {
-    let d = 0;
+  const netCol = (zone: string) => {
+    let c = 0;
     let cur = zone;
-    for (let guard = 0; guard < 16 && parent.has(cur); guard++) {
+    for (let g = 0; g < 16 && parent.has(cur); g++) {
       cur = parent.get(cur)!;
-      d++;
+      c += 2;
     }
-    return d;
+    return c;
   };
 
-  const groups = new Map<string, { net: TopoNode | null; hosts: TopoNode[] }>();
+  const colOf = new Map<string, number>();
   for (const n of uniq.values()) {
-    const z = zoneOf(n);
-    const g = groups.get(z) ?? { net: null, hosts: [] };
-    if (n.kind === "network") g.net = n;
-    else g.hosts.push(n);
-    groups.set(z, g);
+    if (n.kind === "network") colOf.set(n.id, netCol(zoneOf(n)));
+    else {
+      const c = netCol(zoneOf(n));
+      colOf.set(n.id, n.role === "gateway" ? Math.max(0, c - 1) : c + 1);
+    }
   }
 
-  // 框内主机顺序：网关 → 监控机 → 其他主机（固定，不随轮询跳动）
-  const rank = (n: TopoNode) => (n.role === "gateway" ? 0 : n.role === "monitor" ? 1 : 2);
-  for (const g of groups.values()) {
-    g.hosts.sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
+  // 纵向对齐的参照：右邻列的节点看着左邻列里与它相连的那个
+  const refOf = new Map<string, string>();
+  for (const e of edges) {
+    if (e.kind !== "attach") continue;
+    const ca = colOf.get(e.from);
+    const cb = colOf.get(e.to);
+    if (ca === undefined || cb === undefined) continue;
+    if (cb > ca) refOf.set(e.to, e.from);
+    else if (ca > cb) refOf.set(e.from, e.to);
   }
 
-  const boxSize = (z: string) => {
-    const g = groups.get(z)!;
-    const n = g.hosts.length;
-    const rowW = n > 0 ? n * DIM.host.w + (n - 1) * ZONE.hostGap : 0;
-    const w = Math.max(DIM.network.w, rowW) + ZONE.pad * 2;
-    const h =
-      ZONE.head +
-      ZONE.gap +
-      DIM.network.h +
-      (n > 0 ? ZONE.gap + DIM.host.h : 0) +
-      ZONE.padBottom;
-    return { w, h };
-  };
-
-  // 深度 → 该列的 zone（同列的兄弟网段按名字排，顺序稳定）
-  const cols = new Map<number, string[]>();
-  for (const z of groups.keys()) {
-    const d = depthOf(z);
-    const arr = cols.get(d) ?? [];
-    arr.push(z);
-    cols.set(d, arr);
+  const byCol = new Map<number, TopoNode[]>();
+  for (const n of uniq.values()) {
+    const c = colOf.get(n.id) ?? 0;
+    const arr = byCol.get(c) ?? [];
+    arr.push(n);
+    byCol.set(c, arr);
   }
-  for (const arr of cols.values()) arr.sort();
-
-  const maxD = Math.max(0, ...cols.keys());
-  const colW = new Map<number, number>();
-  for (const [d, zs] of cols) colW.set(d, Math.max(...zs.map((z) => boxSize(z).w)));
-
-  const colX = new Map<number, number>();
-  let cx = 36;
-  for (let d = 0; d <= maxD; d++) {
-    colX.set(d, cx);
-    cx += (colW.get(d) ?? 0) + ZONE.colGap;
-  }
+  const maxCol = Math.max(0, ...byCol.keys());
 
   const pos = new Map<string, { x: number; y: number }>();
-  const boxes: Box[] = [];
-  let bottom = 0;
+  const rank = (n: TopoNode) => (n.role === "gateway" ? 0 : n.role === "monitor" ? 2 : 1);
+  let bottom = GEO.pad;
 
-  for (const [d, zs] of cols) {
-    let y = 36;
-    for (const z of zs) {
-      const g = groups.get(z)!;
-      const { w, h } = boxSize(z);
-      const bx = colX.get(d)!;
-      const meta = (g.net?.meta ?? {}) as Record<string, unknown>;
+  for (let c = 0; c <= maxCol; c++) {
+    const list = byCol.get(c) ?? [];
+    if (!list.length) continue;
 
-      // 网段卡：框内水平居中、贴标题条下方
-      if (g.net) {
-        pos.set(g.net.id, { x: bx + (w - DIM.network.w) / 2, y: y + ZONE.head + ZONE.gap });
-      }
-      // 主机：网段卡下方横排（超过框宽的极端情况由 fitView 兜住）
-      const rowW = g.hosts.length * DIM.host.w + Math.max(0, g.hosts.length - 1) * ZONE.hostGap;
-      const rowX = bx + (w - rowW) / 2;
-      const rowY = y + ZONE.head + ZONE.gap + DIM.network.h + ZONE.gap;
-      g.hosts.forEach((hn, i) =>
-        pos.set(hn.id, { x: rowX + i * (DIM.host.w + ZONE.hostGap), y: rowY }),
-      );
+    const wantY = (n: TopoNode): number | null => {
+      const r = refOf.get(n.id);
+      const rp = r ? pos.get(r) : undefined;
+      const rn = r ? uniq.get(r) : undefined;
+      if (!rp || !rn) return null;
+      return rp.y + DIM[rn.kind].h / 2 - DIM[n.kind].h / 2;
+    };
 
-      boxes.push({
-        id: `zone:${z}`,
-        zone: z,
-        x: bx,
-        y,
-        w,
-        h,
-        label: g.net?.label ?? z,
-        cidr: typeof meta.cidr === "string" ? meta.cidr : "",
-        hosts: g.hosts.length,
-        external: meta.external === true,
-      });
-      bottom = Math.max(bottom, y + h);
-      y += h + ZONE.rowGap;
+    list.sort((a, b) => {
+      // 监控机沉底（采集竖线从下方顶上来，下面不能有卡）
+      const ma = a.role === "monitor" ? 1 : 0;
+      const mb = b.role === "monitor" ? 1 : 0;
+      if (ma !== mb) return ma - mb;
+      const wa = wantY(a);
+      const wb = wantY(b);
+      if (wa !== null && wb !== null && Math.abs(wa - wb) > 1) return wa - wb;
+      return rank(a) - rank(b) || a.label.localeCompare(b.label);
+    });
+
+    const x = GEO.pad + c * (DIM.network.w + GEO.colGap);
+    let y = GEO.pad;
+    for (const n of list) {
+      const w = wantY(n);
+      if (w !== null) y = Math.max(y, w);
+      pos.set(n.id, { x: x + (DIM.network.w - DIM[n.kind].w) / 2, y });
+      y += DIM[n.kind].h + GEO.rowGap;
     }
+    bottom = Math.max(bottom, y - GEO.rowGap);
   }
 
-  return { pos, boxes, corridorY: bottom + 44 };
+  // 每台监控机一条横向采集通道（按列、再按上下顺序）
+  const monitors = [...uniq.values()]
+    .filter((n) => n.role === "monitor")
+    .sort((a, b) => (pos.get(a.id)?.y ?? 0) - (pos.get(b.id)?.y ?? 0))
+    .map((n) => n.id);
+  const laneOf = new Map<string, number>();
+  monitors.forEach((id, i) => laneOf.set(id, i));
+
+  return { pos, colOf, corridorY: bottom + GEO.corridor, laneOf };
 }
 
 function assemble(
@@ -677,198 +559,127 @@ function assemble(
   selected: Set<string>,
   hotMirror: Set<string>,
   dimmed: Set<string>,
-  /** 展开逐主机镜像线的网络（`zone->监控机`）；空 = 只画聚合主干 */
-  expand: Set<string>,
   /** 当前悬停的边：只点亮它、淡化其余线与无关节点 */
   hoverEdge: string | null,
-): { nodes: (GNode | GBox)[]; edges: Edge[] } {
+): { nodes: GNode[]; edges: Edge[] } {
   const uniq = uniqNodes(nodes);
-  const zoneOf = (id: string) => (id.startsWith("net:") ? id.slice(4) : (id.split(":")[1] ?? ""));
 
-  // 区域框垫在最底层：不可拖、不可选、不参与连线，只是"这一层是这个网段"
-  const rfNodes: (GNode | GBox)[] = layout.boxes.map((b) => ({
-    id: b.id,
-    type: "zonebox" as const,
-    position: { x: b.x, y: b.y },
-    width: b.w,
-    height: b.h,
-    draggable: false,
-    selectable: false,
-    connectable: false,
-    deletable: false,
-    focusable: false,
-    zIndex: -1,
-    data: { label: b.label, cidr: b.cidr, hosts: b.hosts, external: b.external },
-  }));
-
-  /** 某个节点上某块网口的 handle side（不在清单里就兜底左侧） */
+  /** 某个节点上某块网口在哪个侧（不在清单里就兜底左侧） */
   const sideOfOn = (nodeId: string, iface: string): string => {
     const n = uniq.get(nodeId);
     const f = n?.ifaces?.find((x) => x.name === iface);
     return f ? sideOf(f, n?.role ?? null) : "l";
   };
 
-  const inSameBox = (e: TopoEdge) => zoneOf(e.from) === zoneOf(e.to);
+  /** 某节点上第一块（非）抓包网口——边没写 iface 时兜底，别写死 eth1：
+   *  多抓包口的监控机、改过编号的老规格都会因此把线连到不存在的 handle。 */
+  const ifaceOn = (nodeId: string, capture: boolean): string | null => {
+    const list = uniq.get(nodeId)?.ifaces ?? [];
+    return (capture ? list.find((f) => f.capture) : list.find((f) => !f.capture))?.name ?? null;
+  };
 
-  // ── handle 解析：网段卡没有物理网口，按语义选固定的接入点 ──
-  //   net 作为源、目标在本框内（下挂主机 / 管理口）：走底部，线垂直向下
-  //   net 作为源、目标在别的框（跨列 uplink）：走右缘，线走列间走廊
-  //   net 作为目标：走底部右侧（本 zone 网关的内网口接进来）
+  // ── handle 解析：网段卡没有物理网口，左进右出 ──
   const srcHandle = (e: TopoEdge): string | undefined => {
     if (e.source_iface) return handleId("s", sideOfOn(e.from, e.source_iface), e.source_iface);
-    if (e.from.startsWith("net:")) {
-      return inSameBox(e) ? handleId("s", "b", "inner") : handleId("s", "r", "net");
-    }
-    return undefined;
+    if (e.from.startsWith("net:")) return handleId("s", "r", "net");
+    const f = ifaceOn(e.from, false);
+    return f ? handleId("s", sideOfOn(e.from, f), f) : undefined;
   };
   const tgtHandle = (e: TopoEdge): string | undefined => {
     if (e.target_iface) return handleId("t", sideOfOn(e.to, e.target_iface), e.target_iface);
-    if (e.to.startsWith("net:")) return handleId("t", "b", "net");
-    return undefined;
+    if (e.to.startsWith("net:")) return handleId("t", "l", "net");
+    const f = ifaceOn(e.to, false);
+    return f ? handleId("t", sideOfOn(e.to, f), f) : undefined;
   };
-  const boxOfZone = new Map(layout.boxes.map((b) => [b.zone, b]));
 
-  // 同一网段出去的多条跨列上联线：按目标 y 排序分车道（走廊里平行分开）
+  const yOf = (id: string) => layout.pos.get(id)?.y ?? 0;
+
+  // 车道：同一个源口出去的多条线，按目标高低编号；越靠上的目标越贴目标列。
+  // 不编号的话它们会在走廊里完全重合，hover 只能选中压在上面那条。
+  // 间距按扇出条数摊算，条数多时自动收窄，避免最后几条挤到卡片边上重合。
   const laneOf = new Map<string, number>();
+  const laneStepOf = new Map<string, number>();
   {
-    const byFrom = new Map<string, TopoEdge[]>();
+    const bySrc = new Map<string, TopoEdge[]>();
     for (const e of edges) {
-      if (e.kind !== "attach" || e.port !== "uplink" || !e.from.startsWith("net:")) continue;
-      const arr = byFrom.get(e.from) ?? [];
+      if (e.kind !== "attach") continue;
+      const arr = bySrc.get(e.from) ?? [];
       arr.push(e);
-      byFrom.set(e.from, arr);
+      bySrc.set(e.from, arr);
     }
-    for (const arr of byFrom.values()) {
-      arr.sort((a, b) => (layout.pos.get(a.to)?.y ?? 0) - (layout.pos.get(b.to)?.y ?? 0));
-      arr.forEach((e, i) => laneOf.set(`${e.from}->${e.to}`, i));
+    for (const [src, arr] of bySrc) {
+      arr.sort((a, b) => yOf(a.to) - yOf(b.to));
+      arr.forEach((e, i) => laneOf.set(`${e.from}|${e.to}`, i));
+      // 走廊可用宽度 = 列间距 - 第一条车道占位 - 两侧留白
+      const room = Math.max(0, GEO.colGap - GEO.lane0 - 8);
+      const step = arr.length > 1 ? Math.min(GEO.laneStep, Math.max(5, room / (arr.length - 1))) : GEO.laneStep;
+      laneStepOf.set(src, step);
+    }
+  }
+
+  // 同一列、同一侧的被镜像主机：竖线依次外错，不然它们完全重合。
+  // 按 **每条边** 分侧编号（不是每台主机）：网关的 eth0 在右、普通主机在左，
+  // 一台机器两侧都被镜像时，如果只按主机编号，两侧会互相覆盖槽位。
+  const mirSlot = new Map<string, number>();
+  {
+    const bySide = new Map<string, string[]>();
+    for (const e of edges) {
+      if (e.kind !== "mirror") continue;
+      const sIf = e.source_iface ?? ifaceOn(e.from, false);
+      const c = layout.colOf.get(e.from);
+      if (c === undefined || !sIf) continue;
+      const k = `${c}:${sideOfOn(e.from, sIf)}`;
+      const arr = bySide.get(k) ?? [];
+      if (!arr.includes(e.from)) arr.push(e.from);
+      bySide.set(k, arr);
+    }
+    for (const [k, arr] of bySide) {
+      arr.sort((a, b) => yOf(a) - yOf(b)).forEach((id, i) => mirSlot.set(`${k}|${id}`, i));
     }
   }
 
   const rfEdges: Edge[] = [];
 
-  /** 单条逐主机镜像线（源口 → 监控机抓包口）。聚合主干展开时才画。
-   * forceHot：从展开的主干来的线直接高亮。 */
-  const perHostMirror = (e: TopoEdge, i: number, forceHot = false): Edge => {
-    const id = `${e.kind}:${e.from}->${e.to}:${i}`;
-    const ts = e.target_iface ? sideOfOn(e.to, e.target_iface) : "b";
-    return {
+  // ── 镜像线：源主机的网口 → 监控机的抓包口 ──
+  // 一艘主机一条线，同一台监控机的线共用一条底部横向通道，看着是一根总线，
+  // 但每条都能单独 hover（"这台机器到底被谁在抓"要能问得出来）。
+  for (const e of edges) {
+    if (e.kind !== "mirror") continue;
+    if (!uniq.has(e.from) || !uniq.has(e.to) || e.from === e.to) continue;
+    const id = mirrorEdgeId(e);
+    const lane = layout.laneOf.get(e.to) ?? 0;
+    // 两端都按名称解析出**真实存在**的网口：规格里缺 iface 时回落到该机第一块
+    // （非）抓包口。写死 eth1 的话，多抓包口/改过编号的机器会连到不存在的
+    // handle，React Flow 悄悄把线拉到节点正中，看着像"线穿卡"。
+    const sIf = e.source_iface ?? ifaceOn(e.from, false);
+    const side = sIf ? sideOfOn(e.from, sIf) : "l";
+    const slot = mirSlot.get(`${layout.colOf.get(e.from) ?? 0}:${side}|${e.from}`) ?? 0;
+    const tIf = e.target_iface ?? ifaceOn(e.to, true);
+    const ts = tIf ? sideOfOn(e.to, tIf) : "b";
+    rfEdges.push({
       id,
       source: e.from,
       target: e.to,
-      // 镜像线走**底部镜像点**：网络连线占网口正侧，两者完全分开
-      sourceHandle: "s:b:mir",
-      targetHandle: handleId("t", ts, e.target_iface ?? "eth1"),
+      sourceHandle: sIf ? handleId("s", side, sIf) : undefined,
+      targetHandle: tIf ? handleId("t", ts, tIf) : undefined,
       type: "lab",
       data: {
-        corridorY: layout.corridorY,
-        exitX:
-          (boxOfZone.get(zoneOf(e.from))?.x ?? 0) +
-          (boxOfZone.get(zoneOf(e.from))?.w ?? 0) +
-          20,
-        sameBox: inSameBox(e),
-        label: "",
+        // 错位靠"起点外移"实现：同列同侧的口 x 一样，错开才看得清是几条线
+        corridorY: layout.corridorY + lane * GEO.busLane,
+        mirSlot: slot,
+        tip: `镜像 ${e.from.split(":").slice(1).join(":")}:${sIf ?? "?"} → ${e.to
+          .split(":")
+          .slice(1)
+          .join(":")}:${tIf ?? "?"}`,
         from: e.from,
         to: e.to,
-        tip: `镜像 ${e.from.split(":").slice(1).join(":")}:${e.source_iface ?? "?"} → ${e.to.split(":").slice(1).join(":")}:${e.target_iface ?? "?"}`,
       },
-      ...mirrorSpec(forceHot || hotMirror.has(id)),
-    } as Edge;
-  };
-
-  // ── 整网采集：同网络的多条逐主机线合成一条主干 ──
-  // 语义上它是网络级开关（开在网络节点上），所以主干画 网络 → 监控机抓包口，
-  // 悬停监控机或主干时再把逐主机细线展开。
-  const groups = new Map<string, TopoEdge[]>();
-  const singles: TopoEdge[] = [];
-  for (const e of edges) {
-    if (e.kind !== "mirror") continue;
-    const zone = e.from.startsWith("host:") ? e.from.split(":")[1] : "";
-    const netId = `net:${zone}`;
-    if (zone && uniq.has(netId) && e.from !== e.to) {
-      const k = `${zone}->${e.to}`;
-      const arr = groups.get(k) ?? [];
-      arr.push(e);
-      groups.set(k, arr);
-    } else {
-      singles.push(e);
-    }
-  }
-
-  let seq = 0;
-  // 按监控机聚合：一台监控机抓几个网段 -> 一条采集总线
-  const byMonitor = new Map<string, { k: string; zone: string; list: TopoEdge[] }[]>();
-  for (const [k, list] of groups) {
-    if (list.length < 2) {
-      singles.push(...list);
-      continue;
-    }
-    const [zone, mon] = k.split("->");
-    const arr = byMonitor.get(mon) ?? [];
-    arr.push({ k, zone, list });
-    byMonitor.set(mon, arr);
-  }
-
-  const monitors = [...byMonitor.keys()].sort();
-  monitors.forEach((mon, lane) => {
-    const items = byMonitor.get(mon)!;
-    // 每条总线一条独立通道：底部走廊按监控机顺序 +18px，互不重叠
-    const laneY = layout.corridorY + lane * 28;
-    const taps = items.map((it) => {
-      const netPos = layout.pos.get(`net:${it.zone}`);
-      const box = boxOfZone.get(it.zone);
-      return {
-        // 起点：网段卡右缘中线
-        sx: (netPos?.x ?? 0) + DIM.network.w,
-        sy: (netPos?.y ?? 0) + DIM.network.h / 2,
-        // 下沉位置：本框右缘外的列间走廊（同一列的两个网段共用，正常）
-        x: (box?.x ?? 0) + (box?.w ?? 0) + 20,
-      };
-    });
-    const head = items[0].list[0];
-    const iface = head.target_iface ?? "eth1";
-    const open = [...expand].some((k) => k.endsWith(`->${mon}`));
-    const totalHosts = items.reduce((n, it) => n + it.list.length, 0);
-
-    rfEdges.push({
-      id: `mirror-bus:${mon}`,
-      // source 只是载体（路径由 taps 决定），挂在第一个被采网段上
-      source: `net:${items[0].zone}`,
-      sourceHandle: handleId("s", "r", "net"),
-      target: mon,
-      targetHandle: handleId("t", sideOfOn(mon, iface), iface),
-      type: "lab",
-      data: {
-        bus: true,
-        corridorY: laneY,
-        taps,
-        label: open ? `采集 ${items.length} 个网段 · ${totalHosts} 台` : "",
-        from: `net:${items[0].zone}`,
-        to: mon,
-        tip: `采集总线 → ${mon.split(":").slice(1).join(":")}（${items.length} 网段 · ${totalHosts} 台）`,
-      },
-      style: {
-        stroke: "#f59e0b",
-        strokeWidth: open ? 2.2 : 1.3,
-        strokeDasharray: "6 4",
-        opacity: open ? 1 : 0.55,
-      },
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        color: "#f59e0b",
-        width: 15,
-        height: 15,
-      },
-      zIndex: open ? 6 : 3,
+      ...mirrorSpec(hotMirror.has(id)),
     } as Edge);
+  }
 
-    if (open) {
-      items.forEach((it) => it.list.forEach((e, i) => rfEdges.push(perHostMirror(e, i, true))));
-    }
-  });
-
-  singles.forEach((e, i) => rfEdges.push(perHostMirror(e, i)));
-
-  // attach 边：端点锚在具体网口的 handle 上。
+  // ── attach 边：端点锚在具体网口的 chip 上 ──
+  let seq = 0;
   for (const e of edges) {
     if (e.kind !== "attach") continue;
     if (!uniq.has(e.from) || !uniq.has(e.to) || e.from === e.to) continue;
@@ -882,14 +693,16 @@ function assemble(
       targetHandle: tgtHandle(e),
       type: "lab",
       data: {
-        sameBox: inSameBox(e),
-        lane: laneOf.get(`${e.from}->${e.to}`) ?? 0,
-        label: "",
+        lane: laneOf.get(`${e.from}|${e.to}`) ?? 0,
+        laneStep: laneStepOf.get(e.from) ?? GEO.laneStep,
+        tip: `${e.from.split(":").slice(1).join(":")}${e.source_iface ? ":" + e.source_iface : ""} → ${e.to
+          .split(":")
+          .slice(1)
+          .join(":")}${e.target_iface ? ":" + e.target_iface : ""}${
+          e.port === "uplink" ? "（上联）" : ""
+        }`,
         from: e.from,
         to: e.to,
-        tip: `${e.from.split(":").slice(1).join(":")}${e.source_iface ? ":" + e.source_iface : ""} → ${
-          e.to.split(":").slice(1).join(":")
-        }${e.target_iface ? ":" + e.target_iface : ""}${e.port === "uplink" ? "（上联）" : ""}`,
       },
       style: { stroke: spec.stroke, strokeWidth: spec.strokeWidth },
       markerEnd: spec.marker
@@ -900,20 +713,37 @@ function assemble(
   }
 
   // ── 悬停聚焦：点亮这一条、压暗其余，并显示它的接口标签 ──
-  const focused = hoverEdge ? rfEdges.map((e) => {
-    const foc = e.id === hoverEdge;
-    const d = (e.data ?? {}) as { tip?: string };
-    return {
-      ...e,
-      style: {
-        ...(e.style ?? {}),
-        opacity: foc ? 1 : 0.06,
-        strokeWidth: foc ? 2.6 : (e.style as { strokeWidth?: number })?.strokeWidth,
-      },
-      zIndex: foc ? 999 : e.zIndex,
-      data: foc && !(e.data as { label?: string })?.label ? { ...e.data, label: d.tip ?? "" } : e.data,
-    } as Edge;
-  }) : rfEdges;
+  // 悬停某个节点走另一条分支：点亮与它相关的镜像线，其余线**也**压暗——
+  // 只淡节点不淡线的话，线还亮着，看着像"淡了一半"，对比很突兀。
+  const dimByNodeFocus = !hoverEdge && hotMirror.size > 0;
+  const focused = hoverEdge
+    ? rfEdges.map((e) => {
+        const foc = e.id === hoverEdge;
+        const d = (e.data ?? {}) as { tip?: string };
+        return {
+          ...e,
+          style: {
+            ...(e.style ?? {}),
+            opacity: foc ? 1 : 0.08,
+          },
+          zIndex: foc ? 999 : e.zIndex,
+          data: {
+            ...e.data,
+            dim: !foc,
+            label: foc ? (d.tip ?? "") : "",
+          },
+        } as Edge;
+      })
+    : dimByNodeFocus
+      ? rfEdges.map((e) =>
+          hotMirror.has(e.id)
+            ? e
+            : ({
+                ...e,
+                style: { ...(e.style ?? {}), opacity: 0.22 },
+              } as Edge),
+        )
+      : rfEdges;
 
   // 节点：悬停某条线时只保留它的两端（其余淡化），否则沿用 hover 监控机的淡化
   const keep = new Set<string>();
@@ -923,11 +753,12 @@ function assemble(
     if (d.from) keep.add(d.from);
     if (d.to) keep.add(d.to);
   }
-  const rfAll: (GNode | GBox)[] = [...rfNodes];
+
+  const rfNodes: GNode[] = [];
   for (const n of uniq.values()) {
-    const d = DIM[n.kind] ?? DIM.host;
+    const d = DIM[n.kind];
     const p = layout.pos.get(n.id) ?? { x: 0, y: 0 };
-    rfAll.push({
+    rfNodes.push({
       id: n.id,
       type: "lab",
       position: p,
@@ -950,7 +781,7 @@ function assemble(
     });
   }
 
-  return { nodes: rfAll, edges: focused };
+  return { nodes: rfNodes, edges: focused };
 }
 
 function GraphInner({
@@ -977,11 +808,11 @@ function GraphInner({
   const rf = useReactFlow();
 
   // 高亮靠 **hover** 而不是点击：点击节点要开抽屉，两个事件会撞在一起。
-  // 悬停监控机节点 = 它的所有镜像线高亮；悬停某条镜像线 = 只高亮那条。
+  // 悬停监控机 = 它吃进来的镜像线全亮；悬停某台主机 = 它被谁抓；悬停某条
+  // 线 = 只亮那条。
   //
-  // 退出用"延迟清除"：鼠标从节点滑到贴在它边缘的抓包口/连线上时，浏览器会
-  // 先发 mouseleave 再发 mouseenter，立刻置空就表现为"高亮闪一下就没"——
-  // 也就是"hover 时灵时不灵"。给 160ms 的容差，进入新目标时撤销。
+  // 退出用"延迟清除"：鼠标从节点滑到贴在它边缘的 chip/连线上时，浏览器会
+  // 先发 mouseleave 再发 mouseenter，立刻置空就表现为"高亮闪一下就没"。
   const [hoverNode, setHoverNode] = useState<string | null>(null);
   const [hoverEdge, setHoverEdge] = useState<string | null>(null);
   const leaveTimer = useRef<number | null>(null);
@@ -997,49 +828,47 @@ function GraphInner({
       leaveTimer.current = null;
       setHoverNode(null);
       setHoverEdge(null);
-    }, 160);
+    }, 140);
+  };
+  const clearNow = () => {
+    cancelLeave();
+    setHoverNode(null);
+    setHoverEdge(null);
   };
   useEffect(() => cancelLeave, []);
 
-  const mirrorIds = useMemo(() => {
-    const m = new Map<string, string[]>();
-    edges.forEach((e, i) => {
-      if (e.kind !== "mirror") return;
-      const id = `${e.kind}:${e.from}->${e.to}:${i}`;
-      (m.get(e.to) ?? m.set(e.to, []).get(e.to)!).push(id);
+  /** 悬停某个节点时"相关的一小片"：它自己 + 镜像线的另一端。
+   *  普通主机也走这条路——以前只有监控机才淡化无关节点，悬停普通主机会出现
+   *  "线全暗了、卡片还亮着"的半淡状态，看着很突兀。 */
+  const nodeFocus = useMemo(() => {
+    const hot = new Set<string>();
+    const keep = new Set<string>();
+    if (!hoverNode) return { hot, keep };
+    keep.add(hoverNode);
+    edges.forEach((e) => {
+      if (e.kind !== "mirror" || (e.from !== hoverNode && e.to !== hoverNode)) return;
+      hot.add(mirrorEdgeId(e));
+      keep.add(e.from);
+      keep.add(e.to);
     });
-    return m;
-  }, [edges]);
+    return { hot, keep };
+  }, [edges, hoverNode]);
 
-  const hotMirror = useMemo(() => {
-    if (hoverEdge) return new Set([hoverEdge]);
-    if (!hoverNode) return new Set<string>();
-    // 悬停监控机：点亮它吃进来的所有镜像线
-    const inbound = mirrorIds.get(hoverNode);
-    if (inbound) return new Set(inbound);
-    // 悬停普通主机：点亮它发出去的镜像线——"我到底被谁在抓"一眼可见
-    const out = new Set<string>();
-    edges.forEach((e, i) => {
-      if (e.kind === "mirror" && e.from === hoverNode) {
-        out.add(`${e.kind}:${e.from}->${e.to}:${i}`);
-      }
-    });
-    return out;
-  }, [hoverEdge, hoverNode, mirrorIds, edges]);
+  const hotMirror = useMemo(
+    () => (hoverEdge ? new Set([hoverEdge]) : nodeFocus.hot),
+    [hoverEdge, nodeFocus],
+  );
 
   const dimmed = useMemo(() => {
-    if (!hoverNode || !mirrorIds.has(hoverNode) || hoverEdge) return new Set<string>();
-    // 悬停监控机时淡化无关节点，聚焦它的采集链路
-    const keep = new Set<string>([hoverNode]);
-    edges
-      .filter((e) => e.kind === "mirror" && e.to === hoverNode)
-      .forEach((e) => keep.add(e.from));
+    // 只悬停一条线时由 assemble 处理节点淡化；悬停节点但没有任何镜像关系
+    // （比如一台没被抓包的普通主机）就什么都不淡——整图突然变灰更吓人。
+    if (hoverEdge || !hoverNode || nodeFocus.hot.size === 0) return new Set<string>();
     const out = new Set<string>();
     nodes.forEach((n) => {
-      if (!keep.has(n.id)) out.add(n.id);
+      if (!nodeFocus.keep.has(n.id)) out.add(n.id);
     });
     return out;
-  }, [edges, nodes, hoverNode, hoverEdge, mirrorIds]);
+  }, [nodes, hoverNode, hoverEdge, nodeFocus]);
 
   // ── 手工布局：只在结构变化时重算（纯函数，同步出结果）──
   const structKey = useMemo(() => {
@@ -1051,7 +880,12 @@ function GraphInner({
     return `${nk}#${ek}`;
   }, [nodes, edges]);
 
-  const [layout, setLayout] = useState<Layout>({ pos: new Map(), boxes: [], corridorY: 0 });
+  const [layout, setLayout] = useState<Layout>({
+    pos: new Map(),
+    colOf: new Map(),
+    corridorY: 0,
+    laneOf: new Map(),
+  });
   const fitted = useRef(false);
 
   useEffect(() => {
@@ -1063,47 +897,18 @@ function GraphInner({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [structKey]);
 
-  // 展开哪些"整网采集"主干：悬停监控机 = 全展开，悬停某条主干 = 只展开它。
-  const monitorIds = useMemo(
-    () => new Set(nodes.filter((n) => n.role === "monitor").map((n) => n.id)),
-    [nodes],
-  );
-  const expand = useMemo(() => {
-    const s = new Set<string>();
-    if (hoverEdge?.startsWith("mirror-agg:")) {
-      s.add(hoverEdge.slice("mirror-agg:".length));
-    }
-    if (hoverEdge?.startsWith("mirror-bus:")) {
-      const mon = hoverEdge.slice("mirror-bus:".length);
-      edges.forEach((e) => {
-        if (e.kind !== "mirror" || e.to !== mon) return;
-        if (!e.from.startsWith("host:")) return;
-        s.add(`${e.from.split(":")[1]}->${e.to}`);
-      });
-    }
-    if (hoverNode && monitorIds.has(hoverNode)) {
-      edges.forEach((e) => {
-        if (e.kind !== "mirror" || e.to !== hoverNode) return;
-        if (!e.from.startsWith("host:")) return;
-        s.add(`${e.from.split(":")[1]}->${e.to}`);
-      });
-    }
-    return s;
-  }, [hoverEdge, hoverNode, monitorIds, edges]);
-
   const built = useMemo(
-    () => assemble(nodes, edges, layout, sel, hotMirror, dimmed, expand, hoverEdge),
-    [nodes, edges, layout, sel, hotMirror, dimmed, expand, hoverEdge],
+    () => assemble(nodes, edges, layout, sel, hotMirror, dimmed, hoverEdge),
+    [nodes, edges, layout, sel, hotMirror, dimmed, hoverEdge],
   );
 
-  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode | GBox>([]);
+  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<GNode>([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
-  // 布局引用记一笔：ELK 异步算完返回**新 Layout 对象** → 全量采用它的
-  // 位置；引用没变（同结构下的轮询刷新 / hover 高亮重建）→ 保留 RF 内部
-  // 当前位置（用户拖过的）。初始 layout 是空地图，第一次 built 的节点全
-  // 在 (0,0)，若不区分，ELK 结果会被这批 (0,0) 盖住——所有节点叠成一坨，
-  // 就是"取景只有一台机器"的根因。
+  // 布局引用记一笔：换了新 Layout 对象 → 全量采用它的位置（结构变了）；
+  // 引用没变（轮询刷新 / hover 高亮重建）→ 保留 RF 内部当前位置（用户拖过
+  // 的）。初始 layout 是空地图，第一次 built 的节点全在 (0,0)，若不区分，
+  // 真实位置会被这批 (0,0) 盖住——所有节点叠成一坨。
   const layoutRef = useRef<Layout | null>(null);
 
   useEffect(() => {
@@ -1115,30 +920,34 @@ function GraphInner({
       return built.nodes.map((n) => ({ ...n, position: have.get(n.id) ?? n.position }));
     });
     setRfEdges(built.edges);
-    // 首次拿到布局后取景：此时 setState 已在本轮 flush，rAF 回调能看到
-    // 带坐标的节点。
-    // 取景前必须确认**节点已经拿到真实坐标**：首帧那次 built 用的是空布局，
-    // 所有节点都在 (0,0)，此时 fitView 会把视口放大到单点（表现是"图里只剩
-    // 一个节点、还贴在角落"）。判断方式是"不全在原点"，而不是看布局 map 大小
-    // ——布局已经换了、built 还是旧的那一轮就是这么漏过去的。
+    // 首次拿到布局后取景：取景前必须确认**节点已经拿到真实坐标**，否则
+    // fitView 会把视口放大到一个点（表现是"图里只剩一个节点、贴在角落"）。
     const placed = built.nodes.some((n) => n.position.x !== 0 || n.position.y !== 0);
     if (!fitted.current && built.nodes.length > 0 && placed) {
       fitted.current = true;
+      // 取景要把**采集走廊**一起框进去：fitView 只量节点，而镜像线要落到
+      // 节点下方 44~100px 才汇成总线——图一高，底部总线就被画布下沿裁掉。
+      const laneMax = Math.max(0, ...layout.laneOf.values());
+      const x0 = Math.min(...built.nodes.map((n) => n.position.x));
+      const y0 = Math.min(...built.nodes.map((n) => n.position.y));
+      const x1 = Math.max(...built.nodes.map((n) => n.position.x + (n.width ?? 0)));
+      const y1 = Math.max(
+        ...built.nodes.map((n) => n.position.y + (n.height ?? 0)),
+        layout.corridorY + laneMax * GEO.busLane + 8,
+      );
+      const bounds = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
       // rAF 回调可能跑在 React 把新节点提交进 React Flow store **之前**
-      // ——量到的还是上一轮全在 (0,0) 的节点堆，视口顶到 maxZoom、中心对准
-      // 原点，整张图平移出画布（表现：只剩一个节点挂在角落）。所以取景前
-      // 先问 store 要一次节点：没就绪就下一帧再试，最多等半秒。
+      // ——量到的还是上一轮全在 (0,0) 的节点堆。所以先问 store 要一次节点：
+      // 没就绪就下一帧再试，最多等半秒。
       const tryFit = (tries: number) => {
         const ns = rf.getNodes();
-        const ready =
-          ns.length > 0 && ns.some((n) => n.position.x !== 0 || n.position.y !== 0);
+        const ready = ns.length > 0 && ns.some((n) => n.position.x !== 0 || n.position.y !== 0);
         if (!ready) {
           if (tries > 0) requestAnimationFrame(() => tryFit(tries - 1));
           return;
         }
-        // minZoom 别低于 0.55：再小下去节点里的字就成了灰块，
-        // "看清楚整张图"不如"看得清一台机器"，超出的部分让人自己拖。
-        rf.fitView({ padding: 0.12, duration: 200, minZoom: 0.55 });
+        // padding 传数字是**像素**（不是比例）：0.05 只有 0.05px，节点会贴边。
+        rf.fitBounds(bounds, { padding: 10, duration: 200 });
       };
       requestAnimationFrame(() => tryFit(30));
     }
@@ -1150,7 +959,8 @@ function GraphInner({
   };
 
   return (
-    <div className="topo-canvas">
+    // 鼠标离开整块画布时立刻收掉高亮（只靠边的 mouseleave 有边缘情况）
+    <div className="topo-canvas" onMouseLeave={clearNow}>
       <ReactFlow
         nodes={rfNodes}
         edges={rfEdges}
@@ -1158,9 +968,7 @@ function GraphInner({
         edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
-        onSelectionChange={({ nodes: ns }) =>
-          onSelect?.(ns.filter((n) => n.type !== "zonebox").map((n) => n.id))
-        }
+        onSelectionChange={({ nodes: ns }) => onSelect?.(ns.map((n) => n.id))}
         // 普通拖动 = 平移画布，Shift + 拖动 = 框选。反过来的话（拖拽即框选）
         // 会让人以为图卡住了：想挪一下视野，结果拉出一个选框。
         selectionOnDrag={false}
@@ -1171,14 +979,12 @@ function GraphInner({
         maxZoom={1.6}
         nodesConnectable={false}
         edgesFocusable={false}
-        onNodeClick={(_, n) => {
-          if (n.type === "zonebox") return;
-          pick(n.id);
+        onNodeClick={(_, n) => pick(n.id)}
+        onPaneClick={() => {
+          clearNow();
+          pick(undefined);
         }}
-        onPaneClick={() => pick(undefined)}
-        // hover 高亮：监控机节点与镜像线都接住鼠标
         onNodeMouseEnter={(_, n) => {
-          if (n.type === "zonebox") return;
           cancelLeave();
           setHoverNode(n.id);
           setHoverEdge(null);
@@ -1186,6 +992,7 @@ function GraphInner({
         onNodeMouseLeave={() => scheduleLeave()}
         onEdgeMouseEnter={(_, e) => {
           cancelLeave();
+          setHoverNode(null);
           setHoverEdge(e.id);
         }}
         onEdgeMouseLeave={() => scheduleLeave()}
@@ -1215,8 +1022,6 @@ function GraphInner({
             return "#e2e8f0";
           }}
           maskColor="rgba(245,246,248,0.72)"
-          // 之前用的是 var(--border)，变量没定义就等于没有边框：缩略图贴在
-          // 画布右下角像一块脏色斑。这里写死颜色，并加圆角与投影。
           style={{
             background: "#ffffff",
             border: "1px solid #e2e8f0",

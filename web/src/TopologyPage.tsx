@@ -433,6 +433,9 @@ export default function TopologyPage() {
           />
         ) : (
           <TopologyGraph
+            // 换规格就整块重建：取景、悬停、选中都只对当前这张图有意义。
+            // 不重建的话视口还是上一份规格的缩放/平移，新图可能整个在画布外。
+            key={spec ?? "all"}
             nodes={nodes}
             edges={edges}
             selected={selected}
@@ -455,18 +458,16 @@ export default function TopologyPage() {
           </span>
           <span className="lg">
             <b style={{ background: "#faf5ff", borderColor: "#a78bfa" }} />
-            内网（zone）
-          </span>
-          <span className="lg">
-            <b style={{ background: "#fafbfd", borderColor: "#d7dee9", borderStyle: "dashed" }} />
-            网段框（一层=一个网段）
+            内网（一列 = 一层）
           </span>
           <span className="lg">
             <b style={{ background: "#f0fdf4", borderColor: "#16a34a" }} />
             网关
           </span>
           <span className="lg">
-            <b style={{ background: "#eff6ff", borderColor: "#2563eb" }} />
+            {/* 跟 .tn-role-monitor 的实际配色对齐：以前这里是蓝色，卡片却是青色，
+                图例和图上对不上号 */}
+            <b style={{ background: "#ecfeff", borderColor: "#0891b2" }} />
             流量监控
           </span>
           <span className="lg">

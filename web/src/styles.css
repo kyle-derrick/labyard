@@ -158,6 +158,10 @@ body {
   overflow: hidden;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
   font-size: 12px;
+  /* hover 淡化/恢复走过渡，别"啪"地跳一下 */
+  transition:
+    opacity 0.12s linear,
+    box-shadow 0.12s linear;
 }
 
 .tn-title {
@@ -263,6 +267,29 @@ body {
 
 .iface-net {
   font-weight: 600;
+}
+
+/* 网口 chip 的容器：左右两侧是竖列（吸在卡片边缘、向外突出 8px），
+   监控机的抓包口在卡片下缘横排。handle 由 chip 自己带，落在 chip 边沿上。 */
+.iface-col {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 主机节点的定位容器（卡片 + 探出边缘的网口 chip 的公共父级） */
+.tn-wrap {
+  position: relative;
+}
+
+.iface-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: center;
+  gap: 6px;
 }
 
 .tn-dot {
@@ -552,55 +579,14 @@ body {
   background: #f59e0b;
 }
 
-/* ── 拓扑区域框：一个网段一层 ──
- * 框把"同网段的网段卡 + 全部主机"圈在一起，列=深度从左到右；
- * 框本身不吃鼠标事件（纯背景），节点在框内自由点击/拖动。 */
-.react-flow__node-zonebox {
-  pointer-events: none !important;
+/* ── 拓扑连线 ──
+ * 自己画的折线（见 TopologyGraph 的 LabEdge）：线宽/颜色由 style 内联给，
+ * 这里只补 hover 的过渡，免得高亮时"啪"地跳一下。 */
+.lab-path {
+  transition: opacity 0.12s linear;
 }
 
-.zonebox {
-  box-sizing: border-box;
-  width: 100%;
-  height: 100%;
-  border: 1px dashed #d7dee9;
-  border-radius: 12px;
-  background: #fafbfd;
-}
-
-.zonebox-wan {
-  border-color: #c3caf3;
-  background: #f7f8ff;
-}
-
-.zonebox-head {
-  box-sizing: border-box;
-  height: 26px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 10px;
-  border-bottom: 1px dashed #e4e9f1;
-}
-
-.zonebox-name {
-  font-size: 11.5px;
-  font-weight: 600;
-  color: #475569;
-  white-space: nowrap;
-}
-
-.zonebox-cidr {
-  font-size: 10px;
-  color: #94a3b8;
-}
-
-.zonebox-count {
-  margin-left: auto;
-  font-size: 10px;
-  color: #94a3b8;
-  white-space: nowrap;
-}
+/* 节点淡化的过渡写在主定义 `.tn` 里（约 148 行），这里不再重复定义。 */
 
 /* 边上标签（只在 hover 展开时出现） */
 .edge-lbl {
@@ -621,13 +607,3 @@ body {
   font-weight: 600;
 }
 
-/* 主机底部镜像出点：被采流量从这个橙点向下汇入总线 */
-.mir-dot {
-  display: block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  border: 1px solid #f59e0b;
-  background: #fffbeb;
-  box-sizing: border-box;
-}
