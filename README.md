@@ -92,6 +92,8 @@ mirrors:                      # 精确连线：单台主机的流量交给某台
 
 ```bash
 # 在 PVE 宿主上（Debian 13 / PVE 9.x）
+curl -fLO https://github.com/kyle-derrick/labyard/releases/latest/download/labyard-linux-amd64.tar.gz
+tar xzf labyard-linux-amd64.tar.gz && cd labyard-linux-amd64
 ./installer/install.sh
 
 # 浏览器打开 https://<宿主IP>:8443
@@ -99,6 +101,8 @@ mirrors:                      # 精确连线：单台主机的流量交给某台
 journalctl -u labyard | grep 初始管理员密码
 # 忘了就删 /var/lib/labyard/password.hash 再 systemctl restart labyard
 ```
+
+校验与回滚到指定版本见 [`docs/operations.md`](docs/operations.md) §1。
 
 或者只用命令行：
 

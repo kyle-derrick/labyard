@@ -11,10 +11,21 @@
 由 PVE 自带，安装器只检查不代装。
 
 ```bash
-tar xzf labyard-*-x86_64.tar.gz && cd labyard-*
+# 预编译包（打 v* tag 时由 GitHub Actions 构建，见 .github/workflows/release.yml）
+BASE=https://github.com/kyle-derrick/labyard/releases/latest/download
+curl -fLO "$BASE/labyard-linux-amd64.tar.gz"
+curl -fLO "$BASE/SHA256SUMS" && sha256sum -c SHA256SUMS --ignore-missing
+tar xzf labyard-linux-amd64.tar.gz && cd labyard-linux-amd64
+
 ./installer/install.sh                      # 缺 ttyd 会自动下载
 ./installer/install.sh --ttyd ./ttyd        # 离线环境：指定本地 ttyd
 ```
+
+要回滚到某个旧版本，把 `latest/download` 换成 `download/v0.1.0`——资产名固定，
+版本只体现在 Release tag 与包内 `VERSION`。
+
+从源码构建（装了 Rust 与 Node 的机器）：`make` → `target/release/labyard`，
+把二进制放到 `installer/` 上一层再跑 `./installer/install.sh`。
 
 装完之后的三件事：
 

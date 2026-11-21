@@ -1,0 +1,177 @@
+name: release
+
+# 只做一件事：打 v* tag 时构建发布包，挂到 GitHub Release。
+#
+# 为什么不放在 push 上：这个项目的门禁在部署流程里（部署到 222 时跑
+# cargo test + api-regress），主干 push 不做出包；tag 是唯一的"对外发版"信号。
+#
+# 包结构（install.sh 假定二进制与它同级，文档里的路径是 ./installer/install.sh）：
+#   labyard-linux-amd64/
+#   ├── labyard          ← 已嵌前端（rust-embed 读 web/dist）
+#   ├── installer/install.sh
+#   ├── README.md / LICENSE / NOTICE / VERSION
+#   ├── examples/        ← 规格示例
+#   └── docs/
+#
+# 资产名固定不带版本：这样
+#   .../releases/latest/download/labyard-linux-amd64.tar.gz
+# 是永久链接，升级只要重跑同一条 curl。版本看 Release tag 与包内 VERSION。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # 演练：只构建 + 传 artifact，不创建 Release
+
+permissions:
+  contents: write # 创建 Release 需要
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # 发版中途取消会留下半个 Release
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    # 22.04 而不是 ubuntu-latest：glibc 2.35 编出来的二进制在 Debian 12/13、
+    # PVE 9 上都能跑；用更新 runner 编会让老宿主 glibc too old。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # --generate-notes 要完整历史算 changelog
+
+      - name: 校验版本（tag 必须等于 Cargo.toml 的 version）
+        id: ver
+        run: |
+          set -eu
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$VERSION" ] || { echo "Cargo.toml 里没读到 version"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # 包内文件时间戳统一取这个提交时间，让同一个 tag 重跑出同样的字节
+          EPOCH=$(git log -1 --format=%ct || true)
+          [ -n "$EPOCH" ] || { echo "::error::取不到提交时间（checkout 是否带了 .git？）"; exit 1; }
+          echo "epoch=$EPOCH" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            case "$TAG" in
+              v*) ;;
+              *) echo "::error::tag 必须以 v 开头，收到 $TAG"; exit 1 ;;
+            esac
+            # 防"打了 v0.2.0 的 tag，包里还是 0.1.0"这种最难发现的发版事故
+            if [ "${TAG#v}" != "$VERSION" ]; then
+              echo "::error::tag $TAG 与 Cargo.toml 的 version=$VERSION 不一致"
+              exit 1
+            fi
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "版本 $VERSION"
+
+      - name: 安装 Rust（按 rust-toolchain.toml 的 pin）
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 必须重建前端：二进制里的前端是编译期嵌进去的，不重建就会发出旧界面
+      - name: 构建前端
+        run: |
+          cd web
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: 单元测试
+        run: cargo test --release --locked
+
+      - name: 构建二进制
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: 打包
+        run: |
+          set -eu
+          V="${{ steps.ver.outputs.version }}"
+          NAME="labyard-linux-amd64"
+          STAGE="dist/$NAME"
+          mkdir -p "$STAGE/installer"
+
+          install -m 0755 "target/$TARGET/release/labyard" "$STAGE/labyard"
+          install -m 0755 installer/install.sh "$STAGE/installer/install.sh"
+          install -m 0644 README.md LICENSE NOTICE "$STAGE/"
+          printf '%s\n' "$V" > "$STAGE/VERSION"
+          cp -R examples docs "$STAGE/"
+          find "$STAGE" -name '.DS_Store' -delete
+          find "$STAGE" -name '._*' -delete
+
+          # 固定属主/顺序/时间戳：同样的源码在不同机器上打出同样字节的包
+          tar -C dist --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${{ steps.ver.outputs.epoch }}" \
+              -czf "dist/$NAME.tar.gz" "$NAME"
+
+          ( cd dist && sha256sum "$NAME.tar.gz" > SHA256SUMS )
+          ls -lh dist
+          echo "sha256: $(cut -d' ' -f1 dist/SHA256SUMS)"
+
+      # 冒烟：真把包解开跑一次。防"打出来的二进制跑不起来"这种只能在
+      # Release 页面上才发现的问题（上一步只会证明 cargo 成功了）。
+      - name: 冒烟（解包 → 运行 --version）
+        run: |
+          set -eu
+          NAME="labyard-linux-amd64"
+          tar -xzf "dist/$NAME.tar.gz" -C /tmp
+          "/tmp/$NAME/labyard" --version
+          "/tmp/$NAME/installer/install.sh" --help | sed -n 1,3p
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: labyard-${{ steps.ver.outputs.version }}-${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 发布到 GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${{ steps.ver.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # 重跑同一条 tag：覆盖资产，不新建 Release（否则会 422）
+            echo "Release $TAG 已存在，覆盖上传资产"
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" \
+              --title "labyard $TAG" \
+              --generate-notes \
+              dist/*.tar.gz dist/SHA256SUMS
+          fi
+          gh release view "$TAG" --json url,assets \
+            --template '{{.url}}{{"\n"}}{{range .assets}}  {{.name}}  {{.size}} B{{"\n"}}{{end}}'
+
+      - name: 摘要
+        run: |
+          {
+            echo "### labyard ${{ steps.ver.outputs.tag || steps.ver.outputs.version }}"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "产物：\`labyard-linux-amd64.tar.gz\`（\`linux/amd64\`，glibc ≥ 2.35）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# 想加 arm64（PVE on ARM 很少见，加了会让每次发版多跑一遍 docker cross）：
+# 把 TARGET 变成 matrix，并用 houseabsolute/actions-rust-cross 代替 cargo build
+# —— rusqlite 带 C 代码，纯 rustup target 装不上交叉 C 工具链。
