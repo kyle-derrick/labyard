@@ -147,14 +147,51 @@ jobs:
         run: |
           set -eu
           TAG="${{ steps.ver.outputs.tag }}"
+          V="${{ steps.ver.outputs.version }}"
+          REPO="${{ github.repository }}"
+
+          # Release 页是用户第一眼看到的地方：--generate-notes 在"首个 release"
+          # 时只有一行 changelog 链接，对装机零帮助，所以自己写正文。
+          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          {
+            echo "## 安装（PVE 9.x / Debian 13）"
+            echo
+            echo '```bash'
+            echo "curl -fLO https://github.com/$REPO/releases/latest/download/labyard-linux-amd64.tar.gz"
+            echo "curl -fLO https://github.com/$REPO/releases/latest/download/SHA256SUMS"
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo "tar xzf labyard-linux-amd64.tar.gz && cd labyard-linux-amd64"
+            echo "./installer/install.sh"
+            echo '```'
+            echo
+            echo "浏览器打开 \`https://<宿主IP>:8443\`；初始密码只在服务首次启动时打进 journal："
+            echo "\`journalctl -u labyard | grep 初始管理员密码\`。"
+            echo
+            echo "升级同一台宿主：重跑上面四条即可，安装器会把上一版留成 \`/usr/local/bin/labyard.prev\`。"
+            echo
+            echo "## 这个包是什么"
+            echo
+            echo "- 版本 \`$V\`（包内 \`VERSION\`），单文件二进制，**前端已编译进去**，宿主不需要 Node"
+            echo "- \`installer/install.sh\`：放二进制、建目录、写 systemd 单元、生自签证书；不动 PVE 自身配置"
+            echo "- \`docs/\` 设计说明与运维手册；\`examples/\` 规格示例"
+            echo "- 校验：资产里的 \`SHA256SUMS\`"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "**完整改动**：https://github.com/$REPO/compare/$PREV...$TAG"
+            else
+              echo "**提交历史**：https://github.com/$REPO/commits/$TAG"
+            fi
+          } > notes.md
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             # 重跑同一条 tag：覆盖资产，不新建 Release（否则会 422）
-            echo "Release $TAG 已存在，覆盖上传资产"
+            echo "Release $TAG 已存在，覆盖资产与说明"
             gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+            gh release edit "$TAG" --notes-file notes.md
           else
             gh release create "$TAG" \
               --title "labyard $TAG" \
-              --generate-notes \
+              --notes-file notes.md \
               dist/*.tar.gz dist/SHA256SUMS
           fi
           gh release view "$TAG" --json url,assets \
