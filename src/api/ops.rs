@@ -482,11 +482,19 @@ pub async fn adopt_host(
         Spec::parse(&patched)
             .and_then(|s| s.resolve_all(&state.cfg.pve.wan_bridge))
             .map_err(bad)?;
-        specs::write(&dir, &body.spec, &patched).map_err(bad)?;
+
+        // 顺序很重要：**先绑 vmid，再写规格**。
+        // 反过来的话，绑定失败（比如 db 里还留着某个 zone 被删掉后的记录）时
+        // 规格已经被写进去了——留下一个 vmid 指向别处的 host，下次 apply 会
+        // 照着它去动容器。绑在前，失败时磁盘上什么都没变。
         state
             .db
             .bind_vmid(&body.zone, &host, body.vmid)
             .map_err(|e| err(StatusCode::CONFLICT, e))?;
+        if let Err(e) = specs::write(&dir, &body.spec, &patched) {
+            state.db.release_vmid(&body.zone, &host); // 回滚，不留悬空绑定
+            return Err(bad(e));
+        }
 
         Ok(Json(serde_json::json!({
             "ok": true, "spec": body.spec, "zone": body.zone,

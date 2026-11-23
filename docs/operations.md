@@ -170,6 +170,10 @@ Web 是唯一操作界面，但**不是唯一执行路径**：
 | 服务被 OOM kill | `systemctl show labyard -p MemoryPeak -p MemorySwapPeak`；`grep VmHWM /proc/$(systemctl show labyard -p MainPID --value)/status`；`journalctl -u labyard \| grep -i "oom-kill"` | `MemoryMax=384M`：**账里不只有 labyard 自己**——`pct`/`pvesh` 是它的子进程、同属一个 cgroup，单个峰值 RSS 176 MB（charged 60–80 MB）。所以要按"最大同时几个 pct"算，不是按"常驻 × 2"算。**注意 cgroup 口径会把页缓存算进去**，`MemoryCurrent` 贴着上限是正常且可回收的，判断是否真危险看 `VmHWM` |
 | PVE 页面变卡 | `journalctl -u labyard \| grep pmxcfs` | `/etc/pve` 是单线程 FUSE，平台状态一律一次 `GET /cluster/resources` 批量取，不逐台查 |
 | 容器起不来 | `pct status <vmid>` / `pct config <vmid>` | 桥不存在（先 `bridge` 步骤）；存储满；`memory` 太小 |
+| 内网 `ping6` 公网不通 | `pct exec <gw> -- ip -6 addr show dev eth1 scope global`；`pct exec <gw> -- sysctl net.ipv6.conf.eth1.accept_ra` | ① 上联口 `accept_ra` 不是 2——`forwarding=1` 后内核**忽略 RA**，网关拿不到上游 GUA，NAT66 没有源地址可换（这是最容易误判成"宿主没有 IPv6 上游"的一条）；② 没有全局地址就 `ip link set eth1 down && ip link set eth1 up` 触发一次 RA，**之后必须补 v4 默认路由**，否则 v4 出网一起挂；③ 桥/上联确实没有 v6 |
+| 网关有 v6 地址了，v4 反而不通 | `pct exec <gw> -- ip route show default` | 重开上联口把 DHCP 租约弄丢了（默认路由消失 → "Network is unreachable"）。`dhclient -1 eth1` 重新拿租约，或 `ip route replace default via <上游网关> dev eth1` |
+| 纳管时报"宿主上没有 vmid N" | `pct status N`；再看 `GET /api/hosts` 的 `unmanaged` 里有没有它 | 刚建的容器被读缓存挡住（8 秒 TTL；纳管走的是实时查询，老版本用缓存会误报）；容器在别的节点上；vmid 敲错 |
+| 纳管成功但容器网络没变 | — | 设计如此：纳管**只登记**。去执行页点 `apply` 才按规格配地址/主机名/资源 |
 
 排障时优先看**平台状态与容器实际状态哪里不一致**——labyard 的价值就是把"以为"
 变成"事实"，排障也一样：`pct list`、`nft list ruleset`、`systemctl list-units`
@@ -200,7 +204,45 @@ ip link show type bridge | grep lab             # 确认桥已清
 |---|---|
 | 单节点 | 集群只警告不阻止。`pve.node` 是配置里写死的一个节点，平台不感知调度——把 zone 建到别的节点上不是它的能力 |
 | 不做升级迁移 | 从未发布过，没有历史版本要迁；`schema_version` 只保证"同一代内"的演进 |
-| IPv6 出公网未验证 | ULA 与 NAT66 在真机验证过；宿主没有 IPv6 上游，出公网这段没有真机证据 |
+| IPv6 跨 zone 未实现 | 同一 zone 内 ULA 互通、NAT66 **出公网**都已真机实测（网关 `accept_ra=2` 取上游 GUA，内网 `ping6` 公网 6.9 ms）。但每个 zone 是不同 ULA /64，网关之间**没有 v6 静态路由**，跨 zone 只有 v4 通 |
+| 纳管只做 LXC | QEMU 虚拟机不纳管（会出现在"宿主上的其它虚拟机"里，按钮置灰）。纳管只写规格 + 绑 vmid，**不改容器本身**，网络要等下一次 `apply` |
+| 纳管需手工点 | 不会自动把宿主上的陌生容器塞进规格——那等于让平台去接管别人手工建的东西。`GET /api/hosts` 的 `unmanaged` 字段只做提示（做法见第 8 节） |
 | 厚 LVM 快照 | PVE 侧仍是 tech preview。`doctor` 只列出存储类型，不判断厚薄；快照操作原样透传 PVE 的报错，失败信息会显示在界面上 |
 | `pct push/pull` 文件面板 | 没做。终端里的 ZMODEM 覆盖"传个文件"的主场景 |
 | Web 是唯一界面 | 服务挂掉时用 CLI（见第 4 节）；再不行直接在 PVE 里操作 |
+
+---
+
+## 8. 纳管 PVE 里已有的容器
+
+先用 `pct create` 或 PVE 面板建好容器，再让 labyard 接管。**只对 LXC 有效**，QEMU 不支持。
+
+Web：`主机` 页底部"宿主上的其它虚拟机"里找到它 → 点**纳管** → 选规格、选 zone、填主机名（默认取容器名的小写短横线形式）、主机位可留空 → 提交。
+
+命令行等价：
+
+```bash
+curl -sk -X POST https://127.0.0.1:8443/api/hosts/adopt \
+  -H 'Content-Type: application/json' \
+  -b cookie.txt \
+  -d '{"vmid":140,"spec":"lab","zone":"lab","host":"pc9"}'
+# ip 不给就自动挑一个空闲主机位（从 .20 起），写进规格里带引号
+```
+
+它做两件事，**都不改容器本身**：
+
+1. 在规格对应的 `hosts:` 块里追加这台主机（`role: host` / `vmid` / `ip`），保留注释与其他内容原样；
+2. 在 `vmids` 表里写下 `vmid → (zone, host)` 的绑定。
+
+然后去执行页点 `apply`，平台才开始按规格配地址、主机名、资源——**这是刻意的**：纳管一台正跑着业务的容器时，不该一按就把它网络改掉。
+
+几个会被拒的情况（都是 409/404，报错里带原因）：
+
+| 情况 | 为什么拒 |
+|---|---|
+| 该 vmid 已经由某台主机管理 | 查的是 `vmids` 绑定表，不只是规格——规格里删掉过的 zone，它的容器仍占着号，先 `POST /api/hosts/prune` 或显式在别处 `destroy` |
+| `(zone, host)` 已经绑了别的 vmid | 一个主机名只能对一台容器 |
+| 这个 zone 里已有同名主机 | 名字是规格里的主键，先换个名 |
+| 宿主上没有这个 vmid | 打错号，或容器在别的节点（单节点限制） |
+
+`(zone, host)` 的绑定是**先写库、再落规格**的：写规格失败会把绑定回滚掉，不会留下"规格里没有、库里占着"的悬空记录。
