@@ -48,7 +48,7 @@ zones:
 - 三层默认值：`defaults` → `zone` → `host`，逐字段覆盖
 - 主机基础配置同样三层合并：`timezone`（时区）、`lang`（locale，如 `zh_CN.UTF-8`）、`apt_mirror`（apt 源，无外网机器可指向内网 apt-cacher-ng）、`packages`（预装包；`packages: []` 显式不要——无外网主机用它退出继承）
 - `storage` 是 rootfs 落点；`template_storage` 是模板（vztmpl）落点，**默认跟随 `storage`**。rootfs 用 lvmthin/zfspool 时模板必须分开放（如 `template_storage: local`），一体存储（dir/NFS）零配置
-- IPv6 默认开启，只发 ULA（`fd` 开头，按 zone 名确定性派生）+ NAT66，不向上游要前缀
+- IPv6 默认开启。给内网主机**只发** ULA（`fd` 开头，按 zone 名确定性派生）+ NAT66；网关自己从上联口按 SLAAC 收一个上游 GUA 仅作 NAT66 源地址，**不申请前缀委派（PD）、也不把上游地址下发给内网主机**
 - 内网主机（server/client）**不给默认路由**，只能从内网发起
 - `nat: true`（默认）让网关做地址转换；`nat: false` 只转发不转换，用于上游已经路由了整个网段的情形
 - 同角色主机不写 `ip` 时自动取不同主机位（两台 `server` 是 `.20`/`.21`，不会撞）

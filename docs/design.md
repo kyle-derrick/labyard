@@ -268,7 +268,7 @@ wan:
   mode: dhcp                       # dhcp | static，逐 zone 可覆盖
 
 ipv6:
-  enabled: true                    # 默认开：只发 ULA + NAT66，不给 GUA
+  enabled: true                    # 默认开：内网只发 ULA + NAT66（网关自己收上游 GUA 做 NAT66 源）
   ula_prefix: fd42:1ab::/40        # 安装时随机生成；按 zone 序号切 /64
 
 # ============ 网络单元：写几个就是几层 ============
@@ -445,7 +445,7 @@ retired(zone, host, note, retired_at, PRIMARY KEY (zone, host))  -- host='*' 表
 下一轮直接 skip。哈希的输入是**步骤的规格参数 + `RULESET_VERSION`**（§8.6.6），
 不是"跑没跑过"这样一个布尔值——这正是"更新"和"重复执行"能同时成立的原因。
 
-### 5.8 IPv6（默认开，ULA + NAT66，不给 GUA）
+### 5.8 IPv6（默认开，内网只发 ULA + NAT66）
 
 默认开。理由不是"v6 普及率高"，而是更硬的一条：**默认关 = 这条代码路径永远没人测**。等到某天有人打开 `ipv6: true`，面对的是从未跑过的 nft 规则和从未配过的 `ip -6 route`，第一次必然炸。默认开，双栈从第一天就在每条回归测试里。
 
@@ -453,7 +453,7 @@ retired(zone, host, note, retired_at, PRIMARY KEY (zone, host))  -- host='*' 表
 
 | 约束 | 做法 | 为什么 |
 |---|---|---|
-| **只给 ULA，不给 GUA** | 全局 `ula_prefix: fdxx:xxxx:xxxx::/48`，安装时随机生成并存 DB | 如果直接从上联拿运营商 GUA，内网机器能凭 v6 地址绕过网关直连外网，NAT 日志全失效。"内网不联网"这条保证会当场破功 |
+| **内网只给 ULA，不给 GUA** | 全局 `ula_prefix: fdxx:xxxx:xxxx::/48`，安装时随机生成并存 DB | 如果直接把上游 GUA 下发给内网机器，它们能凭 v6 地址绕过网关直连外网，NAT 日志全失效。"内网不联网"这条保证会当场破功。注意约束的对象是**内网主机**：网关自己在 eth1 上收一个上游 GUA 作 NAT66 源地址是必需且安全的（见下"上联口被动接受上游 RA"） |
 | **v6 出网必须过网关** | 网关 `masquerade`（NAT66），内网 default route 指向网关 `::1` | 和 v4 同一套可控性：能审计、能一刀切断、能按 zone 关 |
 | **`target` 角色不配 v6 default route** | 和 v4 一致：`gateway: false` 的主机在 v4/v6 上都不写网关 | 隔离是结构性的，不能靠"记得别配" |
 
