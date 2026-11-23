@@ -732,7 +732,7 @@ PVE 的 `PUT /nodes/{n}/lxc/{id}/config` 只接受它认识的那些 key（`net0
 | TLS | **`openssl req`** 生成自签 + **`axum-server` 的 rustls** | — | openssl 本就在系统里；rustls 是纯 Rust 实现，不链接 OpenSSL，没有版本与 CVE 牵连 | 内嵌证书生成（要给二进制塞密钥生成逻辑）、`native-tls`（又回到 OpenSSL 依赖） |
 | 结构化日志 | **tracing** + **tracing-subscriber** | 0.1 / 0.3 | JSON layer 输出结构化行；span 能自动带上 `run_id` 与 `step_key`，这正是 run 日志要的东西 | `log` + `env_logger`（没有 span，手写上下文） |
 | ttyd 反代 | **axum 的 WebSocket**（`ws` feature） | 内置 | 下游用 `WebSocketUpgrade`，上游用 `tokio-tungstenite` 连，双向搬运。**已实现**：真机验证页面 200、WS 握手 `101 Switching Protocols`（见 §7.4） | 手写 ws 帧解析（没必要） |
-| 测试 | `#[cfg(test)]` + 真机回归 | — | 纯函数（脚本生成、哈希、YAML 编辑、拓扑）在同模块里单测，不需要 PVE；需要 PVE 的一律上真机（`scripts/api-regress.py` 逐接口跑）。**没有**"录制回放假 `pct`"这一层：fixture 不保真、会腐烂 | cargo-nextest（当前 99 项不值得多一层工具）、proptest（脚本生成的输入空间不大） |
+| 测试 | `#[cfg(test)]` + 真机回归 | — | 纯函数（脚本生成、哈希、YAML 编辑、拓扑）在同模块里单测，不需要 PVE；需要 PVE 的一律上真机（`scripts/api-regress.py` 逐接口跑）。**没有**"录制回放假 `pct`"这一层：fixture 不保真、会腐烂 | cargo-nextest（当前 134 项、秒级跑完，不值得多一层工具）、proptest（脚本生成的输入空间不大） |
 
 ### 7.2 前端
 

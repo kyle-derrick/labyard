@@ -421,6 +421,28 @@ if PW and HOST and ANALYSIS:
     else:
         print(f"（{link} 不存在，跳过这条负向检查）", flush=True)
 
+# ───────────────────── 纳管外来容器（只验拒绝分支） ─────────────────────
+# 正向纳管会往真实规格里加主机，回归不该留脏数据；但拒绝分支必须有钱包——
+# 这条路径直接拿 vmid 去比对宿主上的真实容器，错一步就会把别人的容器改写掉。
+if PW:
+    head("纳管外来容器（负路径）")
+    managed = next((h.get("vmid") for h in (hosts or {}).get("hosts", [])
+                    if h.get("zone") == ZONE and h.get("vmid")), None)
+    check("纳管：主机名非法被拒", "POST", "/api/hosts/adopt",
+          {"vmid": managed or 999999, "spec": ZONE, "zone": ZONE, "host": "Bad Name!"},
+          want=400)
+    check("纳管：规格不存在 404", "POST", "/api/hosts/adopt",
+          {"vmid": 999999, "spec": "no-such-spec", "zone": ZONE, "host": "pc9"},
+          want=404)
+    check("纳管：vmid 不在宿主 404", "POST", "/api/hosts/adopt",
+          {"vmid": 999999, "spec": ZONE, "zone": ZONE, "host": "pc9"}, want=404)
+    if managed:
+        # 已在规格里的 vmid 再纳管一次会把它挪到别的主机名下 —— 必须 409
+        check("纳管：已管理的 vmid 被拒", "POST", "/api/hosts/adopt",
+              {"vmid": managed, "spec": ZONE, "zone": ZONE, "host": "pc9"}, want=409)
+    check("纳管：缺 vmid 被拒", "POST", "/api/hosts/adopt",
+          {"spec": ZONE, "zone": ZONE, "host": "pc9"}, want=[400, 422])
+
 # ─────────────────────────── 生命周期 ───────────────────────────
 if PW and HOST:
     head("生命周期")
