@@ -123,6 +123,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/hosts", get(hosts))
         .route("/api/hosts/prune", post(prune_hosts))
         .route("/api/hosts/purge", post(purge_orphans))
+        .route("/api/hosts/adopt", post(ops::adopt_host))
         .route("/api/bridges", get(list_bridges))
         .route("/api/bridges/prune", post(prune_bridges))
         .route("/api/hosts/{z}/{h}/power", post(power))
@@ -2067,6 +2068,10 @@ const API_DOCS: &[(&str, &[(&str, &str)])] = &[
     ("/api/hosts", &[("get", "主机清单（含电源状态、orphan 与 retired 标记）")]),
     ("/api/hosts/prune", &[("post", "清理已删除规格留下的 vmid 分配记录")]),
     ("/api/hosts/purge", &[("post", "销毁规格外仍在运行的孤儿容器")]),
+    (
+        "/api/hosts/adopt",
+        &[("post", "纳管宿主上已有的 LXC：写进规格并绑 vmid，不立刻下发")],
+    ),
     ("/api/bridges", &[("get", "宿主上网桥现状（含残留标记）")]),
     ("/api/bridges/prune", &[("post", "清理无地址、无成员的残留网桥")]),
     ("/api/hosts/{z}/{h}/power", &[("post", "开/关/重启单台主机")]),

@@ -350,6 +350,23 @@ export const api = {
       method: "POST",
     }),
 
+  /** 纳管宿主上已有的 LXC：写进规格并绑 vmid。不立刻下发——下次 apply 才接管。 */
+  adoptHost: (body: {
+    vmid: number;
+    spec: string;
+    zone: string;
+    host: string;
+    ip?: string;
+  }) =>
+    req<{
+      ok: boolean;
+      spec: string;
+      zone: string;
+      host: string;
+      vmid: number;
+      yaml: string;
+    }>("/api/hosts/adopt", { method: "POST", body: JSON.stringify(body) }),
+
   /** 销毁"规格里没有、容器还在跑"的孤儿。破坏性：需要确认串。 */
   purgeOrphans: () =>
     req<{ destroyed: string[]; forgotten: string[]; errors: string[] }>(

@@ -59,7 +59,11 @@ impl Phase {
 ///   3 → 地址与 nft 规则落成容器内开机单元（容器重启后自愈）
 ///   4 → 下游 zone 静态路由 + 禁发 ICMP redirect + NAT/出网区分内网网段
 ///   5 → 入向放行"源地址属于内网网段"的跨 zone 转发
-pub const RULESET_VERSION: u32 = 5;
+///   6 → 上联口 `accept_ra=2`：`forwarding=1` 后内核忽略 RA，网关 eth1 拿不到
+///       上游 IPv6，内网 ping6 公网全丢——修掉"IPv6 出不了公网"
+///   7 → 触发 RA 的 down/up 会连 v4 DHCP 租约一起弄丢（默认路由消失），
+///       重开网卡后必须把 v4 默认路由补回来
+pub const RULESET_VERSION: u32 = 7;
 
 /// 一个步骤的完整描述。`kind` 里带全部参数，执行器不需要再去查 spec。
 #[derive(Debug, Clone, Serialize)]

@@ -249,6 +249,41 @@ impl Db {
         );
     }
 
+    /// 把**已经在 PVE 上跑着**的容器绑给 (zone, host)。
+    ///
+    /// 与 `vmid_for` 的分工：那个是"给我一个号"（从 base 起找空闲），
+    /// 这个是"这台容器就是它"（认调用方给的号）。纳管用后者。
+    ///
+    /// 两种冲突都拒绝，绝不"顺手覆盖"：
+    /// - 这个 vmid 已经属于别的 (zone, host) → 那是别人管着的容器；
+    /// - 这个 (zone, host) 已经绑了别的号 → 名字被占，再绑会让两台共用一个身份。
+    pub fn bind_vmid(&self, zone: &str, host: &str, vmid: u32) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        if let Ok((z, h)) = conn.query_row(
+            "SELECT zone, host FROM vmids WHERE vmid = ?1",
+            [vmid],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            if z == zone && h == host {
+                return Ok(());
+            }
+            return Err(format!("vmid {vmid} 已经绑定在 {z}:{h}"));
+        }
+        if let Ok(v) = conn.query_row(
+            "SELECT vmid FROM vmids WHERE zone = ?1 AND host = ?2",
+            params![zone, host],
+            |r| r.get::<_, u32>(0),
+        ) {
+            return Err(format!("{zone}:{host} 已经绑定 vmid {v}"));
+        }
+        conn.execute(
+            "INSERT INTO vmids (vmid, zone, host) VALUES (?1, ?2, ?3)",
+            params![vmid, zone, host],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// 只读查询：这台主机是否分配过 vmid。destroy 用它判断"有没有东西可删"，
     /// 不能用 `vmid_for`——那会在查不到时顺手分配一个，destroy 拿它一查
     /// 就"资源存在"了，实际 PVE 上根本没有这台容器。

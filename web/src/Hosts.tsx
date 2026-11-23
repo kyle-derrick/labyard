@@ -11,7 +11,7 @@
  * 单台失败不影响别的。批量动作前先过滤掉不可操作的主机（不存在的、
  * 已废弃的），剩下的才进 confirm。
  */
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -20,6 +20,7 @@ import {
   Card,
   Dropdown,
   Empty,
+  Form,
   Input,
   Modal,
   Popconfirm,
@@ -47,7 +48,7 @@ import {
   SyncOutlined,
   UndoOutlined,
 } from "@ant-design/icons";
-import { api, terminalUrl, type HostRow } from "./api";
+import { api, terminalUrl, type HostRow, type UnmanagedVm } from "./api";
 import { HostConfigEditor, type ConfigTarget } from "./HostConfig";
 import GatewayPanel from "./Gateway";
 
@@ -386,6 +387,78 @@ export default function Hosts() {
 
   /** PVE 上有、但不在 vmid 分配表里的虚拟机（面板里手工建的等）。 */
   const unmanaged = useMemo(() => hosts.data?.unmanaged ?? [], [hosts.data]);
+
+  // ── 纳管：把面板里手工建的容器写进规格 ──
+  const [adopt, setAdopt] = useState<UnmanagedVm | null>(null);
+  const [adoptSpec, setAdoptSpec] = useState<string>();
+  const [adoptZone, setAdoptZone] = useState<string>();
+  const [adoptHost, setAdoptHost] = useState("");
+  const [adoptIp, setAdoptIp] = useState("");
+  const [adopting, setAdopting] = useState(false);
+
+  const specList = useQuery({
+    queryKey: ["specs"],
+    queryFn: api.specs,
+    enabled: !!adopt,
+  });
+  const adoptModel = useQuery({
+    queryKey: ["spec-model", adoptSpec],
+    queryFn: () => api.specModel(adoptSpec!),
+    enabled: !!adoptSpec,
+  });
+  const adoptZones = useMemo(() => {
+    const m = adoptModel.data?.model as
+      | { zones?: Record<string, unknown> }
+      | undefined;
+    return Object.keys(m?.zones ?? {});
+  }, [adoptModel.data]);
+
+  // 打开时默认选第一份规格（多数环境只有一份）
+  useEffect(() => {
+    if (adopt && !adoptSpec && specList.data?.specs.length) {
+      const first = specList.data.specs.find((s) => s.valid) ?? specList.data.specs[0];
+      setAdoptSpec(first.name);
+    }
+  }, [adopt, adoptSpec, specList.data]);
+
+  /** 容器名当主机名：转小写、非法字符换 `-`、去掉首尾 `-`，截到 31。 */
+  const openAdopt = useCallback((r: UnmanagedVm) => {
+    const slug = (r.name || `ct${r.vmid}`)
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 31);
+    setAdopt(r);
+    setAdoptHost(slug || `ct${r.vmid}`);
+    setAdoptIp("");
+    setAdoptZone(undefined);
+  }, []);
+
+  const submitAdopt = useCallback(async () => {
+    if (!adopt?.vmid || !adoptSpec || !adoptZone || !adoptHost.trim()) {
+      message.warning("规格、zone、主机名都要填");
+      return;
+    }
+    setAdopting(true);
+    try {
+      await api.adoptHost({
+        vmid: adopt.vmid,
+        spec: adoptSpec,
+        zone: adoptZone,
+        host: adoptHost.trim(),
+        ip: adoptIp.trim() || undefined,
+      });
+      message.success(
+        `已写入规格：${adoptZone}:${adoptHost.trim()} → vmid ${adopt.vmid}。点「应用」后才会按规格配网络`,
+      );
+      setAdopt(null);
+      await hosts.refetch();
+    } catch (e) {
+      message.error((e as Error).message);
+    } finally {
+      setAdopting(false);
+    }
+  }, [adopt, adoptSpec, adoptZone, adoptHost, adoptIp, message, hosts]);
 
   /** 销毁"规格里已经没有、容器还在"的孤儿。没有这个入口就只能上机器手工删。 */
   const purgeOrphans = useCallback(async () => {
@@ -1179,12 +1252,92 @@ export default function Hosts() {
                   ),
               },
               { title: "节点", dataIndex: "node", width: 120 },
+              {
+                title: "",
+                width: 88,
+                render: (_: unknown, r) =>
+                  r.kind === "lxc" && r.vmid ? (
+                    <Button size="small" onClick={() => openAdopt(r)}>
+                      纳管
+                    </Button>
+                  ) : (
+                    <Tooltip title="目前只支持 LXC 容器">
+                      <Button size="small" disabled>
+                        纳管
+                      </Button>
+                    </Tooltip>
+                  ),
+              },
             ]}
           />
           <Text type="secondary" style={{ fontSize: 12 }}>
-            这些是在 PVE 面板或用其它工具直接建的，没有经过规格，所以平台只展示、不接管：
-            要纳入管理请写进规格；不用了请到 PVE 里删除。
+            这些是在 PVE 面板或用其它工具直接建的。点「纳管」会把主机写进规格并绑定
+            vmid——只登记，不改造：下次「应用」才真正接管（配网络、主机名、资源）。
+            不用的请到 PVE 里删除。
           </Text>
+
+          <Modal
+            title={`纳管 ${adopt?.name || ""}（vmid ${adopt?.vmid ?? ""}）`}
+            open={!!adopt}
+            onCancel={() => setAdopt(null)}
+            onOk={submitAdopt}
+            okText="写入规格"
+            confirmLoading={adopting}
+            destroyOnClose
+          >
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 14 }}
+              message="只登记，不改造"
+              description="纳管只写规格与 vmid 映射；下一次「应用」才会按规格配网络、主机名与资源。"
+            />
+            <Form layout="vertical" size="small">
+              <Form.Item label="规格" required>
+                <Select
+                  placeholder="选择规格"
+                  value={adoptSpec}
+                  onChange={(v) => {
+                    setAdoptSpec(v);
+                    setAdoptZone(undefined);
+                  }}
+                  options={(specList.data?.specs ?? []).map((s) => ({
+                    value: s.name,
+                    label: s.valid ? `${s.name}（${s.hosts} 台）` : `${s.name}（解析失败）`,
+                    disabled: !s.valid,
+                  }))}
+                />
+              </Form.Item>
+              <Form.Item label="zone" required>
+                <Select
+                  placeholder={adoptSpec ? "选择 zone" : "先选规格"}
+                  value={adoptZone}
+                  onChange={setAdoptZone}
+                  disabled={!adoptSpec}
+                  loading={adoptModel.isFetching}
+                  options={adoptZones.map((z) => ({ value: z, label: z }))}
+                />
+              </Form.Item>
+              <Form.Item
+                label="主机名"
+                required
+                extra="小写字母、数字、连字符；会成为容器主机名"
+              >
+                <Input
+                  value={adoptHost}
+                  onChange={(e) => setAdoptHost(e.target.value)}
+                  placeholder="pc1"
+                />
+              </Form.Item>
+              <Form.Item label="主机位" extra="留空则按角色自动分配（推荐先留空）">
+                <Input
+                  value={adoptIp}
+                  onChange={(e) => setAdoptIp(e.target.value)}
+                  placeholder="30"
+                />
+              </Form.Item>
+            </Form>
+          </Modal>
         </Card>
       )}
 

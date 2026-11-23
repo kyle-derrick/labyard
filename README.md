@@ -214,9 +214,9 @@ docs/operations.md  安装、升级、备份恢复、排障
 
 | 状态 | 内容 |
 |---|---|
-| ✅ 单元测试通过 | **105 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照、监控机自定义 IP/CT 号、监控机内网口自镜像 |
+| ✅ 单元测试通过 | **133 项**：YAML 三层合并、zone 拓扑与环检测、ULA 前缀合法性、步骤哈希确定性、生成器版本参与哈希、apt 缓存隐式依赖、zone 片段往返、nft 原子批次与 `dnat ip to`、映射回程 SNAT、VPN 关闭落地、进程组杀孙进程、超时、取消、密码哈希、cookie 签名、VMID 分配、NAT 开关、DNS 取值、bootstrap 变量名契约、分配器对照、监控机自定义 IP/CT 号、监控机内网口自镜像 |
 | ✅ HTTP 冒烟通过 | 26 项（`scripts/smoke.sh`）：健康检查、SPA 回落、认证、单/嵌套 zone 预览、vmid 回填、ULA 合法性、规格读写与原子性、apply 前置拦截、错误输入、无 PVE 时优雅降级、OpenAPI |
-| ✅ 真机逐接口回归 | 92 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 监控机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
+| ✅ 真机逐接口回归 | 95 项（`scripts/api-regress.py`）：路由表里每个端点各打一次，含负路径（非法 action、不存在的主机、重复连线、`confirm` 不匹配、快照名注入）与"写完读回断言"（`egress` 真的关了、`retired` 标记真的翻、镜像连线真的没了）。它同时是三条 bug 的复现用例：裸 host 镜像连线删不掉、retire 监控机时镜像单元按前缀匹配不到、已结束 run 的 SSE 永不收流 |
 | ✅ 容器内验证 | Rust 编译、`cargo test`、前端 `vite build`、二进制体积（12.7 MB，含 1.48 MB 前端）与内存（常驻 12.0 MiB / 峰值 44.8 MB，含 scrypt 32 MB 工作区）、真浏览器渲染与规格读回 |
 | ✅ **真实 PVE 9.2.2 全链路** | `doctor` 9 项全绿；`apply` **14/14** 步成功（含 bootstrap）；网关拿 `.1`、NAT 出网生效、内网主机**无默认路由**、宿主入向被网关丢弃；幂等重跑全部跳过；基础配置实测生效（时区 CST、`zh_CN.utf8` locale 生成、vim/curl/jq 装入、源指向 tuna、主机 opt-out 不装包）；`destroy` 全路径验证（硬检查、CT/桥/interfaces 清理、销毁后重建闭环）|
 | ✅ **Web 运维** | 主机表格（电源 start/stop/reboot）、快照（列/建/回滚/删）、run 历史与明细、retry、destroy（zone 名二次确认）。真机逐项验证通过 |
@@ -229,8 +229,10 @@ docs/operations.md  安装、升级、备份恢复、排障
 | ✅ **可视化编排** | `GET/PUT /api/specs/{name}/model` 做 YAML ↔ JSON 投影，前端用卡片 + 表格改结构，保存走与手工粘贴**同一条校验**（`Spec::parse` + `resolve_all`）；YAML 是可切换的高级选项。代价写在界面上：保存会重排 YAML 并丢注释 |
 | ✅ **重启自愈** | 地址与 nft 规则落成容器内开机单元（`labyard-net` / `labyard-nft`）：`pct reboot` 后地址、含端口映射的完整策略、关闭态的 egress 都原样恢复。这一步是真机发现的——早先只 `ip addr` 一次性下发，容器重启后整个 zone 静默失联，网关静默 fail-open |
 | ✅ **Web 终端** | ttyd 1.7.7 静态二进制注入容器（systemd 单元、绑容器内网地址）→ axum HTTP+WS 反代（hyper client + tokio-tungstenite）→ iframe 嵌入（ttyd 自带 xterm.js、CJK 输入、ZMODEM 传文件）。真机验证：页面 200（729 KB）、WS 握手 `101 Switching Protocols` |
-| ⚠️ 仅设计推演 | IPv6 出公网（宿主无 IPv6 上游，环境限制；区域内 ULA 互通与 NAT66 已实测）、厚 LVM 快照、`pct snapshot`、升级迁移（**从未发布，刻意不做**） |
-| ❌ 明确没做 | 自动发现外来成员（`observed`/`unknown`）、IP allowlist、TOTP、审计表、`ionice`、apply 前资源预检、`doctor --trace`。逐条都在 `docs/design.md` §5.9 / §7.6.5 / §8.4 / §9 写明，并在原位置标注了"这是设想，没有实现" |
+| ✅ **IPv6（含出公网）** | 每 zone 一个 ULA /64（网关 `::1`、主机 `::{v4}`）、NAT66、门控与 v4 同一套 `inet` 表。网关**上联口 `accept_ra=2`** 通过 SLAAC 拿上游 GUA 并装默认路由：内网主机 `ping6 2400:3200::1` 实测 2/2 通、6 ms；同 zone 主机互通 0.13 ms。脚本靠 `RULESET_VERSION` 升版触发重跑，已部署环境也会跟着更新。**跨 zone 只有 v4 有静态路由，v6 跨 zone 未实现** |
+| ✅ **纳管外来容器** | 在 PVE 面板或用别的工具建的 LXC 会出现在"宿主上的其它虚拟机"里，点「纳管」写进规格 + 绑 vmid，之后与平台建的主机没有区别。**只登记、不立刻下发**：下次 `apply` 才按规格配网络/主机名/资源（避免纳管一台跑着业务的容器时顺手断网）。QEMU 暂不支持，IP 自动挑空闲主机位 |
+| ⚠️ 仅设计推演 | 厚 LVM 快照、`pct snapshot`、升级迁移（**从未发布，刻意不做**） |
+| ❌ 明确没做 | IP allowlist、TOTP、审计表、`ionice`、apply 前资源预检、`doctor --trace`、**v6 跨 zone 路由**。逐条都在 `docs/design.md` §5.8 / §7.6.5 / §8.4 / §9 写明，并在原位置标注了"这是设想，没有实现" |
 
 **mock 全绿不等于真机通过**，这一条不含糊——现在的每一条 ✅ 都有真机证据。
 

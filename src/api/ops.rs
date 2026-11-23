@@ -342,6 +342,267 @@ pub async fn patch_host_config(
     })())
 }
 
+// ───────────────────────── 纳管已有容器 ─────────────────────────
+
+#[derive(Deserialize)]
+pub struct AdoptBody {
+    pub vmid: u32,
+    pub spec: String,
+    pub zone: String,
+    pub host: String,
+    /// 主机位（"30"）；不写则按角色默认分配
+    pub ip: Option<String>,
+}
+
+/// 主机名要同时能当容器 hostname 和 YAML 键：小写字母/数字/连字符，
+/// 且以字母或数字开头（YAML 里 `-x:` 会被当成列表项）。
+fn valid_host_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 31
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// 把宿主上已有的容器纳管进规格。
+///
+/// 只做"登记"，不做"改造"：写规格 + 绑 vmid，**不立刻下发**。真正的接管发生
+/// 在下一次 apply——那会按规格配网络、主机名与资源。这是刻意的：纳管一台跑着
+/// 服务的容器不应该顺手把它网断了。
+pub async fn adopt_host(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AdoptBody>,
+) -> Response {
+    render_async(async move {
+        authed(&state, &headers)?;
+        let host = body.host.trim().to_string();
+        if !valid_host_name(&host) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "主机名只能用 1–31 个小写字母、数字或连字符，且以字母或数字开头",
+            ));
+        }
+        let dir = spec_dir(&state);
+        let Some(text) = specs::read(&dir, &body.spec).map_err(bad)? else {
+            return Err(err(StatusCode::NOT_FOUND, "规格不存在"));
+        };
+
+        // 只纳管宿主上真实存在、且没被别的 (zone,host) 管着的 LXC。
+        // 这里**必须走实时查询**：用户刚在 PVE 面板建完容器就来点纳管，
+        // 展示用的缓存还是几十秒前的快照，会直接回"宿主上没有这台"。
+        let cancel = CancellationToken::new();
+        let vms = state.pve.cluster_vms(&cancel).await.map_err(bad)?;
+        let Some(row) = vms.iter().find(|r| r.vmid_parsed() == Some(body.vmid)) else {
+            return Err(err(
+                StatusCode::NOT_FOUND,
+                format!("宿主上没有 vmid {}", body.vmid),
+            ));
+        };
+        if !row.is_lxc() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "目前只纳管 LXC 容器；QEMU 的网卡/模板流程不同，手工写规格更稳",
+            ));
+        }
+        if let Some((z, h, _)) = state
+            .db
+            .all_vmids()
+            .into_iter()
+            .find(|(_, _, v)| *v == body.vmid)
+        {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("vmid {} 已经由 {z}:{h} 管理", body.vmid),
+            ));
+        }
+
+        let sp = Spec::parse(&text).map_err(bad)?;
+        let res = sp.resolve_all(&state.cfg.pve.wan_bridge).map_err(bad)?;
+        let Some(z) = res.zones.iter().find(|z| z.name == body.zone) else {
+            return Err(err(
+                StatusCode::NOT_FOUND,
+                format!("规格 {} 里没有 zone {}", body.spec, body.zone),
+            ));
+        };
+        if z.hosts.iter().any(|h| h.name == host) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("{} 里已经有主机 {}", body.zone, host),
+            ));
+        }
+        if body.ip.as_deref().is_some_and(|ip| ip.trim().is_empty()) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "ip 要么不填（自动分配），要么给主机位，如 30",
+            ));
+        }
+
+        // 主机位：没填就自己挑一个空闲的写进去，**不能留给规格的自动分配**。
+        // hosts 是按名字排序的 BTreeMap，纳管名很可能排在现有主机前面
+        // （adopt-demo < t1），自动分配会先把它放到 .20，然后与显式 `ip: 20`
+        // 的 t1 撞车——报出来的还是"两台都占 .20"，很难看懂。
+        let ip = match body.ip.as_deref() {
+            Some(ip) => ip.trim().to_string(),
+            None => {
+                let used: std::collections::HashSet<u8> = z
+                    .hosts
+                    .iter()
+                    .filter_map(|h| {
+                        h.ipv4
+                            .split('.')
+                            .nth(3)
+                            .and_then(|s| s.split('/').next())
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .collect();
+                let mut o: u16 = 20; // 普通主机的默认起点
+                while o <= 254 && used.contains(&(o as u8)) {
+                    o += 1;
+                }
+                if o > 254 {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        "这个 zone 没有空闲主机位了，请手工指定 ip",
+                    ));
+                }
+                o.to_string()
+            }
+        };
+
+        let Some(patched) = add_yaml_host(&text, &body.zone, &host, body.vmid, Some(&ip)) else {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("规格 {} 里找不到 zone {} 的块，去编排页加", body.spec, body.zone),
+            ));
+        };
+        // 与所有写路径同一条安全网：先 parse + resolve，失败不落盘
+        Spec::parse(&patched)
+            .and_then(|s| s.resolve_all(&state.cfg.pve.wan_bridge))
+            .map_err(bad)?;
+        specs::write(&dir, &body.spec, &patched).map_err(bad)?;
+        state
+            .db
+            .bind_vmid(&body.zone, &host, body.vmid)
+            .map_err(|e| err(StatusCode::CONFLICT, e))?;
+
+        Ok(Json(serde_json::json!({
+            "ok": true, "spec": body.spec, "zone": body.zone,
+            "host": host, "vmid": body.vmid, "yaml": patched
+        })))
+    })
+    .await
+}
+
+/// 在 `zones: > <zone>: > hosts:` 下追加一台主机（块状写法），其余字节不动。
+/// zone 里没有 `hosts:` 时连它一起补上。找不到 zone 返回 None。
+pub fn add_yaml_host(
+    yaml: &str,
+    zone: &str,
+    host: &str,
+    vmid: u32,
+    ip: Option<&str>,
+) -> Option<String> {
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let is_blank = |l: &str| {
+        let t = l.trim();
+        t.is_empty() || t.starts_with('#')
+    };
+    let lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+
+    let zi = lines.iter().position(|l| l.trim() == "zones:")?;
+    let z0 = indent_of(&lines[zi]);
+    let zone_indent = z0 + 2;
+
+    let mut zone_i = None;
+    for i in (zi + 1)..lines.len() {
+        let l = &lines[i];
+        if is_blank(l) {
+            continue;
+        }
+        if indent_of(l) <= z0 {
+            break;
+        }
+        if indent_of(l) == zone_indent && l.trim() == format!("{zone}:") {
+            zone_i = Some(i);
+            break;
+        }
+    }
+    let zzi = zone_i?;
+
+    let mut zone_end = lines.len();
+    for i in (zzi + 1)..lines.len() {
+        let l = &lines[i];
+        if is_blank(l) {
+            continue;
+        }
+        if indent_of(l) <= zone_indent {
+            zone_end = i;
+            break;
+        }
+    }
+
+    let hosts_indent = zone_indent + 2;
+    let host_indent = hosts_indent + 2;
+    let field_indent = host_indent + 2;
+    let hosts_i = ((zzi + 1)..zone_end).find(|&i| {
+        let l = &lines[i];
+        !is_blank(l) && indent_of(l) == hosts_indent && l.trim() == "hosts:"
+    });
+
+    let mut entry = vec![
+        format!("{}{host}:", " ".repeat(host_indent)),
+        format!("{}role: host", " ".repeat(field_indent)),
+        format!("{}vmid: {vmid}", " ".repeat(field_indent)),
+    ];
+    if let Some(ip) = ip {
+        // ip 在规格里是字符串（`ip: 30` 会被 YAML 解析成整数而反序列化失败）
+        entry.push(format!("{}ip: \"{}\"", " ".repeat(field_indent), ip.trim()));
+    }
+
+    let mut out = lines.clone();
+    match hosts_i {
+        Some(hi) => {
+            // 插入点是 **hosts 块内**最后一个非空行之后——不是整个 zone 块的末尾。
+            // 真机上踩过：hosts 后面还有 zone 级键（`monitor:` / `nat:` / `v4:`），
+            // 按 zone 末尾算会把主机块插到 `v4:` 之后，缩进对但层级错，
+            // 整份 YAML 变成 "mapping values are not allowed"。
+            let mut hosts_end = zone_end;
+            for i in (hi + 1)..zone_end {
+                let l = &lines[i];
+                if !is_blank(l) && indent_of(l) <= hosts_indent {
+                    hosts_end = i;
+                    break;
+                }
+            }
+            let mut at = hi + 1;
+            for i in (hi + 1)..hosts_end {
+                if !is_blank(&lines[i]) {
+                    at = i + 1;
+                }
+            }
+            for (k, l) in entry.into_iter().enumerate() {
+                out.insert(at + k, l);
+            }
+        }
+        None => {
+            let mut block = vec![format!("{}hosts:", " ".repeat(hosts_indent))];
+            block.extend(entry);
+            for (k, l) in block.into_iter().enumerate() {
+                out.insert(zone_end + k, l);
+            }
+        }
+    }
+
+    let mut s = out.join("\n");
+    if yaml.ends_with('\n') {
+        s.push('\n');
+    }
+    Some(s)
+}
+
 /// 在 YAML 文本里定位 `zones: > <zone>: > hosts: > <host>:` 块，替换/插入
 /// cores / memory / disk。块内没有的键按 host 子键缩进插入到块首。
 /// 找不到返回 None（调用方据此回退成"去编排页改"）。
@@ -1787,5 +2048,65 @@ mod tests {
     fn unknown_vmid_falls_back_to_the_whole_zone() {
         // 查不到 vmid 就保守处理：多停几个总比留下孤儿单元好
         assert_eq!(mirror_unit_globs("lab", "t1", None), vec!["lab-*"]);
+    }
+
+    // ── 纳管：往 hosts 块里追加一台 ──
+
+    /// 独立于 `YAML`：纳管要跑到 `resolve`，defaults 必须给全（memory/disk）。
+    const ADOPT_YAML: &str = "defaults:\n  cores: 1\n  memory: 256\n  disk: 4\n  template: debian-13-standard\n  storage: local-lvm\nzones:\n  lab:\n    uplink: wan\n    v4: 10.77.0.0/24\n    hosts:\n      gw:\n        role: gateway\n      t1:\n        role: host\n        # 手写注释\n        ip: \"20\"\n";
+
+    #[test]
+    fn adopt_appends_host_block_and_keeps_everything_else() {
+        let out = add_yaml_host(ADOPT_YAML, "lab", "pc1", 118, Some("30")).unwrap();
+        assert!(
+            out.contains("      pc1:\n        role: host\n        vmid: 118\n        ip: \"30\""),
+            "插入的块不对:\n{out}"
+        );
+        assert!(out.contains("# 手写注释"), "别人的注释不能被碰掉");
+        assert!(out.contains("ip: \"20\""), "邻居字段不能被碰掉");
+        // 落地前必须能过同一条校验
+        let sp = crate::core::spec::Spec::parse(&out).expect("parse");
+        let res = sp.resolve_all("vmbr0").expect("resolve");
+        let z = res.zones.iter().find(|z| z.name == "lab").unwrap();
+        let pc1 = z.hosts.iter().find(|h| h.name == "pc1").expect("应有 pc1");
+        assert_eq!(pc1.ipv4, "10.77.0.30/24");
+    }
+
+    #[test]
+    fn adopt_adds_hosts_key_when_zone_has_none() {
+        let y = "zones:\n  lab:\n    uplink: wan\n    v4: 10.77.0.0/24\n";
+        let out = add_yaml_host(y, "lab", "pc1", 120, None).unwrap();
+        assert!(out.contains("    hosts:\n      pc1:\n        role: host\n        vmid: 120"), "{out}");
+        assert!(!out.contains("ip:"), "没给 ip 就不要写这一行");
+    }
+
+    #[test]
+    fn adopt_unknown_zone_is_none() {
+        assert!(add_yaml_host(YAML, "nope", "pc1", 118, None).is_none());
+    }
+
+    /// 真机踩过：hosts 后面还有 zone 级键时，插入点必须停在 hosts 块内，
+    /// 否则主机块会被插到 `v4:` 之后，整份 YAML 变成映射语法错误。
+    #[test]
+    fn adopt_inserts_inside_hosts_block_not_at_zone_end() {
+        let y = "defaults:\n  cores: 1\n  memory: 256\n  disk: 4\n  template: t\n  storage: s\nzones:\n  lab:\n    hosts:\n      gw:\n        role: gateway\n    monitor:\n      mgmt: wan\n    nat: true\n    uplink: wan\n    v4: 10.77.0.0/24\n";
+        let out = add_yaml_host(y, "lab", "pc1", 130, None).unwrap();
+        let at_hosts = out.find("      gw:").unwrap();
+        let at_new = out.find("      pc1:").unwrap();
+        let at_monitor = out.find("    monitor:").unwrap();
+        assert!(at_hosts < at_new && at_new < at_monitor, "必须插在 gw 与 monitor 之间:\n{out}");
+        let sp = crate::core::spec::Spec::parse(&out).expect("parse");
+        sp.resolve_all("vmbr0").expect("resolve");
+    }
+
+    #[test]
+    fn host_name_must_be_a_safe_label() {
+        assert!(valid_host_name("pc1"));
+        assert!(valid_host_name("web-01"));
+        assert!(!valid_host_name(""), "空名");
+        assert!(!valid_host_name("-pc"), "连字符开头在 YAML 里会被当列表项");
+        assert!(!valid_host_name("PC1"), "大写会让 hostname 与规格对不上");
+        assert!(!valid_host_name("pc 1"), "空格");
+        assert!(!valid_host_name("pc:1"), "冒号能改 YAML 结构");
     }
 }

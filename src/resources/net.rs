@@ -85,6 +85,37 @@ pub fn gateway_addressing_routed(
     s.push_str("sysctl -qw net.ipv4.conf.eth0.send_redirects=0\n");
 
     s.push_str("sysctl -qw net.ipv6.conf.all.forwarding=1\n");
+    // 上联口拿上游 IPv6（SLAAC）。forwarding=1 之后内核**默认忽略 RA**，
+    // 所以必须 accept_ra=2——这一行漏掉的后果很隐蔽：内网 ULA 全通、NAT66
+    // 规则也在，但 eth1 没有全球地址，出公网的包没有源地址可用，
+    // 现象是"内网 ping6 公网 100% 丢包"，很容易误判成"宿主没有 IPv6 上游"。
+    //
+    // 只在「上联是真实外网桥」（没有静态地址）时做：嵌套 zone 的上联是平台
+    // 自己的桥，没有 RA 可听，去 down/up 只会白断一次链路。
+    if uplink_ip.is_none() && v6_prefix.is_some() {
+        s.push_str(&format!("sysctl -qw net.ipv6.conf.{uplink}.accept_ra=2\n"));
+        s.push_str(&format!("sysctl -qw net.ipv6.conf.{uplink}.autoconf=1\n"));
+        // 已经有全球地址就别动接口：每次 apply 都 down/up 会无谓断网
+        s.push_str(&format!(
+            "if ! ip -6 addr show dev {uplink} scope global | grep -q 'inet6 '; then\n  \
+             ip link set {uplink} down && ip link set {uplink} up\n  \
+             i=0; while [ $i -lt 12 ]; do\n    \
+             ip -6 addr show dev {uplink} scope global | grep -q 'inet6 ' && break\n    \
+             i=$((i+1)); sleep 0.5\n  \
+             done\n\
+             fi\n"
+        ));
+        // **重启网卡会连 v4 的 DHCP 租约一起弄丢**：地址还在（租约缓存），但默认
+        // 路由没了。真机踩过——修好 IPv6 的同一个 apply 把 IPv4 出网弄断，
+        // 现象是网关自己 `ping 223.5.5.5` 报 Network is unreachable，
+        // 而看起来"只是改了个 v6 开关"。所以这里必须把默认路由补回来。
+        s.push_str(&format!(
+            "if ! ip -4 route show default dev {uplink} | grep -q .; then\n  \
+             (command -v dhclient >/dev/null && dhclient -1 {uplink}) || true\n  \
+             ip route replace default via $(ip -4 route show dev {uplink} | awk '/default/{{print $3; exit}}') dev {uplink} 2>/dev/null || true\n\
+             fi\n"
+        ));
+    }
     // 网关自己也要能解析（apt 装包、provisioner 用）
     s.push_str(&resolv_conf(dns));
     s
@@ -196,9 +227,47 @@ mod tests {
         assert!(h.contains("nameserver 223.5.5.5"));
     }
 
+    /// 真机踩过：`forwarding=1` 之后内核**忽略 RA**，网关 eth1 拿不到上游全球
+    /// 地址，于是"内网 ping6 公网 100% 丢包"，而 ULA 与 NAT66 都看起来正常，
+    /// 极容易被误判成"宿主没有 IPv6 上游"。
     #[test]
-    fn gateway_uses_its_own_ip_not_the_zone_cidr() {
-        // 真机教训：早期把网段地址 10.10.1.0/24 写上接口——网段号当 IP 是错的，
+    fn gateway_accepts_ra_on_real_uplink() {
+        let s = gateway_addressing("10.10.1.1/24", Some("fd00:1::/64"), "eth1", None, None, &[]);
+        assert!(s.contains("net.ipv6.conf.eth1.accept_ra=2"), "上联口要听 RA：{s}");
+        assert!(s.contains("net.ipv6.conf.eth1.autoconf=1"));
+        assert!(s.contains("ip link set eth1 down"), "要主动触发一次 RA");
+    }
+
+    /// 触发 RA 要 down/up 上联口，而这一步会连 v4 的 DHCP 租约一起弄丢：
+    /// 地址还在，默认路由没了。真机踩过——修好 IPv6 的同一次 apply 把 IPv4
+    /// 出网弄断（网关自己 `ping 223.5.5.5` 报 Network is unreachable）。
+    #[test]
+    fn gateway_restores_v4_default_route_after_ra_restart() {
+        let s = gateway_addressing("10.10.1.1/24", Some("fd00:1::/64"), "eth1", None, None, &[]);
+        assert!(
+            s.contains("ip -4 route show default dev eth1"),
+            "重开网卡后要检查 v4 默认路由:\n{s}"
+        );
+        assert!(s.contains("dhclient -1 eth1"), "丢了租约要重新要一次");
+    }
+
+    /// 嵌套 zone 的上联是平台自己的桥，没有 RA 可听——不许去 down/up 白断链路。
+    #[test]
+    fn nested_gateway_does_not_touch_uplink() {
+        let s = gateway_addressing(
+            "10.10.1.1/24",
+            Some("fd00:1::/64"),
+            "eth1",
+            Some("10.77.0.5/24"),
+            Some("10.77.0.1"),
+            &[],
+        );
+        assert!(!s.contains("accept_ra=2"), "嵌套 zone 不该去听 RA");
+        assert!(!s.contains("ip link set eth1 down"));
+    }
+
+    #[test]
+    fn gateway_uses_its_own_ip_not_the_zone_cidr() {        // 真机教训：早期把网段地址 10.10.1.0/24 写上接口——网段号当 IP 是错的，
         // 网关必须拿 .1 这个身份，主机的默认路由才有落点。
         let s = gateway_addressing("10.10.1.1/24", None, "eth1", None, None, &[]);
         assert!(s.contains("ip addr replace 10.10.1.1/24 dev eth0"));
