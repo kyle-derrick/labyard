@@ -194,8 +194,19 @@ jobs:
               --notes-file notes.md \
               dist/*.tar.gz dist/SHA256SUMS
           fi
-          gh release view "$TAG" --json url,assets \
-            --template '{{.url}}{{"\n"}}{{range .assets}}  {{.name}}  {{.size}} B{{"\n"}}{{end}}'
+
+          # 草稿也必须推成已发布。踩过：删掉远端 tag 会把 Release 变成草稿，
+          # 此时 `gh release view` 照样成功、上传照样成功，日志一片绿，
+          # 但匿名用户打不开资产（404），`releases/latest` 还停在上一版。
+          # 只认"能不能下载"这一件事，所以这里强制置 false 再断言。
+          gh release edit "$TAG" --draft=false
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
+            echo "::error::Release $TAG 仍是草稿，外部无法下载"
+            exit 1
+          fi
+
+          gh release view "$TAG" --json url,isDraft,assets \
+            --template '{{.url}}  draft={{.isDraft}}{{"\n"}}{{range .assets}}  {{.name}}  {{.size}} B{{"\n"}}{{end}}'
 
       - name: 摘要
         run: |
